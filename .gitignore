@@ -1,0 +1,26 @@
+# Model weights / checkpoints (large, download separately via download_ckpts.py)
+ckpt/
+microsoft/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.DS_Store
+
+# Local scratch generated during development/testing (regenerate via the scripts instead
+# of committing large binary run outputs)
+data_toolkit/assets/monk/
+data_toolkit/assets/xpart_004/
+data_toolkit/assets/img_interactive.png
+data_toolkit/assets/img_run.png
+data_toolkit/assets/input_2dmap.vxz
+data_toolkit/assets/input_interactive.vxz
+data_toolkit/assets/input_run.vxz
+data_toolkit/assets/input_sam3.vxz
+data_toolkit/assets/output_2dmap.glb
+data_toolkit/assets/output_full.glb
+data_toolkit/assets/output_interactive.glb
+data_toolkit/assets/output_sam3.glb
