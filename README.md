@@ -1,108 +1,100 @@
-# SAM3-SegviGen: Text-Prompted 3D Part Segmentation
+# SAM3-SegviGen（[English](README_EN.md)）
 
-A fork of [SegviGen](https://github.com/Nelipot-Lee/SegviGen) that turns its
-2D-map-guided part segmentation into a **semantic pipeline**: hand it a GLB and a list of
-text prompts, get back one GLB with one named mesh per part — real textures included.
+基于 [SegviGen](https://github.com/Nelipot-Lee/SegviGen) + [SAM3](https://huggingface.co/facebook/sam3)
+的文本提示 3D 部件分割管线：输入一个 GLB 和一组语义提示词，输出一个 GLB——每个部件一个独立命名的
+mesh，带真实贴图。
 
-![teaser](assets/teaser.png)
+上游 SegviGen：[项目主页](https://fenghora.github.io/SegviGen-Page/) |
+[论文](https://arxiv.org/abs/2603.16869) |
+[在线 Demo](https://huggingface.co/spaces/fenghora/SegviGen) |
+[权重](https://huggingface.co/fenghora/SegviGen)
 
-Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
-[Paper](https://arxiv.org/abs/2603.16869) |
-[Online Demo](https://huggingface.co/spaces/fenghora/SegviGen) |
-[Weights](https://huggingface.co/fenghora/SegviGen)
+## 🌟 相对原版的改进
 
-## 🌟 What this fork adds
+**识别 —— 语义提示词替代手涂 2D 引导图。**
+原版的 2D 引导模式需要手涂颜色图。本分支用 SAM3 按文本提示词分割条件渲染图
+（`"helmet"`、`"body=head+face+hand"`），掩码上色后直接作为 SegviGen 的 2D 引导图。
+提示词组可以把多个概念合并成一个部件，`--unassigned_to` 把没有提示词认领的区域归入指定部件，
+保证输出部件数与提示词数严格一致。
 
-**Recognition — semantic prompts instead of hand-painted maps.**
-Upstream's 2D-guided mode needs a manually painted color map. Here
-[SAM3](https://huggingface.co/facebook/sam3) segments the conditioning render from plain
-text prompts (`"helmet"`, `"body=head+face+hand"`), and the masks are colorized into the
-2D map SegviGen consumes. Prompt *groups* merge several concepts into one output part, and
-`--unassigned_to` folds whatever no prompt claimed into a named part, so the output has
-exactly as many parts as requested.
+**合并 —— 每个语义物体恰好一个 mesh。**
+朴素 2D 引导会把复杂壳体拆成几十块碎片。`segment_vote.py` 换了一条路：先做无提示全量分割，
+再多视角渲染交给 SAM3 打掩码，每个**部件**投票选覆盖率最高的提示词（覆盖率门槛防止掩码边缘渗漏
+污染大部件），同名部件通过贴图图集合并成单个 mesh——UV 无损重映射，不重烘。
 
-**Merging — every semantic object comes out as ONE mesh.**
-Naive 2D guidance shatters complex shells into dozens of fragments. `segment_vote.py`
-takes the other route: full (prompt-free) segmentation first, then multi-view renders are
-masked by SAM3 and every *part* votes for the prompt that best covers it (a coverage
-threshold stops mask bleed from hijacking large parts). Parts sharing a name are merged
-into a single mesh with their textures packed into an atlas — lossless UV remapping, no
-rebake.
+**正面视角自动选择。**
+2D 引导模式对渲染朝向敏感。`--front_view` 自动挑选条件视角：
 
-**Automatic front-view selection.**
-The 2D-guided mode is sensitive to which side of the model gets rendered. `--front_view`
-picks the conditioning view automatically:
-
-| mode | how it decides | needs |
+| 模式 | 决策方式 | 依赖 |
 |---|---|---|
-| `metric` | silhouette symmetry + coverage + centeredness | nothing, offline |
-| `auto` | metric top-3, then SAM3 prompt confidence | SAM3 env |
-| `vlm` | metric top-4 grid, a VLM (Kimi/Moonshot) picks the semantic front | `MOONSHOT_API_KEY` |
+| `metric` | 轮廓对称性 + 覆盖率 + 居中度 | 无，纯离线 |
+| `auto` | 指标 top-3，再用 SAM3 提示词置信度定夺 | SAM3 环境 |
+| `vlm` | 指标 top-4 拼图，由 VLM（Kimi/Moonshot）选语义正面 | `MOONSHOT_API_KEY` |
 
-**Texture baking as an option (default on).**
-Each output part is re-UV'd in Blender and the source model's albedo is baked back onto it
-(`--no_texture` skips Blender entirely and emits flat placeholder colors for speed).
+**贴图烘焙作为可选项（默认开启）。**
+每个输出部件在 Blender 中重新展开 UV 并把原模型贴图烘焙回去（`--no_texture` 完全跳过 Blender，
+用占位纯色，速度快）。
 
-**Robustness fixes over upstream.**
-Strict legend/manifest validation with a `--sam3_only` audit mode, off-body fragment
-cleanup, correct glTF V-flip and metallic-factor handling in atlas merging, and camera
-conventions verified against the renderer (IoU 0.987).
+**相对原版的健壮性修复。**
+图例/清单严格校验与 `--sam3_only` 审计模式、离体碎片清理、图集合并的 glTF V 轴翻转与
+metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
 
-## 📷 Results
+## 📷 效果
 
-Auto-selected front view → SAM3 semantic 2D map → final textured split (mushroom + chair,
-exactly two meshes):
+自动选出的正面 → SAM3 语义 2D 图 → 最终带贴图拆分结果（蘑菇 + 椅子，恰好两个 mesh）：
 
 <p>
   <img src="docs/images/front_render.png" width="30%"/>
   <img src="docs/images/sam3_2d_map.png" width="30%"/>
   <img src="docs/images/vote_result_0.png" width="30%"/>
 </p>
+拆出的两个独立部件——提取的蘑菇 / 移除蘑菇后的椅子：
+
 <p>
-  <img src="docs/images/vote_result_90.png" width="30%"/>
   <img src="docs/images/extracted_mushroom.png" width="30%"/>
+  <img src="docs/images/chair_only.png" width="30%"/>
+  <img src="docs/images/vote_result_90.png" width="30%"/>
 </p>
 
-## 🔨 Deployment
+## 🔨 部署
 
-Developed and tested on Windows 11 + RTX 5090D (32 GB); upstream targets Linux with ≥24 GB
-VRAM — both work. Two Python environments are required because SAM3 (transformers 5.x) and
-SegviGen (transformers 4.57.6) conflict:
+在 Windows 11 + RTX 5090D（32 GB）上开发验证；原版面向 Linux + ≥24 GB 显存——两者都可用。
+需要**两个** Python 环境，因为 SAM3（transformers 5.x）与 SegviGen（transformers 4.57.6）依赖冲突：
 
-1. SegviGen env (the one that runs this repo): [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) dependencies first
+1. SegviGen 环境（运行本仓库的环境）：先装 [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 依赖
     ```sh
     git clone -b main https://github.com/microsoft/TRELLIS.2.git --recursive
     cd TRELLIS.2
     ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
 
     pip install mathutils
-    pip install transformers==4.57.6   # pinned: TRELLIS.2 issue #101
+    pip install transformers==4.57.6   # 锁版本：TRELLIS.2 issue #101
     pip install bpy==4.0.0 --extra-index-url https://download.blender.org/pypi/
     pip install --upgrade Pillow trimesh
-    # Linux only: sudo apt-get install -y libsm6 libxrender1 libxext6
+    # 仅 Linux：sudo apt-get install -y libsm6 libxrender1 libxext6
     ```
 
-2. SAM3 env (a separate venv): transformers 5.x + the `facebook/sam3` weights
+2. SAM3 环境（另一个独立 venv）：transformers 5.x + `facebook/sam3` 权重
     ```sh
-    pip install "transformers>=5"   # plus torch matching your CUDA
+    pip install "transformers>=5"   # 外加与你 CUDA 匹配的 torch
     ```
 
-3. Checkpoints (~24 GB total, resume-friendly download via hf-mirror)
+3. 模型权重（共约 24 GB，经 hf-mirror 断点续传下载）
     ```sh
     python download_ckpts.py   # -> ckpt/full_seg.ckpt, full_seg_w_2d_map.ckpt, interactive_seg.ckpt
     ```
 
-Runtime configuration:
+运行时配置：
 
-- `SEGVIGEN_PY_SAM3` — Python of the SAM3 venv (default `../.venv_holo/Scripts/python.exe`).
-- GPU backends (verified on Blackwell): `ATTN_BACKEND=flash_attn SPARSE_CONV_BACKEND=flex_gemm FLEX_GEMM_ALGO=explicit_gemm`.
-- VLM front-view mode: `MOONSHOT_API_KEY` (env var or a gitignored `.env` at the repo
-  root); `SEGVIGEN_VLM_BASE_URL` / `SEGVIGEN_VLM_MODEL` override the defaults
-  (`https://api.moonshot.cn/v1`, `kimi-latest`).
+- `SEGVIGEN_PY_SAM3` —— SAM3 环境的 Python 路径（默认 `../.venv_holo/Scripts/python.exe`）。
+- GPU 后端（Blackwell 已验证）：`ATTN_BACKEND=flash_attn SPARSE_CONV_BACKEND=flex_gemm FLEX_GEMM_ALGO=explicit_gemm`。
+- VLM 正面模式：`MOONSHOT_API_KEY`（环境变量或仓库根目录下 gitignored 的 `.env` 文件）；
+  `SEGVIGEN_VLM_BASE_URL` / `SEGVIGEN_VLM_MODEL` 可覆盖默认值
+  （`https://api.moonshot.cn/v1`，`kimi-latest`）。
 
-## 📒 The interface
+## 📒 接口
 
-### `segment_api.py` — prompts in, one named-parts GLB out
+### `segment_api.py` —— 输入提示词，输出一个带命名部件的 GLB
 
 ```sh
 python segment_api.py \
@@ -113,35 +105,31 @@ python segment_api.py \
   --out out/parts.glb --work_dir out/work
 ```
 
-- `--prompts`: one entry per output part; join concepts with `+` to merge them
-  (`body=head+face+hand`), optionally under an explicit `name=` prefix. Fully user-defined,
-  nothing hard-coded.
-- `--front_view metric|auto|vlm`: pick the conditioning view automatically; `--azimuth`
-  (degrees) remains available to pin a fixed view.
-- `--no_sam`: drop SAM3 entirely and run the prompt-free full_seg checkpoint on a plain
-  render (unnamed, color-clustered parts).
-- `--no_texture`: skip the Blender re-UV + bake step (fast); default keeps real textures.
-- `--sam3_only`: stop after render + SAM3 and keep `render.png` / `sam3_2d_map.png` /
-  legend for auditing.
+- `--prompts`：每个输出部件一条；用 `+` 连接多个概念合并为一个部件
+  （`body=head+face+hand`），可加 `name=` 显式命名。完全自定义，无写死内容。
+- `--front_view metric|auto|vlm`：自动选择条件视角；`--azimuth`（角度）仍可手动固定视角。
+- `--no_sam`：完全跳过 SAM3，用无提示 full_seg 权重在普通渲染图上分割（部件无命名，按颜色聚类）。
+- `--no_texture`：跳过 Blender 重展开 UV + 烘焙（更快）；默认保留真实贴图。
+- `--sam3_only`：在渲染 + SAM3 之后停止，保留 `render.png` / `sam3_2d_map.png` / 图例用于审核。
 
-Python:
+Python 调用：
 
 ```python
 from segment_api import segment
 
 manifest = segment(
     "model.glb", ["mushroom=small mushroom", "chair"], "out/parts.glb",
-    with_texture=True,            # texture baking is optional, default on
+    with_texture=True,            # 贴图烘焙为可选项，默认开启
     front_view="auto",            # metric | auto | vlm | None
     unassigned_to="chair",
-    work_dir="out/work",          # keep intermediates for inspection
+    work_dir="out/work",          # 保留中间产物便于检查
 )
 # manifest: [{"label": 0, "name": "mushroom", "node": "part_00_mushroom", "faces": ..., ...}]
 ```
 
-### `segment_vote.py` — fragment-free semantic objects via multi-view voting
+### `segment_vote.py` —— 多视角投票，产出无碎片的语义物体
 
-For models where a single 2D guide shatters parts, vote instead of guide:
+当单张 2D 引导图会把部件拆碎时，改用投票而非引导：
 
 ```sh
 python segment_vote.py \
@@ -151,17 +139,16 @@ python segment_vote.py \
   --out out/merged.glb --work_dir out/vote_work
 ```
 
-Pipeline: full segmentation → multi-view renders → SAM3 masks per view → per-part voting
-(face-level votes pooled per part; `min_cover` guards against mask bleed) → same-name parts
-merged into one mesh with a texture atlas. Output: exactly one mesh node per prompt name.
+流程：全量分割 → 多视角渲染 → 每视角 SAM3 掩码 → 部件级投票（面级票数汇总到部件；
+`min_cover` 防止掩码渗漏）→ 同名部件经贴图图集合并为一个 mesh。输出：每个提示词名恰好一个
+mesh 节点。
 
-### Upstream inference scripts
+### 原版推理脚本
 
-The original entry points still work unchanged — interactive segmentation
-(`inference_interactive.py`), full segmentation and 2D-map-guided full segmentation
-(`inference_full.py`, with `--two_d_map`).
+原始入口保持不变：交互式分割（`inference_interactive.py`）、全量分割与 2D 引导分割
+（`inference_full.py`，加 `--two_d_map`）。
 
-### Tests
+### 测试
 
 ```sh
 python -m unittest discover tests
@@ -169,11 +156,11 @@ python -m unittest discover tests
 
 ## ⚖️ License
 
-This project is licensed under the [MIT License](LICENSE).
-However, please note that the code in **`trellis2`** originates from the [TRELLIS.2](https://github.com/Microsoft/TRELLIS.2) project and remains subject to its original license terms.
-Users must comply with the licensing requirements of TRELLIS.2 when using or redistributing that portion of the code.
+本项目基于 [MIT License](LICENSE) 开源。
+注意 **`trellis2`** 目录下的代码来自 [TRELLIS.2](https://github.com/Microsoft/TRELLIS.2)，
+仍受其原始许可证约束；使用或再分发该部分代码时请遵守 TRELLIS.2 的许可要求。
 
-## Citation
+## 引用
 
 ```
 @article{li2026segvigen,
