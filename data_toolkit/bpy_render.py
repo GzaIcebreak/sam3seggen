@@ -173,7 +173,7 @@ class BpyRenderer:
         bsdf.inputs[1].default_value = 1
         output = new_mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
         new_mat.node_tree.links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
-        bpy.context.scene.view_layers["View Layer"].material_override = new_mat
+        bpy.context.view_layer.material_override = new_mat
 
     def scene_bbox(self):
         bbox_min = (math.inf,) * 3
@@ -242,6 +242,44 @@ class BpyRenderer:
             matrix = orbit @ matrix
         cam.matrix_world = matrix
         bpy.context.view_layer.update()
+
+    def set_camera_position(self, cam, position):
+        """Place the camera at a world position; TRACK_TO still aims it at the origin.
+
+        Only the translation of a camera matrix ever matters here, because the
+        TRACK_TO constraint recomputes the rotation. Setting the position directly
+        lets a caller use a deterministic view grid instead of orbiting one
+        calibrated matrix, which cannot change elevation.
+        """
+        cam.matrix_world.translation = mathutils.Vector(tuple(float(v) for v in position))
+        bpy.context.view_layer.update()
+
+    def render_from_positions(self, file_path, camera_positions, output_dir, camera_angle_x, names=None):
+        """Render one view per camera position into output_dir, returning the paths."""
+        self.init_render_settings()
+        self.init_scene()
+        self.load_object(file_path)
+        if self.split_normal:
+            self.split_mesh_normal()
+        scale, offset = self.normalize_scene()
+        print(f"[INFO] Scene normalized with auto scale: {scale}, offset: {offset}")
+
+        cam = self.init_camera()
+        self.init_lighting()
+        if self.geo_mode:
+            self.override_material()
+        cam.data.lens = 16 / np.tan(camera_angle_x / 2)
+
+        os.makedirs(output_dir, exist_ok=True)
+        written = []
+        for index, position in enumerate(camera_positions):
+            name = names[index] if names else f"view_{index:03d}"
+            self.set_camera_position(cam, position)
+            path = os.path.join(output_dir, f"{name}.png")
+            bpy.context.scene.render.filepath = path
+            bpy.ops.render.render(write_still=True)
+            written.append(path)
+        return written
 
     def compute_bbox(self, file_path):
         """Bounding box (Blender space) of a glb loaded on its own, for use as ref_bbox."""

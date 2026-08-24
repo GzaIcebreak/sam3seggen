@@ -283,8 +283,10 @@ def drop_offbody_components(mesh, aabb_limit=0.5, span_tolerance=0.98, max_drop_
     that spills past the silhouette can extrude thin shells that stop exactly on the
     aabb. The input was normalised so that only its longest axis spans the full aabb;
     any other axis reaching an aabb face is therefore geometry that does not belong to
-    the body. Bail out if the rule wants to delete a lot, which would mean the body
-    itself landed on the aabb.
+    the body. Besides detached shells, trim one-face-wide bridge chains whose leaf reaches
+    an aabb face: these are connected to the body, so component cleanup cannot see them.
+    Bail out if either rule wants to delete a lot, which would mean the body itself landed
+    on the aabb.
     """
     from trimesh.graph import connected_components
 
@@ -302,18 +304,64 @@ def drop_offbody_components(mesh, aabb_limit=0.5, span_tolerance=0.98, max_drop_
         vertices = np.asarray(mesh.vertices[faces[component].ravel()])[:, constrained]
         if (np.abs(vertices) >= aabb_limit).any():
             dropped.append(component)
-    if not dropped:
+    if dropped:
+        drop_faces = np.concatenate(dropped)
+        if len(drop_faces) > max_drop_ratio * len(faces):
+            print(f"Off-body cleanup skipped: {len(drop_faces)} of {len(faces)} faces flagged")
+            return mesh
+        keep = np.ones(len(faces), dtype=bool)
+        keep[drop_faces] = False
+        mesh.update_faces(keep)
+        mesh.remove_unreferenced_vertices()
+        print(f"Removed {len(dropped)} off-body components ({len(drop_faces)} faces)")
+
+    faces = np.asarray(mesh.faces)
+    adjacency = np.asarray(mesh.face_adjacency)
+    if len(adjacency) == 0:
         return mesh
 
-    drop_faces = np.concatenate(dropped)
-    if len(drop_faces) > max_drop_ratio * len(faces):
-        print(f"Off-body cleanup skipped: {len(drop_faces)} of {len(faces)} faces flagged")
+    neighbours = [[] for _ in range(len(faces))]
+    for left, right in adjacency:
+        neighbours[int(left)].append(int(right))
+        neighbours[int(right)].append(int(left))
+
+    edge_lengths = np.asarray(mesh.edges_unique_length)
+    edge_lengths = edge_lengths[np.isfinite(edge_lengths) & (edge_lengths > 0)]
+    if not len(edge_lengths):
+        return mesh
+    aabb_tolerance = float(np.median(edge_lengths))
+    vertices = np.asarray(mesh.vertices)
+    face_vertices = vertices[faces][:, :, constrained]
+    reaches_aabb = np.any(
+        aabb_limit - np.abs(face_vertices) <= aabb_tolerance,
+        axis=(1, 2),
+    )
+
+    chain_faces = set()
+    for seed in np.flatnonzero(reaches_aabb):
+        seed = int(seed)
+        if len(neighbours[seed]) > 1 or seed in chain_faces:
+            continue
+        previous = None
+        current = seed
+        while len(neighbours[current]) <= 2:
+            chain_faces.add(current)
+            onward = [face for face in neighbours[current] if face != previous]
+            if len(onward) != 1:
+                break
+            previous, current = current, onward[0]
+
+    if not chain_faces:
+        return mesh
+    chain_faces = np.fromiter(sorted(chain_faces), dtype=np.int64)
+    if len(chain_faces) > max_drop_ratio * len(faces):
+        print(f"Off-body bridge cleanup skipped: {len(chain_faces)} of {len(faces)} faces flagged")
         return mesh
     keep = np.ones(len(faces), dtype=bool)
-    keep[drop_faces] = False
+    keep[chain_faces] = False
     mesh.update_faces(keep)
     mesh.remove_unreferenced_vertices()
-    print(f"Removed {len(dropped)} off-body components ({len(drop_faces)} faces)")
+    print(f"Removed {len(chain_faces)} off-body bridge-chain faces")
     return mesh
 
 def slat_to_glb(meshes, tex_voxels, resolution=512):
@@ -402,7 +450,11 @@ def inference(ckpt_path, item):
     print("-"*100)
     print("Getting cond ............")
     if not item['2d_map']:
-        render_from_transforms(item['glb'], item['transforms'], item['img'])
+        # transforms.json holds a single calibrated camera; without an azimuth offset that
+        # camera can easily land on the model's back, and the conditioning view decides
+        # which side of the model the part colours are inferred from.
+        render_from_transforms(item['glb'], item['transforms'], item['img'],
+                               azimuths=[item.get('azimuth', 0.0)])
     image = Image.open(item['img'])
     image = preprocess_image(rembg_model, image)
     cond = get_cond(image_cond_model, [image])
@@ -462,6 +514,15 @@ if __name__ == "__main__":
         help="Path to transforms.json (required if not using --two_d_map).",
     )
     parser.add_argument(
+        "--azimuth",
+        type=float,
+        default=0.0,
+        help="Degrees to orbit transforms.json's camera around the up axis when rendering the "
+             "conditioning view (ignored with --two_d_map). transforms.json's own camera is not "
+             "necessarily in front of the model: for data_toolkit/transforms.json and monk.glb, "
+             "0 looks at its back and ~135 is head-on front.",
+    )
+    parser.add_argument(
         "--blender_reuv",
         action="store_true",
         help="After dropping off-body components, Smart Project new UVs in Blender and bake the source albedo back.",
@@ -484,6 +545,7 @@ if __name__ == "__main__":
         "export_glb": os.path.abspath(args.export_glb),
         "blender_reuv": args.blender_reuv,
         "rebake_texture_size": args.rebake_texture_size,
+        "azimuth": args.azimuth,
     }
     if not args.two_d_map:
         item["transforms"] = os.path.abspath(args.transforms)

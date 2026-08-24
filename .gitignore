@@ -24,3 +24,13 @@ data_toolkit/assets/output_2dmap.glb
 data_toolkit/assets/output_full.glb
 data_toolkit/assets/output_interactive.glb
 data_toolkit/assets/output_sam3.glb
+
+# Local secrets (VLM API key for --front_view vlm)
+.env
+
+# Scratch / experiment scripts and run outputs
+.tmp_*
+_tmp_gradio_seg/
+demo_gradio.log
+data_toolkit/assets/mushroom/
+data_toolkit/assets/dwarf/

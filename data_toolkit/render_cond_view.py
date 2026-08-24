@@ -26,12 +26,13 @@ def main():
     parser.add_argument(
         "--azimuths",
         default="0",
-        help="Comma-separated degrees to orbit transforms.json's camera around the up axis, "
-             "e.g. '0,90,180' for the calibrated view (0, roughly a rear 3/4) plus a front "
-             "view (+90, with the data_toolkit/transforms.json camera) plus the other side "
-             "(+180). Check a render before assuming which offset is 'front' for a different "
-             "transforms.json. With more than one value, --out is used as a template: "
-             "'view.png' becomes 'view_0.png', 'view_90.png', 'view_180.png'.",
+        help="Comma-separated degrees to orbit transforms.json's camera around the up axis. "
+             "With data_toolkit/transforms.json and monk.glb, 0 (the calibrated camera) looks "
+             "at the model's BACK, ~135 is head-on front, and 90/180 are front 3/4 views from "
+             "either side; '0,135,225' is a reasonable turntable. The front offset depends on "
+             "how the model itself is oriented, so render a probe before trusting any value. "
+             "With more than one value, --out is used as a template: 'view.png' becomes "
+             "'view_0.png', 'view_135.png', ...",
     )
     args = parser.parse_args()
 

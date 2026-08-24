@@ -24,6 +24,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from data_toolkit.project_2d import label_mesh_from_map
+
 
 def load_single_mesh(path):
     scene = trimesh.load(path, force="scene")
@@ -47,11 +49,29 @@ def face_base_colors(mesh):
 
 
 def palette_from_legend(path):
-    """Part colours the 2D map asked for, so faces can be matched instead of clustered."""
+    """Concept colours the 2D map asked for, plus the part each concept belongs to."""
     with open(path, "r", encoding="utf-8") as f:
         legend = json.load(f)
     colors = np.array([entry["color"] for entry in legend], dtype=np.float64)
-    return colors, [entry["prompt"] for entry in legend]
+    concepts = [entry["prompt"] for entry in legend]
+    parts = [entry.get("part", entry["prompt"]) for entry in legend]
+    return colors, concepts, parts
+
+
+def merge_labels_by_part(labels, part_names_per_label):
+    """Collapse several concept ids that share an output part name into one label."""
+    unique = list(dict.fromkeys(part_names_per_label))
+    index = {name: i for i, name in enumerate(unique)}
+    remap = np.array([index[name] for name in part_names_per_label], dtype=np.int64)
+    return remap[np.asarray(labels)], unique
+
+
+def merge_centers_by_part(centers, part_names_per_label, unique_parts):
+    merged = []
+    for part in unique_parts:
+        first = next(i for i, name in enumerate(part_names_per_label) if name == part)
+        merged.append(centers[first])
+    return np.asarray(merged, dtype=np.float64)
 
 
 def assign_to_palette(colors, centers):
@@ -74,14 +94,34 @@ def cluster_parts(colors, areas, color_tol):
     return labels, centers
 
 
-def smooth_labels(mesh, labels, n_labels, iterations, self_weight=2):
+def welded_face_adjacency(mesh):
+    """Face adjacency across real geometric edges, ignoring UV seams.
+
+    glTF stores a separate vertex per UV corner, so mesh.face_adjacency only sees the
+    fraction of edges whose two faces happen to share vertex indices -- on a SegviGen
+    output that leaves every part shattered into hundreds of "components", which makes
+    both the neighbour vote and the island cleanup below nearly no-ops. Re-index the faces
+    by vertex position first so neighbours are actually recognised. The mesh itself is left
+    alone: welding it would collapse the UVs the bake needs.
+    """
+    positions, inverse = np.unique(mesh.vertices.round(6), axis=0, return_inverse=True)
+    faces = inverse[np.asarray(mesh.faces)]
+    faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])]
+    if len(faces) != len(mesh.faces):
+        # Face indices have to keep lining up with labels/areas, so fall back rather than
+        # silently re-index if welding degenerated any face.
+        return np.asarray(mesh.face_adjacency)
+    return np.asarray(trimesh.Trimesh(vertices=positions, faces=faces, process=False).face_adjacency)
+
+
+def smooth_labels(adjacency, labels, n_labels, iterations, self_weight=2):
     """Majority vote over face neighbours.
 
     Texture filtering and to_glb's seam inpainting blend colours where two parts meet,
     so the thin bands along those seams cluster as colours of their own. They lose the
     vote to the solid regions on either side.
     """
-    adjacency = np.asarray(mesh.face_adjacency)
+    adjacency = np.asarray(adjacency)
     if len(adjacency) == 0:
         return labels
     left, right = adjacency[:, 0], adjacency[:, 1]
@@ -92,6 +132,48 @@ def smooth_labels(mesh, labels, n_labels, iterations, self_weight=2):
         np.add.at(votes, (right, labels[left]), 1)
         votes[rows, labels] += self_weight
         labels = votes.argmax(axis=1)
+    return labels
+
+
+def reassign_label_islands(adjacency, labels, areas, min_island_ratio=0.2):
+    """Hand a part's small detached patches over to the part surrounding them.
+
+    Neighbour voting in smooth_labels only cleans up seam-width noise; a whole boot that
+    got the staff's colour survives it, because inside that patch every neighbour agrees.
+    Such a patch is always disconnected from the rest of its part, so compare each
+    connected patch against the largest patch of the same part and give away the small
+    ones, which mostly ends the "one stray limb in the wrong part" failure.
+    """
+    from trimesh.graph import connected_components
+
+    adjacency = np.asarray(adjacency)
+    if len(adjacency) == 0 or min_island_ratio <= 0:
+        return labels
+
+    labels = labels.copy()
+    same_part = labels[adjacency[:, 0]] == labels[adjacency[:, 1]]
+    patches = connected_components(adjacency[same_part], nodes=np.arange(len(labels)))
+    by_part = {}
+    for patch in patches:
+        by_part.setdefault(labels[patch[0]], []).append(patch)
+
+    for part, part_patches in by_part.items():
+        biggest = max(areas[patch].sum() for patch in part_patches)
+        for patch in part_patches:
+            if areas[patch].sum() >= min_island_ratio * biggest:
+                continue
+            member = np.zeros(len(labels), dtype=bool)
+            member[patch] = True
+            # Faces across the patch border, weighted by area so a long thin contact with
+            # one part cannot outvote a broad one.
+            crossing = adjacency[member[adjacency[:, 0]] != member[adjacency[:, 1]]]
+            outside = np.where(member[crossing[:, 0]], crossing[:, 1], crossing[:, 0])
+            if len(outside) == 0:
+                continue
+            weights = np.bincount(labels[outside], weights=areas[outside])
+            winner = int(weights.argmax())
+            if winner != part:
+                labels[patch] = winner
     return labels
 
 
@@ -107,6 +189,17 @@ def drop_small_parts(labels, centers, areas, min_area_ratio, names=None):
     remap = np.argmin(np.linalg.norm(centers[:, None, :] - kept_centers[None], axis=2), axis=1)
     kept_names = [names[i] for i in keep] if names is not None else None
     return remap[labels], kept_centers, kept_names
+
+
+def _undo_to_glb_rotation_np(points):
+    """Same fix as _undo_to_glb_rotation, without going through Blender.
+
+    to_glb bakes a -90 deg X rotation into every vertex it emits (see the comment in
+    _import_aligned_source); the no-bake split path never touches Blender, so undo it
+    directly on the raw glTF-space vertices instead.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    return np.stack([points[:, 0], -points[:, 2], points[:, 1]], axis=1)
 
 
 def part_geometries(mesh, labels, centers, names=None):
@@ -422,26 +515,88 @@ def bake_parts(parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_marg
     return manifest
 
 
+LABEL_COLORS = np.array(
+    [
+        [220, 40, 40], [40, 90, 230], [30, 180, 70], [240, 210, 30],
+        [40, 200, 210], [230, 70, 180], [140, 50, 200], [240, 130, 30],
+        [20, 120, 120], [180, 180, 40], [80, 40, 160], [40, 160, 40],
+    ],
+    dtype=np.float64,
+)
+
+
+def load_face_labels(labels_path, names_path, n_faces):
+    """Per-face part labels decided elsewhere, e.g. by lifting multi-view SAM3 masks.
+
+    Colours here are only a display placeholder: the labels already say which part each
+    face belongs to, so nothing downstream has to recover that from a colour again.
+    """
+    labels = np.load(os.path.abspath(labels_path))
+    if len(labels) != n_faces:
+        raise ValueError(f"labels cover {len(labels)} faces but the mesh has {n_faces}")
+    with open(os.path.abspath(names_path), "r", encoding="utf-8") as handle:
+        names = json.load(handle)
+    if labels.max(initial=-1) >= len(names):
+        raise ValueError(f"label {int(labels.max())} has no name in {names_path}")
+    centers = LABEL_COLORS[np.arange(len(names)) % len(LABEL_COLORS)]
+    return labels.astype(np.int64), list(names), centers
+
+
+def _split_labels(mesh, palette=None, color_tol=40.0, min_area_ratio=0.01,
+                  smooth_iterations=3, min_island_ratio=0.2,
+                  two_d_map=None, transforms=None, azimuth=0.0,
+                  labels_npy=None, label_names=None):
+    areas = np.asarray(mesh.area_faces)
+    if labels_npy:
+        labels, names, centers = load_face_labels(labels_npy, label_names, len(mesh.faces))
+        print(f"using {len(names)} precomputed face labels: {names}")
+        return part_geometries(mesh, labels, centers, names)
+
+    colors = face_base_colors(mesh)
+    part_names_for_concepts = None
+    projected = False
+    if palette:
+        centers, names, part_names_for_concepts = palette_from_legend(os.path.abspath(palette))
+        labels = assign_to_palette(colors, centers)
+        if two_d_map and transforms:
+            labels = label_mesh_from_map(
+                mesh, labels, os.path.abspath(two_d_map), centers,
+                os.path.abspath(transforms), azimuth, _undo_to_glb_rotation_np,
+            )
+            projected = True
+            print(f"overwrote visible-face labels from {two_d_map}")
+    else:
+        labels, centers = cluster_parts(colors, areas, color_tol)
+        names = None
+    adjacency = welded_face_adjacency(mesh)
+    if not projected:
+        labels = smooth_labels(adjacency, labels, len(centers), smooth_iterations)
+    labels = reassign_label_islands(adjacency, labels, areas, min_island_ratio)
+    if part_names_for_concepts is not None:
+        labels, names = merge_labels_by_part(labels, part_names_for_concepts)
+        centers = merge_centers_by_part(centers, part_names_for_concepts, names)
+    else:
+        labels, centers, names = drop_small_parts(labels, centers, areas, min_area_ratio, names)
+    return part_geometries(mesh, labels, centers, names)
+
+
 def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, color_tol=40.0,
                  min_area_ratio=0.01, smooth_iterations=3, uv_angle_limit=66.0, uv_margin=0.003,
                  cage_extrusion=0.02, max_ray_distance=0.05, samples=16, margin=2,
-                 combined_name="parts.glb", save_textures=False):
+                 combined_name="parts.glb", save_textures=False, min_island_ratio=0.2,
+                 two_d_map=None, transforms=None, azimuth=0.0,
+                 labels_npy=None, label_names=None):
     seg_glb = os.path.abspath(seg_glb)
     source_glb = os.path.abspath(source_glb)
     out_dir = os.path.abspath(out_dir)
 
     mesh = load_single_mesh(seg_glb)
-    areas = np.asarray(mesh.area_faces)
-    colors = face_base_colors(mesh)
-    if palette:
-        centers, names = palette_from_legend(os.path.abspath(palette))
-        labels = assign_to_palette(colors, centers)
-    else:
-        labels, centers = cluster_parts(colors, areas, color_tol)
-        names = None
-    labels = smooth_labels(mesh, labels, len(centers), smooth_iterations)
-    labels, centers, names = drop_small_parts(labels, centers, areas, min_area_ratio, names)
-    parts = part_geometries(mesh, labels, centers, names)
+    parts = _split_labels(
+        mesh, palette=palette, color_tol=color_tol, min_area_ratio=min_area_ratio,
+        smooth_iterations=smooth_iterations, min_island_ratio=min_island_ratio,
+        two_d_map=two_d_map, transforms=transforms, azimuth=azimuth,
+        labels_npy=labels_npy, label_names=label_names,
+    )
 
     print(f"{len(parts)} parts from {len(mesh.faces)} faces")
     for part in parts:
@@ -453,17 +608,79 @@ def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, 
                       combined_name=combined_name, save_textures=save_textures)
 
 
+def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_area_ratio=0.01,
+                          smooth_iterations=3, combined_name="parts.glb", min_island_ratio=0.2,
+                          two_d_map=None, transforms=None, azimuth=0.0,
+                          labels_npy=None, label_names=None):
+    """Split into parts without Blender: no re-UV, no texture bake, no bpy dependency.
+
+    Each part keeps its own flat "part colour" (the same colour it was assigned in the
+    2D/clustering map) as a placeholder vertex colour instead of the source model's real
+    albedo. Much faster than export_parts and works in any plain Python env with trimesh,
+    at the cost of not looking like the original material.
+    """
+    seg_glb = os.path.abspath(seg_glb)
+    out_dir = os.path.abspath(out_dir)
+
+    mesh = load_single_mesh(seg_glb)
+    parts = _split_labels(
+        mesh, palette=palette, color_tol=color_tol, min_area_ratio=min_area_ratio,
+        smooth_iterations=smooth_iterations, min_island_ratio=min_island_ratio,
+        two_d_map=two_d_map, transforms=transforms, azimuth=azimuth,
+        labels_npy=labels_npy, label_names=label_names,
+    )
+
+    print(f"{len(parts)} parts from {len(mesh.faces)} faces (no texture bake)")
+    os.makedirs(out_dir, exist_ok=True)
+    manifest = []
+    scene = trimesh.Scene()
+    for part in parts:
+        suffix = "".join(c if c.isalnum() else "_" for c in part["name"]) if part["name"] else ""
+        name = f"part_{part['label']:02d}" + (f"_{suffix}" if suffix else "")
+        vertices = _undo_to_glb_rotation_np(part["vertices"])
+        rgba = np.array(part["part_color"] + [255], dtype=np.uint8)
+        vertex_colors = np.tile(rgba, (len(vertices), 1))
+        part_mesh = trimesh.Trimesh(
+            vertices=vertices, faces=part["faces"], vertex_colors=vertex_colors, process=False,
+        )
+        scene.add_geometry(part_mesh, node_name=name, geom_name=name)
+        print(f"  {name}: {len(part['faces'])} faces colour={part['part_color']}")
+        manifest.append({
+            "label": part["label"],
+            "name": part["name"],
+            "node": name,
+            "part_color": part["part_color"],
+            "faces": int(len(part["faces"])),
+            "area": part["area"],
+        })
+
+    combined_path = os.path.join(out_dir, combined_name)
+    scene.export(combined_path)
+    print(f"combined {len(parts)} parts -> {combined_path}")
+
+    with open(os.path.join(out_dir, "parts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description="Split SegviGen output into parts and rebake source texture")
     parser.add_argument("--seg_glb", required=True, help="SegviGen output glb (part colours)")
-    parser.add_argument("--source_glb", required=True, help="Original model whose texture is baked back")
+    parser.add_argument("--source_glb", default=None,
+                        help="Original model whose texture is baked back (required unless --no_bake)")
     parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--no_bake", action="store_true",
+                        help="Split into parts without Blender/bpy: no re-UV, no texture bake, "
+                             "each part just keeps a flat placeholder colour. Fast, no --source_glb needed.")
     parser.add_argument("--palette", default=None,
                         help="SAM3 *_legend.json; match faces to its colours instead of clustering")
     parser.add_argument("--texture_size", type=int, default=2048)
     parser.add_argument("--color_tol", type=float, default=40.0, help="RGB distance separating two parts")
     parser.add_argument("--min_area_ratio", type=float, default=0.01, help="Discard parts below this area share")
     parser.add_argument("--smooth_iterations", type=int, default=3, help="Neighbour vote passes over seam bands")
+    parser.add_argument("--min_island_ratio", type=float, default=0.2,
+                        help="Give a part's detached patch to the surrounding part when it is "
+                             "smaller than this share of that part's largest patch. 0 disables.")
     parser.add_argument("--uv_angle_limit", type=float, default=66.0)
     parser.add_argument("--uv_margin", type=float, default=0.003)
     parser.add_argument("--cage_extrusion", type=float, default=0.02)
@@ -483,7 +700,22 @@ def main():
     parser.add_argument("--save_textures", action="store_true",
                         help="Also dump each part's baked texture as a standalone PNG "
                              "(they're always packed inside the combined glb regardless).")
+    parser.add_argument("--two_d_map", default=None,
+                        help="SAM3 colour map; visible faces are labelled from it.")
+    parser.add_argument("--transforms", default=None,
+                        help="transforms.json used to render the conditioning view.")
+    parser.add_argument("--azimuth", type=float, default=0.0,
+                        help="Camera orbit used for the conditioning view, in degrees.")
+    parser.add_argument("--labels", default=None,
+                        help="npy of one part label per face, e.g. from data_toolkit/lift_sam3.py. "
+                             "Bypasses colour clustering and the 2D map entirely.")
+    parser.add_argument("--label_names", default=None,
+                        help="JSON list naming each label index used by --labels.")
     args = parser.parse_args()
+    if not args.no_bake and args.source_glb is None:
+        parser.error("--source_glb is required unless --no_bake is set")
+    if bool(args.labels) != bool(args.label_names):
+        parser.error("--labels and --label_names must be given together")
 
     if args.blender_reuv:
         os.makedirs(os.path.abspath(args.out_dir), exist_ok=True)
@@ -503,6 +735,23 @@ def main():
         print(f"saved {out}")
         return
 
+    if args.no_bake:
+        export_parts_no_bake(
+            args.seg_glb, args.out_dir,
+            palette=args.palette,
+            color_tol=args.color_tol,
+            min_area_ratio=args.min_area_ratio,
+            smooth_iterations=args.smooth_iterations,
+            combined_name=args.combined_name,
+            min_island_ratio=args.min_island_ratio,
+            two_d_map=args.two_d_map,
+            transforms=args.transforms,
+            azimuth=args.azimuth,
+            labels_npy=args.labels,
+            label_names=args.label_names,
+        )
+        return
+
     export_parts(
         args.seg_glb, args.source_glb, args.out_dir,
         palette=args.palette,
@@ -518,8 +767,19 @@ def main():
         margin=args.margin,
         combined_name=args.combined_name,
         save_textures=args.save_textures,
+        min_island_ratio=args.min_island_ratio,
+        two_d_map=args.two_d_map,
+        transforms=args.transforms,
+        azimuth=args.azimuth,
+        labels_npy=args.labels,
+        label_names=args.label_names,
     )
 
 
 if __name__ == "__main__":
     main()
+    # bpy's pip package can access-violate during interpreter teardown after a Cycles
+    # bake (harmless -- happens after every output file is already written), which
+    # would otherwise make callers checking the exit code think this run failed.
+    sys.stdout.flush()
+    os._exit(0)

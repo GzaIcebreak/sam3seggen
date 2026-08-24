@@ -428,7 +428,84 @@ def maybe_blender_reuv(mesh, item):
         texture_size=item.get("rebake_texture_size", 2048),
     )
 
-def inference(ckpt_path, item, input_vxz_points_list):
+POINT_SLOTS = 10
+
+
+def to_latent_coords(tex_encoder, points):
+    """Voxel seeds in [0, 511]^3 as the latent coordinates the point channel lives in.
+
+    Seeds arrive spread widest-first, and only the first few survive the slot budget, so
+    duplicates are dropped in place rather than with torch.unique -- sorting them by
+    coordinate would quietly replace that spread with whichever corner sorts lowest.
+    """
+    coords = torch.tensor(points, dtype=torch.int32).cuda()
+    coords = torch.cat([torch.zeros((coords.shape[0], 1), dtype=torch.int32).cuda(), coords], dim=1)
+    encoded = tex_encoder(sp.SparseTensor(torch.zeros((coords.shape[0], 6), dtype=torch.float32).cuda(), coords)).coords
+    seen, kept = set(), []
+    for row in encoded.tolist():
+        key = tuple(row)
+        if key not in seen:
+            seen.add(key)
+            kept.append(row)
+    return torch.tensor(kept, dtype=torch.int32, device=encoded.device)
+
+
+def build_input_points(tex_encoder, positive, negative=(), negative_slots=0):
+    """Wrap voxel seeds as the sparse point tensor the model was trained to condition on.
+
+    There are only ten slots, and what fills them decides where the part stops. Seeds taken
+    from the neighbouring parts and marked negative look like the obvious way to pin a
+    boundary down, but they cost positive slots and measurably widen the result -- the staff
+    grows from 4% of the surface to 25% -- so they are off unless asked for. Leftover slots
+    sit at the origin marked negative, as in training.
+    """
+    positive_coords = to_latent_coords(tex_encoder, positive)
+    negative_coords = to_latent_coords(tex_encoder, negative) if negative_slots and len(negative) else positive_coords[:0]
+    # A negative that landed in the same latent voxel as a positive would contradict it.
+    if len(negative_coords):
+        clash = (negative_coords[:, None, :] == positive_coords[None, :, :]).all(dim=-1).any(dim=1)
+        negative_coords = negative_coords[~clash]
+
+    negative_coords = negative_coords[:negative_slots]
+    positive_coords = positive_coords[: POINT_SLOTS - len(negative_coords)]
+    negative_coords = negative_coords[:POINT_SLOTS - len(positive_coords)]
+
+    coords = torch.cat([positive_coords, negative_coords], dim=0)
+    labels = [[1]] * len(positive_coords) + [[0]] * len(negative_coords)
+    spare = POINT_SLOTS - len(coords)
+    if spare:
+        coords = torch.cat([coords, torch.zeros((spare, 4), dtype=torch.int32).cuda()], dim=0)
+        labels += [[0]] * spare
+    print(f"  {len(positive_coords)} positive and {len(negative_coords)} negative latent points")
+    return {
+        'point_slats': sp.SparseTensor(coords, coords),
+        'point_labels': torch.tensor(labels, dtype=torch.int32).cuda(),
+    }
+
+
+def paint_parts_volume(template, confidences, palette):
+    """One attribute volume where every voxel carries the colour of its winning part.
+
+    Meshing happens after decimation and a remesh that both follow the attributes, so two
+    runs never produce the same topology and per-face masks cannot be lined up afterwards.
+    The decoded volumes do share their coordinates, though, so the parts are combined here
+    instead, and the result is a single palette-coloured volume -- the same form the
+    non-interactive checkpoint emits, which the existing split-and-bake path already reads.
+    """
+    winner = torch.stack(confidences).argmax(dim=0)
+    feats = template.feats.clone()
+    colours = torch.tensor(palette, dtype=feats.dtype, device=feats.device) / 255.0
+    feats[:, 0:3] = colours[winner]
+    return sp.SparseTensor(feats, template.coords), winner
+
+
+def inference(ckpt_path, item, parts):
+    """Segment one part per entry in `parts`, a list of (name, voxel seeds).
+
+    Voxelising the mesh, encoding it and embedding the conditioning image dominate the
+    runtime and depend only on the input, so they happen once no matter how many parts are
+    asked for. Only the sampling and the texture decode repeat.
+    """
     print("-"*100)
     print("Loading model ............")
     with open("microsoft/TRELLIS.2-4B/pipeline.json", "r") as f:
@@ -465,29 +542,63 @@ def inference(ckpt_path, item, input_vxz_points_list):
     image = preprocess_image(rembg_model, image)
     cond = get_cond(image_cond_model, [image])
 
-    print("-"*100)
-    print("Sampling .................")
-    vxz_points_coords = torch.tensor(input_vxz_points_list, dtype=torch.int32).cuda()
-    vxz_points_coords = torch.cat([torch.zeros((vxz_points_coords.shape[0], 1), dtype=torch.int32).cuda(), vxz_points_coords], dim=1)
-    input_points_coords = tex_encoder(sp.SparseTensor(torch.zeros((vxz_points_coords.shape[0], 6), dtype=torch.float32).cuda(), vxz_points_coords)).coords
-    input_points_coords = torch.unique(input_points_coords, dim=0)
-    point_num = input_points_coords.shape[0]
-    if point_num >= 10:
-        input_points_coords = input_points_coords[:10]
-        point_labels = torch.tensor(([[1]]*10), dtype=torch.int32).cuda()
-    else:
-        input_points_coords = torch.cat([input_points_coords, torch.zeros((10 - point_num, 4), dtype=torch.int32).cuda()], dim=0)
-        point_labels = torch.tensor(([[1]]*point_num+[[0]]*(10-point_num)), dtype=torch.int32).cuda()
-    input_points = {'point_slats': sp.SparseTensor(input_points_coords, input_points_coords), 'point_labels': point_labels}
+    region_confidence, volumes = {}, []
+    for region, part, seeds in parts:
+        print("-"*100)
+        print(f"Sampling {region} from {len(seeds)} seed points ................")
+        # Round-robin so every neighbouring region gets a negative slot; concatenating would
+        # let the first one use them all up and leave the other boundaries unconstrained.
+        others = [points for other, _, points in parts if other != region]
+        negative = [points[i] for i in range(max(map(len, others))) for points in others if i < len(points)] if others else []
+        input_points = build_input_points(tex_encoder, seeds, negative, item.get("negative_slots", 0))
 
-    output_tex_slat = tex_slat_sample_single(gen3dseg, sampler, pipeline_args, shape_slat, tex_slat, cond, input_points)
-    with torch.no_grad():
-        tex_voxels = tex_decoder(output_tex_slat, guide_subs=subs) * 0.5 + 0.5
+        output_tex_slat = tex_slat_sample_single(gen3dseg, sampler, pipeline_args, shape_slat, tex_slat, cond, input_points)
+        with torch.no_grad():
+            tex_voxels = tex_decoder(output_tex_slat, guide_subs=subs) * 0.5 + 0.5
+
+        confidence = tex_voxels[0].feats[:, 0:3].mean(dim=-1)
+        print(f"  claimed {float((confidence > 0.5).float().mean()) * 100:.1f}% of voxels")
+        region_confidence[region] = confidence
+        volumes.append(tex_voxels)
+
+    if item.get("export_dir"):
+        for (region, _, _), tex_voxels in zip(parts, volumes):
+            path = os.path.join(item["export_dir"], f"{region}.glb")
+            maybe_blender_reuv(slat_to_glb(meshes, tex_voxels), item).export(path)
+            print(f"wrote {path}")
+
+    # A grouped part is the union of its regions, and a union of near-binary masks is a max.
+    part_names, confidences = [], []
+    for _, part, _ in parts:
+        if part not in part_names:
+            part_names.append(part)
+    for part in part_names:
+        members = [region for region, other, _ in parts if other == part]
+        confidences.append(torch.stack([region_confidence[r] for r in members]).amax(dim=0))
+        if len(members) > 1:
+            print(f"{part}: union of {len(members)} regions -> "
+                  f"{float((confidences[-1] > 0.5).float().mean()) * 100:.1f}% of voxels")
+    parts = [(name, name, None) for name in part_names]
+
+    if item.get("export_confidence"):
+        # The voxel grid sits in the input glb's own coordinates, so these confidences can be
+        # read back on the original mesh by looking up each face centroid -- no correspondence
+        # between the original topology and the remesh below is needed.
+        np.savez_compressed(
+            item["export_confidence"],
+            coords=volumes[0][0].coords[:, 1:].cpu().numpy().astype(np.int32),
+            confidence=torch.stack(confidences, dim=1).float().cpu().numpy(),
+            names=np.array(part_names),
+        )
+        print(f"wrote {item['export_confidence']}")
 
     print("-"*100)
-    print("Exporting glb ............")
-    glb = maybe_blender_reuv(slat_to_glb(meshes, tex_voxels), item)
-    glb.export(item['export_glb'])
+    print("Combining parts and exporting glb ............")
+    combined, winner = paint_parts_volume(volumes[0][0], confidences, item["palette"])
+    maybe_blender_reuv(slat_to_glb(meshes, [combined]), item).export(item["export_glb"])
+    for index, name in enumerate(part_names):
+        print(f"  {name}: {float((winner == index).float().mean()) * 100:.1f}% of voxels")
+    print(f"wrote {item['export_glb']}")
 
 if __name__ == "__main__":
     import argparse
@@ -526,14 +637,32 @@ if __name__ == "__main__":
         "--export_glb",
         type=str,
         required=True,
-        help="Output glb path.",
+        help="Output glb path: one mesh with a flat palette colour per part.",
     )
     parser.add_argument(
         "--input_vxz_points",
         type=int,
         nargs="+",
-        required=True,
         help="List of voxel coordinates in vxz space in [0-511]^3 space, as a flat list of ints: x1 y1 z1 x2 y2 z2 ...",
+    )
+    parser.add_argument(
+        "--seed_points",
+        type=str,
+        help="JSON mapping part name to voxel seeds, as written by data_toolkit/part_seed_points.py. "
+             "Every part is segmented in one process, which loads the model and encodes the mesh once.",
+    )
+    parser.add_argument(
+        "--export_dir",
+        type=str,
+        help="Optional: also write each part's raw mask as its own glb here, for inspection.",
+    )
+    parser.add_argument(
+        "--negative_slots",
+        type=int,
+        default=0,
+        help="How many of the ten point slots to fill with seeds from the other parts, marked "
+             "negative. They cost positive slots and in testing widened every part, so the "
+             "default is none.",
     )
     parser.add_argument(
         "--blender_reuv",
@@ -548,19 +677,38 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if len(args.input_vxz_points) % 3 != 0:
-        parser.error("--input_vxz_points length must be a multiple of 3 (x y z per point).")
-    input_vxz_points_list = [
-        args.input_vxz_points[i : i + 3]
-        for i in range(0, len(args.input_vxz_points), 3)
-    ]
+    if args.seed_points:
+        with open(os.path.abspath(args.seed_points), "r") as f:
+            parts = [
+                (region, entry["part"], entry["points"])
+                for region, entry in json.load(f).items()
+            ]
+    else:
+        if not args.input_vxz_points:
+            parser.error("pass either --seed_points or --input_vxz_points")
+        if len(args.input_vxz_points) % 3 != 0:
+            parser.error("--input_vxz_points length must be a multiple of 3 (x y z per point).")
+        parts = [("part", "part", [args.input_vxz_points[i : i + 3] for i in range(0, len(args.input_vxz_points), 3)])]
+
+    from data_toolkit.parts_rebake import LABEL_COLORS
+    distinct_parts = list(dict.fromkeys(part for _, part, _ in parts))
+    export_glb = os.path.abspath(args.export_glb)
+    os.makedirs(os.path.dirname(export_glb) or ".", exist_ok=True)
     item = {
         "glb": os.path.abspath(args.glb),
         "input_vxz": os.path.abspath(args.input_vxz),
         "transforms": os.path.abspath(args.transforms),
         "img": os.path.abspath(args.img),
-        "export_glb": os.path.abspath(args.export_glb),
+        "export_glb": export_glb,
+        "export_dir": os.path.abspath(args.export_dir) if args.export_dir else None,
+        "export_confidence": os.path.splitext(export_glb)[0] + "_confidence.npz",
+        "negative_slots": args.negative_slots,
+        "palette": LABEL_COLORS[: len(distinct_parts)].tolist(),
         "blender_reuv": args.blender_reuv,
         "rebake_texture_size": args.rebake_texture_size,
     }
-    inference(os.path.abspath(args.ckpt_path), item, input_vxz_points_list)
+    if item["export_dir"]:
+        os.makedirs(item["export_dir"], exist_ok=True)
+    with open(os.path.splitext(export_glb)[0] + "_parts.json", "w") as f:
+        json.dump(distinct_parts, f, indent=2)
+    inference(os.path.abspath(args.ckpt_path), item, parts)
