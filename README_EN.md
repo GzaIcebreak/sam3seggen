@@ -167,6 +167,49 @@ The original entry points still work unchanged — interactive segmentation
 python -m unittest discover tests
 ```
 
+## 🧪 Fine-tuning (fixing "SAM3 colours don't make it into SegviGen")
+
+Full documentation lives in [`finetune/README.md`](finetune/README.md) (Chinese). Every
+script runs from the repo root via `finetune\run_ft.bat <script> <args>` (same environment
+variables as the inference .bat files, `.venv`); only `sam3_masks.py` runs in `.venv_holo`
+and is spawned automatically as a subprocess by path A.
+
+**Why.** The upstream 2D-guidance model was trained on pixel-perfect maps rasterised from the
+3D ground truth. SAM3 maps have ragged edges, missed parts, grey unassigned regions and
+semantic merges — that domain gap is the root cause of colours not being honoured. The
+`finetune/` pipeline adapts the `full_seg_w_2d_map` model with LoRA so that colours follow the
+2D map with boundaries snapped to geometry, and grey means *unassigned* (a grey part stays grey
+in 3D instead of receiving a guessed colour; a half-covered part is completed in 3D).
+
+**Two sample-generation paths.** Each object is voxelised / encoded once; a variant only
+recolours the voxels and re-runs the texture encoder, so dozens of variants per object are cheap:
+
+| Path | Source of the 2D condition map | Scripts |
+|---|---|---|
+| A | Blender render of the textured mesh → SAM3 masks → bound to GT parts (coverage / precision rules, unbound parts turn grey) | `make_samples_a.py` |
+| B | Pixel-perfect map + synthetic corruption (boundary jitter, speckle, whole-part grey, partial erase, grey holes, neighbour merge) | `make_samples_b.py` + `corrupt.py` |
+
+```bat
+REM Data: PartVerse (resumable download -> split by anno_infos face labels -> prompts from captions)
+finetune\run_ft.bat download_partverse.py --out E:\data\partverse
+finetune\run_ft.bat import_partverse.py --partverse E:\data\partverse --out E:\data\pv --limit 2500
+
+REM Samples: chunked subprocess driver (object lists for path B / path A), isolates native o_voxel crashes, resumable
+finetune\run_ft.bat run_batch.py --dataset_root E:\data\pv --objects_b E:\data\pv_list_b.txt --objects_a E:\data\pv_list_a.txt
+
+REM Train / export / evaluate
+finetune\run_ft.bat train.py --dataset_root E:\data\pv --out_dir finetune\runs\v1 --max_steps 4000
+finetune\run_ft.bat merge_lora.py --lora finetune\runs\v1\lora_last.pt --out ckpt\full_seg_w_2d_map_ft.ckpt
+finetune\run_ft.bat eval_fidelity.py --object E:\data\pv\<obj> --variant <name> --run_inference --ckpt ckpt\full_seg_w_2d_map_ft.ckpt
+```
+
+**Modules.** `common.py` (directory layout, ID palette, camera reproduction, voxel recolouring,
+SLAT encoding, DINOv3 conditioning), `dataset.py` / `lora.py` / `model.py` / `train.py`
+(v-prediction flow-matching LoRA training with step-0 per-kind loss checks and holdout),
+`merge_lora.py` (folds LoRA into a checkpoint usable directly by `inference_full.py`),
+`eval_fidelity.py` (fidelity / purity of an output GLB against the colours the 2D map asked for,
+with automatic Y-up frame alignment).
+
 ## ⚖️ License
 
 This project is licensed under the [MIT License](LICENSE).

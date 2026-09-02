@@ -34,3 +34,11 @@ _tmp_gradio_seg/
 demo_gradio.log
 data_toolkit/assets/mushroom/
 data_toolkit/assets/dwarf/
+
+# Fine-tuning run outputs (LoRA weights, logs) and generated sample datasets
+finetune/runs/
+finetune/samples/
+
+# Reference material pulled from the HF demo Space (not part of this repo)
+demo_space/
+demo_examples/

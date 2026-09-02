@@ -6,11 +6,12 @@ import os
 import numpy as np
 
 class BpyRenderer:
-    def __init__(self, resolution=512, engine="CYCLES", geo_mode=False, split_normal=False):
+    def __init__(self, resolution=512, engine="CYCLES", geo_mode=False, split_normal=False, samples=None):
         self.resolution = resolution
         self.engine = engine
         self.geo_mode = geo_mode
         self.split_normal = split_normal
+        self.samples = samples
         self.import_functions = self._setup_import_functions()
 
     def _setup_import_functions(self):
@@ -39,7 +40,7 @@ class BpyRenderer:
         bpy.context.scene.render.film_transparent = True
         if self.engine == "CYCLES":
             bpy.context.scene.render.engine = "CYCLES"
-            bpy.context.scene.cycles.samples = 128 if not self.geo_mode else 1
+            bpy.context.scene.cycles.samples = (self.samples or 128) if not self.geo_mode else 1
             bpy.context.scene.cycles.filter_type = "BOX"
             bpy.context.scene.cycles.filter_width = 1
             bpy.context.scene.cycles.diffuse_bounces = 1
@@ -338,8 +339,8 @@ class BpyRenderer:
             written.append(path)
         return written
 
-def render_from_transforms(file_path, transforms_json_path, output_path, resolution=512, engine="CYCLES", geo_mode=False, split_normal=False, ref_glb=None, azimuths=None):
-    renderer = BpyRenderer(resolution=resolution, engine=engine, geo_mode=geo_mode, split_normal=split_normal)
+def render_from_transforms(file_path, transforms_json_path, output_path, resolution=512, engine="CYCLES", geo_mode=False, split_normal=False, ref_glb=None, azimuths=None, samples=None):
+    renderer = BpyRenderer(resolution=resolution, engine=engine, geo_mode=geo_mode, split_normal=split_normal, samples=samples)
     return renderer.render_from_transforms(file_path, transforms_json_path, output_path, ref_glb=ref_glb, azimuths=azimuths)
 
 if __name__ == "__main__":

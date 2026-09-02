@@ -39,6 +39,12 @@ mesh，带真实贴图。
 图例/清单严格校验与 `--sam3_only` 审计模式、离体碎片清理、图集合并的 glTF V 轴翻转与
 metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
 
+**微调 —— 让 SAM3 的颜色真正进入 SegviGen。**
+原模型的 2D 引导图是从 3D 真值光栅出来的像素级完美图，而 SAM3 给的图边缘毛糙、有整件漏检、
+有灰色未分配区域、有语义合并——这个域差是"SAM3 颜色进不了 SegviGen"的根因。`finetune/`
+提供了完整的域适配 LoRA 微调管线（两条建样本路 + 训练 + 评估），详见下文
+[微调](#-微调修-sam3-颜色进不了-segvigen)。
+
 ## 📷 效果
 
 自动选出的正面 → SAM3 语义 2D 图 → 最终带贴图拆分结果（蘑菇 + 椅子，恰好两个 mesh）：
@@ -153,6 +159,43 @@ mesh 节点。
 ```sh
 python -m unittest discover tests
 ```
+
+## 🧪 微调（修 "SAM3 颜色进不了 SegviGen"）
+
+完整文档见 [`finetune/README.md`](finetune/README.md)。所有脚本在仓库根目录下通过
+`finetune\run_ft.bat <脚本> <参数>` 运行（与推理 .bat 相同的环境变量，使用 `.venv`；只有
+`sam3_masks.py` 走 `.venv_holo`，由路 A 自动以子进程调用）。
+
+**目标。** 对 `full_seg_w_2d_map` 模型做 LoRA 域适配，让它学会两件事：颜色严格跟着 2D 图走、
+边界贴到几何上（锯齿 / 溢出 / 斑点不进 3D）；灰 = 未分配（2D 里整件是灰的，3D 也输出灰而不是
+乱猜一个色；2D 只覆盖半件的，3D 整件补全同色）。
+
+**两条建样本路。** 每个物体只体素化 / 编码一次，之后每个变体只是给体素重新上色再过一次纹理编码器，
+所以一个物体出几十个变体很便宜：
+
+| 路 | 2D 条件图来源 | 脚本 |
+|---|---|---|
+| A | Blender 渲染真实贴图 → SAM3 掩码 → 绑定到真值部件（覆盖率 / 精度规则，未绑定件变灰） | `make_samples_a.py` |
+| B | 像素级完美图 + 合成腐蚀（边界抖动、斑点、整件变灰、半件擦除、灰洞、邻件合并） | `make_samples_b.py` + `corrupt.py` |
+
+```bat
+REM 数据：PartVerse（断点续传下载 → 按 anno_infos 面片标签拆件 → 从 caption 抽提示词）
+finetune\run_ft.bat download_partverse.py --out E:\data\partverse
+finetune\run_ft.bat import_partverse.py --partverse E:\data\partverse --out E:\data\pv --limit 2500
+
+REM 建样本：分块子进程驱动（路 B 2000 个 + 路 A 500 个对象列表），隔离 o_voxel 原生崩溃，可恢复
+finetune\run_ft.bat run_batch.py --dataset_root E:\data\pv --objects_b E:\data\pv_list_b.txt --objects_a E:\data\pv_list_a.txt
+
+REM 训练 / 导出 / 评估
+finetune\run_ft.bat train.py --dataset_root E:\data\pv --out_dir finetune\runs\v1 --max_steps 4000
+finetune\run_ft.bat merge_lora.py --lora finetune\runs\v1\lora_last.pt --out ckpt\full_seg_w_2d_map_ft.ckpt
+finetune\run_ft.bat eval_fidelity.py --object E:\data\pv\<obj> --variant <name> --run_inference --ckpt ckpt\full_seg_w_2d_map_ft.ckpt
+```
+
+**模块。** `common.py`（目录规范、ID 色板、相机复现、体素重着色、SLAT 编码、DINOv3 条件）、
+`dataset.py` / `lora.py` / `model.py` / `train.py`（v-pred flow-matching LoRA 训练，含 step-0
+分组损失检查、holdout）、`merge_lora.py`（合并为可直接被 `inference_full.py` 使用的 ckpt）、
+`eval_fidelity.py`（输出 GLB 与 2D 图预期颜色的保真度 / 纯度，自动对齐 Y-up 帧）。
 
 ## ⚖️ License
 
