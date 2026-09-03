@@ -116,11 +116,21 @@ def main():
     parser.add_argument("--check_only", action="store_true")
     parser.add_argument("--check_ts", default="0.2,0.5,0.8")
     parser.add_argument("--check_every", type=int, default=0, help="Run the loss check on the holdout every N steps")
+    parser.add_argument("--check_limit", type=int, default=0,
+                        help="Cap the check set to this many variants, sampled evenly per kind (0 = all)")
     parser.add_argument("--check_root", nargs="*", default=None, help="Extra roots evaluated (not trained on)")
     parser.add_argument("--holdout_file", default=None,
                         help="Object names (one per line) excluded from training and added to the holdout check")
     parser.add_argument("--no_checkpointing", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    parser.add_argument("--wandb_project", default="segvigen-finetune")
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_name", default=None, help="Display name (default: out_dir basename)")
+    parser.add_argument("--wandb_id", default=None,
+                        help="Run id to resume; defaults to out_dir basename so train_loop restarts "
+                             "continue one run instead of starting a new one each time")
+    parser.add_argument("--wandb_mode", default="online", choices=["online", "offline"])
     args = parser.parse_args()
 
     os.chdir(common.ROOT)
@@ -136,15 +146,35 @@ def main():
     kinds = dataset.kinds()
     print(f"{len(dataset)} variants: " + ", ".join(f"{k}={kinds.count(k)}" for k in sorted(set(kinds))))
 
+    def subsample(ds: VariantDataset, limit: int) -> VariantDataset:
+        """Even stride per kind, so the check set keeps the clean/corrupt/sam3 mix."""
+        if not limit or len(ds) <= limit:
+            return ds
+        by_kind = defaultdict(list)
+        for item in ds.items:
+            by_kind[item[2]["kind"]].append(item)
+        per_kind = max(1, limit // len(by_kind))
+        picked = []
+        for kind in sorted(by_kind):
+            items = by_kind[kind]
+            stride = max(1, len(items) // per_kind)
+            picked += items[::stride][:per_kind]
+        ds.items = picked
+        return ds
+
     model = load_gen3dseg(args.ckpt, device)
     for p in model.parameters():
         p.requires_grad_(False)
     lora_params = inject_lora(model.flow_model, r=args.lora_r, alpha=args.lora_alpha,
                               targets=args.lora_targets.split(","), dropout=args.lora_dropout)
     model.to(device)
+    start_step = 0
     if args.resume_lora:
-        load_lora_state_dict(model, torch.load(args.resume_lora, map_location="cpu")["lora"])
-        print(f"resumed LoRA from {args.resume_lora}")
+        payload = torch.load(args.resume_lora, map_location="cpu")
+        load_lora_state_dict(model, payload["lora"])
+        # Continue the LR schedule instead of re-warming up, so an interrupted run resumes cleanly.
+        start_step = int(payload.get("step", 0))
+        print(f"resumed LoRA from {args.resume_lora} at step {start_step}")
     n_lora = sum(p.numel() for p in lora_params)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"LoRA params {n_lora / 1e6:.2f}M of {n_total / 1e9:.2f}B ({100 * n_lora / n_total:.3f}%)")
@@ -153,7 +183,12 @@ def main():
 
     if args.check_only:
         model.eval()
-        result = check_loss(model, dataset, ts, device, args.seed)
+        # With a holdout the baseline must come from the held-out objects, so it stays comparable
+        # to the periodic checks during training.
+        target = VariantDataset(args.dataset_root, kinds=args.kinds, objects=holdout) if holdout else dataset
+        target = subsample(target, args.check_limit)
+        print(f"checking {len(target)} variants ({'holdout' if holdout else 'train set'})")
+        result = check_loss(model, target, ts, device, args.seed)
         os.makedirs(args.out_dir, exist_ok=True)
         with open(os.path.join(args.out_dir, "check_loss.json"), "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2)
@@ -173,7 +208,25 @@ def main():
         check_dataset = check_items[0]
         for extra in check_items[1:]:
             check_dataset.items += extra.items
+        check_dataset = subsample(check_dataset, args.check_limit)
         print(f"holdout: {len(check_dataset)} variants")
+
+    run = None
+    if args.wandb:
+        import wandb
+        # Resuming one id keeps train_loop's restarts as a single continuous run.
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity, mode=args.wandb_mode,
+            id=args.wandb_id or os.path.basename(os.path.normpath(args.out_dir)),
+            name=args.wandb_name or os.path.basename(os.path.normpath(args.out_dir)),
+            resume="allow",
+            config={**vars(args), "n_variants": len(dataset), "n_lora_params": n_lora,
+                    "variants_per_kind": {k: kinds.count(k) for k in sorted(set(kinds))},
+                    "n_holdout_variants": len(check_dataset) if check_dataset is not None else 0},
+        )
+        wandb.define_metric("train/loss", summary="min")
+        wandb.define_metric("holdout/*", summary="min")
+        print(f"wandb: {run.url or args.wandb_mode}")
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.99))
 
@@ -187,8 +240,9 @@ def main():
                         num_workers=0, drop_last=True)
     log_path = os.path.join(args.out_dir, "log.jsonl")
     model.train()
-    step, micro, ema = 0, 0, None
+    step, micro, ema = start_step, 0, None
     t0 = time.time()
+    t_last, step_last = t0, step
     kind_acc = defaultdict(list)
     while step < args.max_steps:
         for batch in loader:
@@ -217,6 +271,15 @@ def main():
                 print(json.dumps(rec))
                 with open(log_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec) + "\n")
+                if run is not None:
+                    # Rate since the previous log point, so GPU contention shows up instead of
+                    # being averaged away over the whole run.
+                    now = time.time()
+                    run.log({"train/loss": rec["loss"], "train/ema": ema, "train/lr": rec["lr"],
+                             "train/vram_gib": rec["vram_gib"],
+                             "train/s_per_step": (now - t_last) / max(1, step - step_last),
+                             **{f"train/loss_{k}": v for k, v in per_kind.items()}}, step=step)
+                    t_last, step_last = now, step
             if step % args.save_every == 0 or step == args.max_steps:
                 payload = {"lora": lora_state_dict(model), "step": step, "args": vars(args)}
                 torch.save(payload, os.path.join(args.out_dir, f"lora_step{step}.pt"))
@@ -226,10 +289,14 @@ def main():
                 result = check_loss(model, check_dataset, ts, device, args.seed)
                 with open(os.path.join(args.out_dir, f"check_step{step}.json"), "w", encoding="utf-8") as f:
                     json.dump(result, f, indent=2)
+                if run is not None:
+                    run.log({f"holdout/{k}": s["mean"] for k, s in result["summary"].items()}, step=step)
                 model.train()
             if step >= args.max_steps:
                 break
     print(f"done: {step} steps, {(time.time() - t0) / 60:.1f} min, peak VRAM {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+    if run is not None:
+        run.finish()
 
 
 if __name__ == "__main__":

@@ -64,8 +64,47 @@ finetune\run_ft.bat merge_lora.py --lora finetune\runs\v1\lora_last.pt --out ckp
 ```
 
 目标与 TRELLIS.2 训练器一致:v-prediction MSE、logit-normal t、sigma_min 1e-5、条件按 `p_uncond` 置零。
-基座冻结、bf16;LoRA 参数 fp32;默认开梯度检查点。RTX 5090 上 batch 2 峰值约 6.7 GiB、约 4 s/步。
-`--lora_targets cross` 只训交叉注意力(更保守)。
+基座冻结、bf16;LoRA 参数 fp32;默认开梯度检查点。RTX 5090 上 batch 2 峰值约 6.7 GiB、约 4 s/步,
+batch 4 峰值约 8.9 GiB、约 2.2 s/步(GPU 无争用时)。`--lora_targets cross` 只训交叉注意力(更保守)。
+
+`--check_only` 在给了 `--holdout_file` 时只评留出对象(否则整个训练集都要过一遍);
+`--check_limit N` 按 kind 等比抽样把校验集封顶,训练中的周期性校验同样受它约束。
+
+### 长跑:别让训练跟着终端一起死
+
+后台起的进程会随会话结束被回收。用计划任务(或任何脱离会话的方式)拉起 `train_loop.bat`:
+它在 python 非正常退出后自动带 `--resume_lora <out_dir>\lora_last.pt` 重试,`train.py` 会从
+checkpoint 里的 step 继续学习率 schedule,不重新 warmup。配合 `--save_every 250`,一次中断最多损失几分钟。
+
+```bat
+REM <attempts> <out_dir> <train.py 的其余参数>
+finetune\train_loop.bat 30 finetune\runs\pv_v1 --dataset_root E:\data\pv --max_steps 4000 --save_every 250
+```
+
+看进度(读 `log.jsonl`,算 s/step 与 ETA,列出 checkpoint 与各次 holdout 校验):
+
+```powershell
+powershell -File finetune\watch_train.ps1 -Follow
+```
+
+注意计划任务默认以较低优先级运行;若发现磁盘 I/O 成为瓶颈,把任务 XML 里的 `<Priority>` 调到 4。
+
+### wandb
+
+```bat
+.venv\Scripts\wandb login                      REM 或设置 WANDB_API_KEY
+set SEGVIGEN_PROXY=http://127.0.0.1:7078       REM 需要代理才能出网时(run_ft.bat 会转成 HTTP(S)_PROXY)
+finetune\run_ft.bat train.py --dataset_root E:\data\pv --out_dir finetune\runs\pv_v1 --wandb
+```
+
+记录 `train/loss`、`train/ema`、`train/lr`、`train/loss_<kind>`(clean / corrupt / sam3 分开)、
+`train/s_per_step`、`train/vram_gib`,以及每次周期性校验的 `holdout/<kind>`;config 里带上变体总数与
+各 kind 的构成。**`--wandb_id` 默认取 `out_dir` 的目录名并以 `resume="allow"` 初始化**,
+所以 `train_loop.bat` 的多次重启会续在同一个 run 上,而不是每次断了就新开一条曲线。
+出不了网就用 `--wandb_mode offline`,事后 `wandb sync <offline-run 目录>`。
+
+要盯的核心指标是 `holdout/sam3`:它跌下来才说明真实 SAM3 条件下的表现在变好,
+训练损失下降本身可能只是拟合了合成腐蚀。
 
 ## PartVerse
 
