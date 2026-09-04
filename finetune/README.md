@@ -7,6 +7,8 @@
 2. 灰 = 未分配:2D 里整件是灰的,3D 里也输出灰(150,150,150),而不是乱猜一个色;
    2D 只覆盖了半件的,3D 里整件补全同色
 
+改动全貌、v1/v2 结果、数据修复与原论文的损失/条件结构对照见 [`REPORT_v3_changes.md`](REPORT_v3_changes.md)。
+
 所有脚本在 SegviGen 根目录下通过 `finetune\run_ft.bat <脚本> <参数>` 运行
 (它设置了与推理 .bat 相同的环境变量并使用 `.venv`);只有 `sam3_masks.py` 用 `.venv_holo`,
 由 `make_samples_a.py` 自动以子进程调用。
@@ -141,11 +143,65 @@ finetune\run_ft.bat eval_fidelity.py --object E:\data\ft\example --variant sam3_
 finetune\run_ft.bat eval_fidelity.py --object E:\data\ft\example --variant sam3_az0 --ckpt ckpt\full_seg_w_2d_map_sam3.ckpt
 ```
 
-- `fidelity`:该件表面上颜色等于 2D 图分给它的颜色(灰件则应为灰)的比例;`parts_correct(>=0.8)` 计数
-- `purity`:该件表面上占主导颜色的比例,低 = 被撕碎;`other_share`:不属于任何图例色的比例
-- 视角里完全不可见的件不计分(单独给 `hidden_mean_purity`)
+打分是"最近邻调色板归属",不是颜色相等。SegviGen 的解码器复现调色板色时会有几十个 RGB 单位的
+偏移,用绝对距离阈值会把颜色其实对了的件判成错:期望 (210,242,63) 输出成 (146,239,81) 是同一个
+黄绿色、距离 66,而 60 的阈值给 0 分。分割真正需要的是归属对,所以每个采样点取最近的图例色、不设
+阈值,偏移单独用距离报告,让两种失效模式可区分。
+
+- `fidelity`:该件表面上最近邻图例色 = 2D 图分给它的色(灰件则为灰)的采样点比例;`parts_correct(>=0.8)` 计数
+- `parts_assigned_correct`:主导归属正确的件数 —— 这是"颜色有没有进去"最直接的读数
+- `dist_median` / `median_dist`:到期望色的距离,即偏色程度;`margin`:到期望色的距离减到最近竞争色的距离,
+  负值 = 归属正确,接近 0 = 快要翻错(比 fidelity 更早预警)
+- `purity`:该件表面上占主导归属的比例,低 = 被撕碎
+- `fidelity_snap60` / `mean_fidelity_snap60`:旧的 60 单位阈值口径,只为和早期报告对比而保留
+- `metric` 字段区分新旧报告;视角里完全不可见的件不计分(单独给 `hidden_mean_purity`)
 - 输出 GLB 是 TRELLIS 的 Y-up 坐标(相对输入绕 X 转 90°),脚本自动在候选坐标系中选覆盖率最高的
 - step-0 vs 训练后:`check_loss.json` 里 sam3/corrupt 与 clean 的差距应缩小
 - 留出集建议 PartObjaverse-Tiny + 自己的资产(monk / dwarf / 1.glb)
 
-基线(example.glb,基座 ckpt,sam3_az0):mean_fidelity 0.76,8/10 件正确;错的是 SAM3 给了红色却没进 3D 的小窗。
+基线(3 个 PartVerse 留出对象,基座 ckpt,sam3_az0):mean_fidelity 0.953,28 件里 27 件归属正确,
+中位偏色 28~67 单位。唯一真错的是一把小钥匙被判给了邻件的蓝色。同一批数据在旧阈值口径下只有 0.656,
+差距全部来自偏色被误判成归属错误。
+
+v3 新增指标:`fragments`(每个颜色在表面均匀采样点上的连通块数,基于输入部件采样,输出网格拓扑不会虚增)、
+`boundary_f1`(预测颜色边界 vs 期望边界的点级 F1,容差 1% 物体尺度);`--shuffle_legend` / `--swap_names`
+分别做"打乱图例"对照和"互换两个名字看边界是否跟着动"的语义冲突测试。硬样本集由 `pick_hard.py` 按
+`voxel_part.npy` 里"细长件贴在大件上"的接触面积选出。
+
+## v3:SAM3 概念库 + 图例 token + 双视角
+
+v1/v2 只做了 LoRA 域适配,颜色语义仍完全靠 latent MSE 隐式学习,留出 MSE 降了 8% 但颜色归属没有变好。
+v3 分两层注入语义(细节与公式见 `REPORT_v3_changes.md` 第 4、6 节):
+
+**SAM3 侧(`.venv_holo`)**:`render_views.py` 给每个对象补 `render.png` + GT `ids.npy`;`bench_sam3.py` 比较提示词模板
+(结论:裸 `{name}` 最好);`concept_bank.py` 在冻结的 SAM3 上学两个 256 维文本偏移 `E_0`(共享)+ `E_name`(逐名字),
+损失 = 正样本 BCE+Dice + 负样本 BCE + presence BCE,`--neg_mode random|hard|mixed`;导出 `bank.pt` 与 `text_cache.pt`。
+评测同时报告 `--eval_thresholds` 下的多阈值结果,以便**在相同误检率下**比较不同 bank(概念库会整体抬高分数,
+只看默认阈值 0.3 会把标定漂移误判成误检飙升)。
+
+```bat
+set HF_ENDPOINT=https://hf-mirror.com
+.venv_holo\Scripts\python finetune\concept_bank.py --dataset_root E:\...\pv --out E:\...\concept_bank_v3 ^
+    --holdout_file E:\...\pv_holdout_v3.txt --epochs 3 --neg_mode mixed --lr_e0 5e-4 --max_prompts 12 --wandb
+.venv_holo\Scripts\python finetune\concept_bank.py ... --eval_only --resume E:\...\concept_bank_v3\bank.pt --eval_thresholds 0.4,0.5,0.6,0.7
+```
+
+`sam3_to_2dmap.py` / `sam3_masks.py` 用 `--concept_bank bank.pt` 加载偏移,并把每个部件实际用到的 256 维文本向量
+一起写进图例,供 SegviGen 侧使用。
+
+**SegviGen 侧(`.venv`)**:`model.py::LegendEncoder` 把条件从单路 DINO token 扩成
+`[主视角 DINO + e_view0; 第二视角 DINO + e_view1; 物体名 token; 每个颜色组一个图例 token]`,
+图例 token = LN(W_t·text_256 + MLP(rgb) + e_legend)。DiT 本体不改(交叉注意力原生接受变长上下文)。
+
+```bat
+finetune\run_ft.bat train.py --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt ^
+    --text_cache E:\...\concept_bank_v3\text_cache.pt --pair --p_drop_legend 0.2 --p_drop_view1 0.3 ^
+    --out_dir finetune\runs\pv_v3 --max_steps 1000 --wandb
+REM 对照:同参数 + --legend_shuffle --out_dir finetune\runs\pv_v3_shuffle;若 fidelity 与 pv_v3 相同,说明模型没读文本
+finetune\run_ft.bat merge_lora.py --lora finetune\runs\pv_v3\lora_final.pt --out ckpt\full_seg_v3.ckpt   REM 另存 ckpt\full_seg_v3_legend.pt
+finetune\run_ft.bat eval_fidelity.py ... --ckpt ckpt\full_seg_v3.ckpt --legend_ckpt ckpt\full_seg_v3_legend.pt ^
+    --text_cache ...\text_cache.pt --pair
+```
+
+`make_samples_a.py` / `make_samples_b.py` 默认给同一对象的两个视角一套共同调色板并共享 3D 目标(`--no_pair` 关闭),
+`dataset.py` 据此返回 `cond_partner` 与图例。

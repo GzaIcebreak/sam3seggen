@@ -46,6 +46,11 @@ def process_object(obj: ObjectDir, encoders, cond_models, azimuths, n_corrupt: i
     aabb = np.asarray(meta["aabb"])
     n_parts = meta["n_parts"]
     written = []
+    # One palette per object: the clean views of an object form a pair with a shared 3D target
+    # (hidden_policy "gt" keeps every part coloured, so the target is view-independent).
+    shared_colors = common.random_palette(rng, n_parts)
+    tags = [view_tag(az) for az in azimuths]
+    first_clean = None
     for az in azimuths:
         labels = ensure_ids_raster(obj, parts, aabb, az, force=force)
         tag = view_tag(az)
@@ -54,13 +59,20 @@ def process_object(obj: ObjectDir, encoders, cond_models, azimuths, n_corrupt: i
             continue
         hidden = [p for p in range(n_parts) if p not in visible]
 
-        colors = common.random_palette(rng, n_parts)
+        colors = shared_colors
         groups = [[p] for p in range(n_parts)]
         grey = hidden if hidden_policy == "grey" else []
         groups_c = [g for g in groups if g[0] not in grey]
+        colors_c = [colors[g[0]] for g in groups_c]
+        paired = hidden_policy == "gt" and len(azimuths) > 1
+        extra = {"ops": [], "hidden_parts": hidden}
+        if paired:
+            extra.update({"pair": "clean", "pair_views": tags})
+        vname = f"clean_{tag}"
         written.append(common.write_variant(
-            obj, f"clean_{tag}", labels, groups_c, grey, colors[:len(groups_c)], "clean", tag,
-            encoders, cond_models, extra={"ops": [], "hidden_parts": hidden}, force=force))
+            obj, vname, labels, groups_c, grey, colors_c, "clean", tag,
+            encoders, cond_models, extra=extra, force=force, target_from=first_clean if paired else None))
+        first_clean = first_clean or vname
 
         for k in range(n_corrupt):
             c_labels, c_groups, c_grey, ops = corrupt(labels, n_parts, rng)

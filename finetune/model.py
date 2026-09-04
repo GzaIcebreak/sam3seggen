@@ -47,6 +47,43 @@ class Gen3DSeg(nn.Module):
         return sp.SparseTensor(torch.cat(feats), torch.cat(coords))
 
 
+class LegendEncoder(nn.Module):
+    """v3 conditioning: [main-view DINO tokens (+e_view0), partner-view tokens (+e_view1),
+    object token, one legend token per colour group].
+
+    legend token = LN(W_t * text_256 + MLP(rgb) + e_legend); object token = LN(W_t * text + e_obj).
+    DINO tokens are already per-token layer-normed (rms 1), so the LN keeps the new tokens on the
+    same scale. The DiT cross-attention takes a variable-length context per sample (list of
+    tensors), so no padding is involved.
+    """
+
+    def __init__(self, text_dim: int = 256, cond_dim: int = 1024, hidden: int = 256):
+        super().__init__()
+        self.text_proj = nn.Linear(text_dim, cond_dim)
+        self.color_mlp = nn.Sequential(nn.Linear(3, hidden), nn.GELU(), nn.Linear(hidden, cond_dim))
+        self.e_view = nn.Parameter(torch.zeros(2, cond_dim))
+        self.e_legend = nn.Parameter(torch.zeros(cond_dim))
+        self.e_obj = nn.Parameter(torch.zeros(cond_dim))
+        self.norm = nn.LayerNorm(cond_dim)
+        nn.init.normal_(self.text_proj.weight, std=0.02)
+        nn.init.zeros_(self.text_proj.bias)
+        nn.init.normal_(self.e_view, std=0.02)
+
+    def forward(self, cond: torch.Tensor, cond_partner: torch.Tensor | None,
+                legend_text: torch.Tensor | None, legend_rgb: torch.Tensor | None,
+                obj_text: torch.Tensor | None, use_view_emb: bool = True) -> torch.Tensor:
+        """All inputs for ONE sample; returns [L, cond_dim]."""
+        blocks = [cond + self.e_view[0] if use_view_emb else cond]
+        if cond_partner is not None:
+            blocks.append(cond_partner + self.e_view[1])
+        if obj_text is not None:
+            blocks.append(self.norm(self.text_proj(obj_text) + self.e_obj).unsqueeze(0))
+        if legend_text is not None and legend_text.shape[0] > 0:
+            tok = self.text_proj(legend_text) + self.color_mlp(legend_rgb) + self.e_legend
+            blocks.append(self.norm(tok))
+        return torch.cat(blocks, 0)
+
+
 def load_gen3dseg(ckpt_path: str = DEFAULT_CKPT, device: str = "cuda") -> Gen3DSeg:
     flow = models.from_pretrained(FLOW_MODEL)
     model = Gen3DSeg(flow)

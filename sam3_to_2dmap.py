@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -95,8 +96,25 @@ def load_sam3(model_id: str, device: str):
     return processor, model
 
 
+def load_concept_bank(path: str | None, device: str):
+    """Optional Stage-B bank (finetune/concept_bank.py); None when no path is given."""
+    if not path:
+        return None
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "finetune"))
+    import sam3_bank
+    bank = sam3_bank.ConceptBank.load(path, device)
+    print(f"concept bank: {len(bank.names)} names, |E_0|={bank.E_0.norm().item():.3f}, template {bank.template!r}")
+    return bank
+
+
 @torch.no_grad()
-def segment_prompts(processor, model, image: Image.Image, prompts: list[str], threshold: float, device: str):
+def segment_prompts(processor, model, image: Image.Image, prompts: list[str], threshold: float, device: str,
+                    bank=None, use_e0: bool = True):
+    """One union mask per prompt. With `bank`, the learned text offsets are applied (frozen SAM3).
+
+    Each returned part also carries `text_vec`: the mean-pooled projected text features (+ offset),
+    the 256-d vector SegviGen's legend tokens are built from.
+    """
     w, h = image.size
     img_inputs = processor(images=image.convert("RGB"), return_tensors="pt")
     pixel_values = img_inputs["pixel_values"].to(device)
@@ -105,10 +123,20 @@ def segment_prompts(processor, model, image: Image.Image, prompts: list[str], th
     parts = []
     for prompt in prompts:
         text_inputs = _to_device(processor(text=prompt, return_tensors="pt"), device)
+        text_out = model.get_text_features(input_ids=text_inputs["input_ids"],
+                                           attention_mask=text_inputs.get("attention_mask"), return_dict=True)
+        offset = bank.offset(prompt, use_e0=use_e0) if bank is not None else None
+        pooled = text_out.pooler_output
+        if offset is not None:
+            pooled = pooled + offset.to(pooled.dtype).view(1, 1, -1)
+        am = text_inputs.get("attention_mask")
+        m = am.float().unsqueeze(-1) if am is not None else torch.ones_like(pooled[..., :1])
+        text_vec = ((pooled.float() * m).sum(1) / m.sum(1).clamp(min=1))[0].cpu().numpy()
+        text_out.pooler_output = pooled
         outputs = model(
             vision_embeds=vision_embeds,
-            input_ids=text_inputs["input_ids"],
-            attention_mask=text_inputs.get("attention_mask"),
+            text_embeds=text_out,
+            attention_mask=am,
         )
         results = processor.post_process_instance_segmentation(
             outputs,
@@ -129,12 +157,12 @@ def segment_prompts(processor, model, image: Image.Image, prompts: list[str], th
         print(f"  [{prompt}] instances={len(masks)} best={best:.3f} pixels={area}")
         if area <= 0:
             continue
-        parts.append({"prompt": prompt, "mask": union.cpu().numpy(), "score": best})
+        parts.append({"prompt": prompt, "mask": union.cpu().numpy(), "score": best, "text_vec": text_vec})
     return parts
 
 
 def segment_parts(processor, model, image: Image.Image, specs, threshold: float, device: str,
-                  allow_missing: bool = False):
+                  allow_missing: bool = False, bank=None, use_e0: bool = True):
     """One mask per concept; grouped concepts stay separate and remember their part name.
 
     SegviGen copies 2D colours onto 3D. If a grouped part is painted as one colour
@@ -147,7 +175,7 @@ def segment_parts(processor, model, image: Image.Image, specs, threshold: float,
     ))
     found = {
         part["prompt"]: part
-        for part in segment_prompts(processor, model, image, unique, threshold, device)
+        for part in segment_prompts(processor, model, image, unique, threshold, device, bank=bank, use_e0=use_e0)
     }
 
     parts = []
@@ -166,6 +194,7 @@ def segment_parts(processor, model, image: Image.Image, specs, threshold: float,
                 "part": name,
                 "mask": member["mask"].astype(bool),
                 "score": member["score"],
+                "text_vec": member.get("text_vec"),
             })
     if missing:
         if allow_missing:
@@ -220,6 +249,7 @@ def colorize(image: Image.Image, parts: list[dict], instance: bool,
             "color": list(color),
             "pixels": int(free.sum()),
             "score": part["score"],
+            "text_vec": [round(float(x), 5) for x in part["text_vec"]] if part.get("text_vec") is not None else None,
         })
 
     leftover = fg & ~occupied
@@ -245,6 +275,7 @@ def colorize(image: Image.Image, parts: list[dict], instance: bool,
             "color": list(UNASSIGNED),
             "pixels": unassigned,
             "score": None,
+            "text_vec": None,
         })
     return Image.fromarray(canvas, mode="RGB"), legend
 
@@ -266,6 +297,9 @@ def main():
     parser.add_argument("--allow_missing", action="store_true",
                         help="Tolerate prompts with no detection (they are just absent from the "
                              "legend) instead of failing. Used when probing candidate views.")
+    parser.add_argument("--concept_bank", default=None,
+                        help="Stage-B bank.pt: adds learned offsets to the text features (SAM3 stays frozen)")
+    parser.add_argument("--no_e0", action="store_true", help="With --concept_bank: per-name offsets only")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -277,8 +311,9 @@ def main():
     print("parts: " + ", ".join(f"{name}({'+'.join(prompts)})" for name, prompts in specs))
 
     processor, model = load_sam3(args.model, device)
+    bank = load_concept_bank(args.concept_bank, device)
     parts = segment_parts(processor, model, image, specs, args.threshold, device,
-                          allow_missing=args.allow_missing)
+                          allow_missing=args.allow_missing, bank=bank, use_e0=not args.no_e0)
     if not parts and not args.allow_missing:
         raise SystemExit("SAM3 produced no masks. Try different --prompts or a lower --threshold.")
 

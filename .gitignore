@@ -39,6 +39,9 @@ data_toolkit/assets/dwarf/
 finetune/runs/
 finetune/samples/
 
+# wandb's local run directory: train.py writes it next to the repo root when --wandb is on
+wandb/
+
 # Reference material pulled from the HF demo Space (not part of this repo)
 demo_space/
 demo_examples/

@@ -431,11 +431,14 @@ def map_to_cond(cond_models, image_path: str, save_path: str) -> None:
 
 def write_variant(obj: ObjectDir, name: str, labels: np.ndarray, groups: list[list[int]],
                   grey_parts: list[int], colors: list[tuple[int, int, int]], kind: str, view: str,
-                  encoders, cond_models, extra: dict | None = None, force: bool = False) -> str:
+                  encoders, cond_models, extra: dict | None = None, force: bool = False,
+                  target_from: str | None = None) -> str:
     """Materialise one (2D map, 3D target, cond) triple.
 
     groups[g] lists the parts sharing colors[g]; grey_parts are painted GREY in 3D;
     `labels` is the already-corrupted 2D label raster (part index / LABEL_BG / LABEL_GREY).
+    `target_from` names a sibling variant with the identical (groups, grey, colors): its
+    output_tex_slat.pth is copied instead of re-encoded (paired views share one 3D target).
     """
     vdir = obj.variant_dir(name)
     done = os.path.join(vdir, "meta.json")
@@ -457,13 +460,17 @@ def write_variant(obj: ObjectDir, name: str, labels: np.ndarray, groups: list[li
     paint_map(labels, label_color).save(map_path)
     map_to_cond(cond_models, map_path, os.path.join(vdir, "cond.pth"))
 
-    coords, data = read_vxz(obj.ids_vxz)
-    voxel_part = np.load(obj.voxel_part)
-    recolored = recolor_voxels(data, voxel_part, part_color)
-    _, tex_encoder = encoders
-    out_tex = encode_tex(tex_encoder, coords, recolored)
-    common = torch.load(obj.common_coords)
-    save_slat(restrict(out_tex, common), os.path.join(vdir, "output_tex_slat.pth"))
+    src = os.path.join(obj.variant_dir(target_from), "output_tex_slat.pth") if target_from else None
+    if src and os.path.exists(src):
+        shutil.copyfile(src, os.path.join(vdir, "output_tex_slat.pth"))
+    else:
+        coords, data = read_vxz(obj.ids_vxz)
+        voxel_part = np.load(obj.voxel_part)
+        recolored = recolor_voxels(data, voxel_part, part_color)
+        _, tex_encoder = encoders
+        out_tex = encode_tex(tex_encoder, coords, recolored)
+        common = torch.load(obj.common_coords)
+        save_slat(restrict(out_tex, common), os.path.join(vdir, "output_tex_slat.pth"))
 
     meta = {
         "kind": kind, "view": view, "groups": groups, "grey_parts": grey_parts,

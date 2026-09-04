@@ -33,6 +33,12 @@ def main():
     n = merge_lora(model.flow_model)
     save_gen3dseg_ckpt(model, args.out)
     print(f"merged {n} LoRA layers from step {payload.get('step')} -> {args.out}")
+    if payload.get("legend"):
+        # v3: the legend encoder is not part of the DiT; keep it next to the merged ckpt for
+        # inference_full.py --legend_ckpt
+        side = os.path.splitext(args.out)[0] + "_legend.pt"
+        torch.save({"legend": payload["legend"], "step": payload.get("step"), "args": cfg}, side)
+        print(f"legend encoder -> {side}")
 
 
 if __name__ == "__main__":

@@ -117,11 +117,13 @@ def process_object(obj: ObjectDir, encoders, cond_models, azimuths, rng, args, p
     if pending:
         cmd = [args.py_sam3, os.path.join(common.ROOT, "finetune", "sam3_masks.py"), "--views", *pending,
                "--threshold", str(args.threshold)]
+        if args.concept_bank:
+            cmd += ["--concept_bank", args.concept_bank]
         if args.force:
             cmd.append("--force")
         subprocess.run(cmd, check=True, cwd=common.ROOT)
 
-    written = []
+    per_view = []
     for az, vdir in zip(azimuths, view_dirs):
         tag = view_tag(az)
         labels = np.load(os.path.join(vdir, "ids.npy"))
@@ -131,6 +133,35 @@ def process_object(obj: ObjectDir, encoders, cond_models, azimuths, rng, args, p
         paint, groups, grey, report = bind_masks(labels, masks, view_prompts, scores,
                                                  args.cover, args.partial_precision, args.partial_cover)
         hidden = [p for p in range(n_parts) if p not in visible_parts(labels)]
+        per_view.append({"tag": tag, "paint": paint, "groups": groups, "grey": grey, "report": report, "hidden": hidden})
+
+    source = "v2" if os.path.exists(os.path.join(obj.path, "names_v1.json")) else "v1"
+    written = []
+    if args.pair and len(per_view) > 1:
+        groups, grey, colors = joint_groups(per_view, n_parts, args.hidden_policy, rng)
+        if not groups:
+            print("  SAM3 bound nothing in any view, skipping object")
+            return {"object": obj.path, "n_parts": n_parts, "variants": []}
+        pair_tags = [v["tag"] for v in per_view if v["groups"]]
+        first = None
+        for v in per_view:
+            if not v["groups"]:
+                print(f"  {v['tag']}: SAM3 bound nothing, skipping view")
+                continue
+            extra = {"prompts": v["report"], "hidden_parts": v["hidden"], "threshold": args.threshold,
+                     "part_names": names, "concept_bank": args.concept_bank, "names_source": source,
+                     "pair": "sam3", "pair_views": pair_tags}
+            vname = f"sam3_{v['tag']}"
+            written.append(common.write_variant(obj, vname, v["paint"], groups, grey, colors, "sam3", v["tag"],
+                                                encoders, cond_models, extra=extra, force=args.force,
+                                                target_from=first))
+            first = first or vname
+            bound_prompts = sum(1 for r in v["report"] if r["parts"])
+            print(f"  {v['tag']}: {bound_prompts}/{len(v['report'])} prompts bound (joint groups={groups}, grey={grey})")
+        return {"object": obj.path, "n_parts": n_parts, "variants": written}
+
+    for v in per_view:
+        groups, grey, hidden, tag = v["groups"], v["grey"], v["hidden"], v["tag"]
         if args.hidden_policy == "grey":
             grey = sorted(set(grey) | set(hidden))
         else:
@@ -140,13 +171,50 @@ def process_object(obj: ObjectDir, encoders, cond_models, azimuths, rng, args, p
             print(f"  {tag}: SAM3 bound nothing, skipping view")
             continue
         colors = common.random_palette(rng, len(groups))
-        extra = {"prompts": report, "hidden_parts": hidden, "threshold": args.threshold,
-                 "part_names": names}
-        written.append(common.write_variant(obj, f"sam3_{tag}", paint, groups, grey, colors, "sam3", tag,
+        extra = {"prompts": v["report"], "hidden_parts": hidden, "threshold": args.threshold,
+                 "part_names": names, "concept_bank": args.concept_bank, "names_source": source}
+        written.append(common.write_variant(obj, f"sam3_{tag}", v["paint"], groups, grey, colors, "sam3", tag,
                                             encoders, cond_models, extra=extra, force=args.force))
-        bound_prompts = sum(1 for r in report if r["parts"])
-        print(f"  {tag}: {bound_prompts}/{len(report)} prompts bound, groups={groups}, grey={grey}")
+        bound_prompts = sum(1 for r in v["report"] if r["parts"])
+        print(f"  {tag}: {bound_prompts}/{len(v['report'])} prompts bound, groups={groups}, grey={grey}")
     return {"object": obj.path, "n_parts": n_parts, "variants": written}
+
+
+def joint_groups(per_view: list[dict], n_parts: int, hidden_policy: str, rng):
+    """One colour assignment shared by all views of an object.
+
+    Parts a prompt tied together in any view share a colour (union of the per-view groups);
+    a part bound in at least one view is coloured in 3D and simply stays grey in the 2D map of
+    the views where SAM3 missed it. Parts visible somewhere but bound nowhere are grey; parts
+    hidden in every view follow --hidden_policy.
+    """
+    parent = list(range(n_parts))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    bound: set[int] = set()
+    for v in per_view:
+        for g in v["groups"]:
+            bound.update(g)
+            for p in g[1:]:
+                parent[find(p)] = find(g[0])
+    comps: dict[int, list[int]] = {}
+    for p in sorted(bound):
+        comps.setdefault(find(p), []).append(p)
+    groups = list(comps.values())
+    visible_any = set().union(*(set(range(n_parts)) - set(v["hidden"]) for v in per_view))
+    grey = sorted(p for p in visible_any if p not in bound)
+    hidden_all = sorted(p for p in range(n_parts) if p not in visible_any)
+    if hidden_policy == "grey":
+        grey = sorted(set(grey) | set(hidden_all))
+    else:
+        groups = groups + [[p] for p in hidden_all]
+    colors = common.random_palette(rng, len(groups)) if groups else []
+    return groups, grey, colors
 
 
 def main():
@@ -163,7 +231,11 @@ def main():
     parser.add_argument("--engine", default="CYCLES", help="bpy render engine for the textured view")
     parser.add_argument("--samples", type=int, default=32, help="Cycles samples (inference renders use 128; 32 + denoise is visually the same)")
     parser.add_argument("--py_sam3", default=DEFAULT_PY_SAM3)
+    parser.add_argument("--concept_bank", default=None, help="Stage-B bank.pt forwarded to sam3_masks.py")
     parser.add_argument("--hidden_policy", choices=["gt", "grey"], default="gt")
+    parser.add_argument("--no_pair", dest="pair", action="store_false",
+                        help="Colour every view independently (v1/v2 behaviour) instead of one joint "
+                             "assignment shared by all views of the object")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--max_parts", type=int, default=64)

@@ -262,6 +262,60 @@ def get_cond(image_cond_model, image):
     neg_cond = torch.zeros_like(cond)
     return {'cond': cond, 'neg_cond': neg_cond}
 
+
+def load_legend_encoder(payload_path):
+    """finetune/train.py payload (lora_*.pt) -> LegendEncoder, or None if it has no legend state."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "finetune"))
+    from model import LegendEncoder
+    payload = torch.load(payload_path, map_location="cpu")
+    state = payload.get("legend")
+    if not state:
+        return None
+    enc = LegendEncoder(text_dim=state["text_proj.weight"].shape[1])
+    enc.load_state_dict(state)
+    return enc.cuda().eval()
+
+
+def read_legend(path):
+    """legend json: sam3_to_2dmap's *_legend.json (rows with color + text_vec) or
+    {"entries": [{"color": [r,g,b], "text_vec": [...]}, ...], "object_text_vec": [...] | null}."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    obj_vec = None
+    if isinstance(data, dict):
+        obj_vec = data.get("object_text_vec")
+        rows = data.get("entries", [])
+    else:
+        rows = data
+    text, rgb = [], []
+    for row in rows:
+        if row.get("text_vec") is None or row.get("prompt") == "<unassigned>":
+            continue
+        text.append(torch.tensor(row["text_vec"], dtype=torch.float32))
+        rgb.append(torch.tensor(row["color"], dtype=torch.float32) / 255.0)
+    return (torch.stack(text) if text else None, torch.stack(rgb) if rgb else None,
+            torch.tensor(obj_vec, dtype=torch.float32) if obj_vec else None)
+
+
+@torch.no_grad()
+def get_cond_v3(image_cond_model, image, image2, legend_encoder, legend_path):
+    """v3 context: main-view DINO tokens (+ partner view) (+ object token) (+ legend tokens).
+    Returned as 1-element lists (variable-length context); neg_cond stays the zero image tokens."""
+    image_cond_model.image_size = 512
+    cond = image_cond_model([image])[0].float()
+    cond2 = image_cond_model([image2])[0].float() if image2 is not None else None
+    text = rgb = obj = None
+    if legend_path:
+        text, rgb, obj = read_legend(legend_path)
+        text, rgb = (t.cuda() if t is not None else None for t in (text, rgb))
+        obj = obj.cuda() if obj is not None else None
+        n = 0 if text is None else text.shape[0]
+        print(f"legend: {n} colour token(s){', object token' if obj is not None else ''}"
+              f"{', second view' if cond2 is not None else ''}")
+    full = legend_encoder(cond, cond2, text, rgb, obj)
+    return {'cond': [full], 'neg_cond': [torch.zeros_like(cond)]}
+
 def tex_slat_sample_single(gen3dseg, sampler, pipeline_args, shape_slat, input_tex_slat, cond_dict):
     device = shape_slat.feats.device
     shape_std = torch.tensor(pipeline_args['shape_slat_normalization']['std'])[None].to(device)
@@ -457,7 +511,14 @@ def inference(ckpt_path, item):
                                azimuths=[item.get('azimuth', 0.0)])
     image = Image.open(item['img'])
     image = preprocess_image(rembg_model, image)
-    cond = get_cond(image_cond_model, [image])
+    legend_encoder = load_legend_encoder(item['legend_ckpt']) if item.get('legend_ckpt') else None
+    if legend_encoder is not None:
+        image2 = preprocess_image(rembg_model, Image.open(item['img2'])) if item.get('img2') else None
+        cond = get_cond_v3(image_cond_model, image, image2, legend_encoder, item.get('legend'))
+    else:
+        if item.get('legend') or item.get('img2'):
+            print("warning: --legend/--img2 ignored: no --legend_ckpt with a legend encoder given")
+        cond = get_cond(image_cond_model, [image])
 
     print("-"*100)
     print("Sampling .................")
@@ -534,6 +595,14 @@ if __name__ == "__main__":
         help="Bake resolution used with --blender_reuv.",
     )
 
+    parser.add_argument("--legend_ckpt", type=str, default=None,
+                        help="v3: finetune lora_*.pt payload holding the legend encoder weights "
+                             "(the LoRA itself must already be merged into --ckpt_path).")
+    parser.add_argument("--legend", type=str, default=None,
+                        help="v3: legend json with per-colour text vectors (sam3_to_2dmap *_legend.json).")
+    parser.add_argument("--img2", type=str, default=None,
+                        help="v3: second 2D map (another view, same colours) used as extra context.")
+
     args = parser.parse_args()
     if (not args.two_d_map) and args.transforms is None:
         parser.error("--transforms is required unless --two_d_map is set.")
@@ -546,6 +615,9 @@ if __name__ == "__main__":
         "blender_reuv": args.blender_reuv,
         "rebake_texture_size": args.rebake_texture_size,
         "azimuth": args.azimuth,
+        "legend_ckpt": os.path.abspath(args.legend_ckpt) if args.legend_ckpt else None,
+        "legend": os.path.abspath(args.legend) if args.legend else None,
+        "img2": os.path.abspath(args.img2) if args.img2 else None,
     }
     if not args.two_d_map:
         item["transforms"] = os.path.abspath(args.transforms)
