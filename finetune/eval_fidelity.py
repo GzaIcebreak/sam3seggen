@@ -41,8 +41,11 @@ def texture_lookup(mesh: trimesh.Trimesh, face_idx: np.ndarray, points: np.ndarr
     """Baked base colour at surface points via barycentric UV interpolation."""
     tri = mesh.triangles[face_idx]
     bary = trimesh.triangles.points_to_barycentric(tri, points)
+    # degenerate (zero-area) faces give NaN barycentrics -> fall back to the first vertex
+    bad = ~np.isfinite(bary).all(1)
+    bary[bad] = [1.0, 0.0, 0.0]
     uv = mesh.visual.uv[mesh.faces[face_idx]]
-    p_uv = (bary[:, :, None] * uv).sum(1)
+    p_uv = np.nan_to_num((bary[:, :, None] * uv).sum(1), nan=0.0)
     mat = mesh.visual.material
     img = getattr(mat, "baseColorTexture", None) or getattr(mat, "image", None)
     if img is None:

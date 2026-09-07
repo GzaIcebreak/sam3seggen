@@ -97,6 +97,12 @@ class Gen3DSeg(nn.Module):
         x_t = sp.SparseTensor(torch.cat(input_tex_feats_list), torch.cat(input_tex_coords_list))
         shape_slats = sp.SparseTensor(torch.cat(shape_feats_list), torch.cat(shape_coords_list))
 
+        if isinstance(cond, dict):
+            # v4: {"image": [tokens], "legend": [tokens] | None}; the legend goes to the
+            # LegendCrossAttention wrappers, the image tokens to the regular cross-attention
+            from finetune.model import set_legend_context
+            set_legend_context(self.flow_model, cond["legend"])
+            cond = cond["image"]
         output_tex_slats = self.flow_model(x_t, t, cond, shape_slats)
         
         output_tex_feats_list = []
@@ -263,18 +269,27 @@ def get_cond(image_cond_model, image):
     return {'cond': cond, 'neg_cond': neg_cond}
 
 
-def load_legend_encoder(payload_path):
-    """finetune/train.py payload (lora_*.pt) -> LegendEncoder, or None if it has no legend state."""
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "finetune"))
-    from model import LegendEncoder
+def load_legend_encoder(payload_path, gen3dseg=None):
+    """finetune/train.py payload (lora_*.pt or merge_lora's *_legend.pt) -> LegendEncoder, or None
+    if it has no legend state. With a v4 payload ("legend_attn") the DiT's cross-attention blocks
+    are wrapped in place and the trained legend K/V + gates loaded (decoupled legend path)."""
+    from finetune.model import LegendEncoder, inject_legend_attention, load_legend_attn_state
     payload = torch.load(payload_path, map_location="cpu")
     state = payload.get("legend")
     if not state:
         return None
     enc = LegendEncoder(text_dim=state["text_proj.weight"].shape[1])
     enc.load_state_dict(state)
-    return enc.cuda().eval()
+    enc = enc.cuda().eval()
+    enc.decoupled = False
+    if payload.get("legend_attn") and gen3dseg is not None:
+        inject_legend_attention(gen3dseg.flow_model)
+        load_legend_attn_state(gen3dseg, payload["legend_attn"])
+        gen3dseg.cuda().eval()
+        gains = [b.cross_attn.gain() for b in gen3dseg.flow_model.blocks]
+        print(f"legend attention: {len(gains)} blocks, read-out gain mean {np.mean(gains):.4f} max {np.max(gains):.4f}")
+        enc.decoupled = True
+    return enc
 
 
 def read_legend(path):
@@ -298,22 +313,48 @@ def read_legend(path):
             torch.tensor(obj_vec, dtype=torch.float32) if obj_vec else None)
 
 
+def token_text_from_map(image, text, rgb, n_tokens, tol=0.12):
+    """v5 per-token names for a preprocessed (cropped, black-background) 2D map: every pixel is
+    matched to the nearest legend colour (within tol, 0..1 RGB), the patches vote as in
+    finetune/token_labels.py. Returns [n_tokens, text_dim] with zero rows where no name applies."""
+    from finetune.token_labels import patch_vote, N_PREFIX
+    px = torch.from_numpy(np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0)  # [H, W, 3]
+    d = torch.cdist(px.reshape(-1, 3), rgb.cpu()).reshape(px.shape[0], px.shape[1], -1)
+    best, idx = d.min(-1)
+    raster = torch.where(best <= tol, idx, torch.full_like(idx, -1)).to(torch.int16).numpy()
+    name_idx = torch.from_numpy(patch_vote(raster, (0, 0, raster.shape[1], raster.shape[0]), rgb.shape[0]).astype(np.int64))
+    vecs = torch.cat([text.cpu(), torch.zeros(1, text.shape[1])])  # last row = no name
+    name_idx = torch.where(name_idx < 0, torch.full_like(name_idx, text.shape[0]), name_idx)
+    out = torch.zeros(n_tokens, text.shape[1])
+    out[N_PREFIX:N_PREFIX + name_idx.numel()] = vecs[name_idx]
+    return out
+
+
 @torch.no_grad()
 def get_cond_v3(image_cond_model, image, image2, legend_encoder, legend_path):
     """v3 context: main-view DINO tokens (+ partner view) (+ object token) (+ legend tokens).
+    v5 encoders (non-zero tok_proj) also get the legend name of the colour under every patch.
     Returned as 1-element lists (variable-length context); neg_cond stays the zero image tokens."""
     image_cond_model.image_size = 512
     cond = image_cond_model([image])[0].float()
     cond2 = image_cond_model([image2])[0].float() if image2 is not None else None
-    text = rgb = obj = None
+    text = rgb = obj = ct = pt = None
     if legend_path:
         text, rgb, obj = read_legend(legend_path)
+        if text is not None and legend_encoder.tok_gain() > 0:
+            ct = token_text_from_map(image, text, rgb, cond.shape[0]).cuda()
+            pt = token_text_from_map(image2, text, rgb, cond2.shape[0]).cuda() if image2 is not None else None
         text, rgb = (t.cuda() if t is not None else None for t in (text, rgb))
         obj = obj.cuda() if obj is not None else None
         n = 0 if text is None else text.shape[0]
         print(f"legend: {n} colour token(s){', object token' if obj is not None else ''}"
-              f"{', second view' if cond2 is not None else ''}")
-    full = legend_encoder(cond, cond2, text, rgb, obj)
+              f"{', second view' if cond2 is not None else ''}"
+              f"{f', per-token names on {int((ct.abs().sum(1) > 0).sum())} patches' if ct is not None else ''}")
+    if getattr(legend_encoder, "decoupled", False):
+        image, legend = legend_encoder.tokens(cond, cond2, text, rgb, obj, cond_text=ct, partner_text=pt)
+        return {'cond': {"image": [image], "legend": [legend]},
+                'neg_cond': {"image": [torch.zeros_like(cond)], "legend": None}}
+    full = legend_encoder(cond, cond2, text, rgb, obj, cond_text=ct, partner_text=pt)
     return {'cond': [full], 'neg_cond': [torch.zeros_like(cond)]}
 
 def tex_slat_sample_single(gen3dseg, sampler, pipeline_args, shape_slat, input_tex_slat, cond_dict):
@@ -511,7 +552,7 @@ def inference(ckpt_path, item):
                                azimuths=[item.get('azimuth', 0.0)])
     image = Image.open(item['img'])
     image = preprocess_image(rembg_model, image)
-    legend_encoder = load_legend_encoder(item['legend_ckpt']) if item.get('legend_ckpt') else None
+    legend_encoder = load_legend_encoder(item['legend_ckpt'], gen3dseg) if item.get('legend_ckpt') else None
     if legend_encoder is not None:
         image2 = preprocess_image(rembg_model, Image.open(item['img2'])) if item.get('img2') else None
         cond = get_cond_v3(image_cond_model, image, image2, legend_encoder, item.get('legend'))

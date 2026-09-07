@@ -5,6 +5,9 @@ v3 additions (all optional, off by default so v1/v2 runs reproduce):
     its RGB, plus the object name's vector -> the legend tokens of finetune/model.py
   * pair:   the partner view of a paired variant (same object, same meta["pair"], other view,
             identical 3D target) so the model can be conditioned on two maps at once
+v5:
+  * token_text: per DINO token the text vector of the part under that patch (token_labels.py ->
+            <variant>/tokens.npz), [1029, 256] with zero rows for CLS/registers/unnamed patches
 """
 from __future__ import annotations
 
@@ -15,12 +18,16 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import cells
 import common
 
 TEXT_DIM = 256
+N_TOKENS = 1029     # DINOv3 ViT-L/16 @512: CLS + 4 registers + 32*32 patches
+N_PREFIX = 5
 
 
 class TextCache:
@@ -58,7 +65,8 @@ def object_name(obj: common.ObjectDir) -> str | None:
 class VariantDataset(Dataset):
     def __init__(self, roots: list[str], kinds: list[str] | None = None, objects: list[str] | None = None,
                  exclude: list[str] | None = None, text_cache: str | None = None, pair: bool = False,
-                 legend_shuffle: bool = False, seed: int = 0):
+                 legend_shuffle: bool = False, seed: int = 0, cell_targets: bool = False,
+                 min_purity: float = 0.9, token_text: bool = False):
         self.items = []
         objects = set(objects) if objects else None
         exclude = set(exclude) if exclude else set()
@@ -80,6 +88,11 @@ class VariantDataset(Dataset):
         self.pair = pair
         self.partners = partners
         self.legend_shuffle = legend_shuffle
+        self.cell_targets = cell_targets
+        self.min_purity = min_purity
+        self.token_text = token_text
+        if token_text and self.text is None:
+            raise ValueError("token_text needs a text_cache")
         self.rng = torch.Generator().manual_seed(seed)
         self._names: dict[str, list[str]] = {}
         self._obj_name: dict[str, str | None] = {}
@@ -105,17 +118,48 @@ class VariantDataset(Dataset):
             self._obj_name[obj.path] = object_name(obj)
         return self._names[obj.path]
 
-    def legend(self, obj, meta) -> dict:
-        """Text vectors + colours of the coloured groups (grey parts carry no legend entry)."""
+    def shuffle_map(self, names: list[str | None]) -> dict[str, str]:
+        """Control runs: a random permutation of the variant's distinct names, applied to the legend
+        AND the per-token names alike, so every name is consistently wrong (colours stay put)."""
+        distinct = sorted({n for n in names if n})
+        if not self.legend_shuffle or len(distinct) < 2:
+            return {}
+        perm = torch.randperm(len(distinct), generator=self.rng).tolist()
+        return {distinct[i]: distinct[perm[i]] for i in range(len(distinct))}
+
+    def variant_names(self, obj, vname, meta) -> tuple[list[str | None], dict | None]:
+        """(legend group names, tokens.npz blob or None) of one variant."""
         names = self.names_of(obj)
         group_names = [majority_name(g, names) for g in meta["groups"]]
-        if self.legend_shuffle and len(group_names) > 1:
-            # control run: colours keep their groups, names are permuted between groups
-            perm = torch.randperm(len(group_names), generator=self.rng).tolist()
-            group_names = [group_names[i] for i in perm]
+        blob = None
+        if self.token_text:
+            p = os.path.join(obj.variant_dir(vname), "tokens.npz")
+            if os.path.exists(p):
+                raw = np.load(p, allow_pickle=True)
+                blob = {"name_idx": raw["name_idx"], "names": [str(n) for n in raw["names"]]}
+        return group_names, blob
+
+    def token_text_of(self, blob: dict | None, name_map: dict[str, str]) -> torch.Tensor | None:
+        """[N_TOKENS, dim] text vectors per DINO token (zero rows where there is no name)."""
+        if blob is None:
+            return None
+        dim = self.text.dim
+        vecs = torch.zeros(len(blob["names"]) + 1, dim)  # last row = "no name"
+        for k, n in enumerate(blob["names"]):
+            v = self.text.get(name_map.get(n, n))
+            if v is not None:
+                vecs[k] = v
+        idx = torch.from_numpy(blob["name_idx"].astype(np.int64))
+        idx = torch.where(idx < 0, torch.full_like(idx, len(blob["names"])), idx)
+        out = torch.zeros(N_TOKENS, dim)
+        out[N_PREFIX:N_PREFIX + idx.numel()] = vecs[idx]
+        return out
+
+    def legend(self, obj, meta, group_names: list[str | None], name_map: dict[str, str]) -> dict:
+        """Text vectors + colours of the coloured groups (grey parts carry no legend entry)."""
         text, rgb = [], []
         for gname, color in zip(group_names, meta["colors"]):
-            v = self.text.get(gname) if self.text else None
+            v = self.text.get(name_map.get(gname, gname) if gname else None) if self.text else None
             if v is None:
                 continue
             text.append(v)
@@ -146,17 +190,40 @@ class VariantDataset(Dataset):
             "tex_out": (tex_out["feats"] - n["tex_mean"]) / n["tex_std"],
             "cond": cond[0],  # [T, 1024]
             "cond_partner": None,
+            "token_text": None,
+            "token_text_partner": None,
             "kind": meta["kind"],
             "name": f"{os.path.basename(obj.path)}/{vname}",
         }
-        if self.pair:
-            partner = self.partner_of(obj, vname, meta)
-            if partner is not None:
-                item["cond_partner"] = torch.load(os.path.join(obj.variant_dir(partner), "cond.pth"),
-                                                  map_location="cpu")["cond"][0]
+        partner = self.partner_of(obj, vname, meta) if self.pair else None
+        if partner is not None:
+            item["cond_partner"] = torch.load(os.path.join(obj.variant_dir(partner), "cond.pth"),
+                                              map_location="cpu")["cond"][0]
         if self.text is not None:
-            item.update(self.legend(obj, meta))
+            group_names, blob = self.variant_names(obj, vname, meta)
+            blob_partner = self.variant_names(obj, partner, meta)[1] if partner is not None else None
+            all_names = list(group_names) + (blob["names"] if blob else []) + (blob_partner["names"] if blob_partner else [])
+            name_map = self.shuffle_map(all_names)
+            item.update(self.legend(obj, meta, group_names, name_map))
+            item["token_text"] = self.token_text_of(blob, name_map)
+            item["token_text_partner"] = self.token_text_of(blob_partner, name_map)
+        if self.cell_targets:
+            item.update(self.cell_targets_of(obj, meta, coords))
         return item
+
+    def cell_targets_of(self, obj, meta, coords: torch.Tensor) -> dict:
+        """v4 colour-loss targets: colour class per latent cell (-1 ignore) and the palette."""
+        n = coords.shape[0]
+        if not os.path.exists(os.path.join(obj.path, "cell_part.npz")):
+            return {"cell_cls": torch.full((n,), -1, dtype=torch.long), "palette": cells.palette_of(meta),
+                    "cell_masked": torch.zeros(n, dtype=torch.bool)}
+        cell_coords, part, _ = cells.load_cells(obj)
+        if not torch.equal(torch.from_numpy(cell_coords).long(), coords[:, 1:].long()):
+            raise RuntimeError(f"{obj.path}: cell_part.npz coords differ from the latent coords")
+        cls, palette = cells.variant_cell_targets(obj, meta, self.min_purity)
+        # partial variants: cells of parts greyed in the 2D map, whose colour only the legend gives
+        masked = torch.from_numpy(np.isin(part, meta.get("masked_parts", [])))
+        return {"cell_cls": torch.from_numpy(cls).long(), "palette": palette, "cell_masked": masked}
 
 
 def collate(batch: list[dict]) -> dict:
@@ -185,4 +252,10 @@ def collate(batch: list[dict]) -> dict:
         out["legend_rgb"] = [item["legend_rgb"] for item in batch]
         out["obj_text"] = [item["obj_text"] for item in batch]
         out["n_groups"] = [item["n_groups"] for item in batch]
+        out["token_text"] = [item["token_text"] for item in batch]
+        out["token_text_partner"] = [item["token_text_partner"] for item in batch]
+    if "cell_cls" in batch[0]:
+        out["cell_cls"] = torch.cat([item["cell_cls"] for item in batch])
+        out["cell_masked"] = torch.cat([item["cell_masked"] for item in batch])
+        out["palette"] = [item["palette"] for item in batch]
     return out

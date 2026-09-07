@@ -74,7 +74,8 @@ def main():
     log = open(args.log or os.path.join(args.dataset_root, "run_batch.log"), "a", encoding="utf-8")
 
     def parse(extra: str):
-        toks = shlex.split(extra)
+        # posix=False keeps Windows path backslashes (shlex would eat them as escapes)
+        toks = [t.strip('"') for t in shlex.split(extra, posix=False)]
         az = [float(a) for a in toks[toks.index("--azimuths") + 1].split(",")] if "--azimuths" in toks else [0.0]
         nc = int(toks[toks.index("--n_corrupt") + 1]) if "--n_corrupt" in toks else 3
         return toks, az, nc

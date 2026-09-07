@@ -7,6 +7,7 @@
 2. 灰 = 未分配:2D 里整件是灰的,3D 里也输出灰(150,150,150),而不是乱猜一个色;
    2D 只覆盖了半件的,3D 里整件补全同色
 
+当前状态的单一入口（路线、数据集、v1–v6 训练参数与结果、GeoSAM2 消融、外部资产定性图）见 [`REPORT_overview.md`](REPORT_overview.md)；
 改动全貌、v1/v2 结果、数据修复与原论文的损失/条件结构对照见 [`REPORT_v3_changes.md`](REPORT_v3_changes.md)。
 
 所有脚本在 SegviGen 根目录下通过 `finetune\run_ft.bat <脚本> <参数>` 运行
@@ -205,3 +206,187 @@ finetune\run_ft.bat eval_fidelity.py ... --ckpt ckpt\full_seg_v3.ckpt --legend_c
 
 `make_samples_a.py` / `make_samples_b.py` 默认给同一对象的两个视角一套共同调色板并共享 3D 目标(`--no_pair` 关闭),
 `dataset.py` 据此返回 `cond_partner` 与图例。
+
+## v4:显式颜色监督 + partial 变体 + 解耦图例注意力
+
+v3 的结论(9-05):pv_v3 与 pv_v3_shuffle 权重相差 5.5%,留出 MSE 却到小数点后 4 位相同,硬样本 fidelity 比基座还低——
+图例 token 收到了梯度,但对输出没有可测量的影响。原因有三:MSE 不需要文本(2D 图已给出 97.7% cell 的颜色);
+10 个图例 token 拼进约 1000 个 DINO token 里被 softmax 稀释;LoRA + MSE 三次微调都让颜色归属变差。v4 三件事一起改
+(细节见 `REPORT_v3_changes.md` 第 7 节):
+
+1. **显式损失** `cells.py` / `train.py::color_loss`:每步从 v 预测恢复 x0_hat,经冻结线性探针 `color_probe.pt`
+   (32 维纹理 latent → RGB,留出对象 R²=0.86、最近调色板 91%)解码颜色,对每个部件纯度 ≥0.9 的 latent cell 做
+   最近调色板分类 CE(类别 = 颜色组 + GREY,τ 作用在 RGB 平方距离上),**按类别均衡加权**,细小部件与主体同权;
+   探针在目标 latent 上就读错的 cell 不计。这与 `eval_fidelity` 的"最近调色板归属"是同一个量。
+2. **partial 变体** `make_samples_partial.py`:干净 2D 图上随机抹灰 1–3 个可见部件,3D 目标与图例不变
+   (`write_variant(..., mask_2d=..., target_from=clean_*)`,只重算 DINO cond)。被抹部件的颜色只有图例知道,
+   它们的 cell 上的 CE 只能靠读图例降下来。`masked_acc`(被抹 cell 的最近调色板准确率,`check_ts` 最大 t 处最诚实)
+   就是"模型是否在用文本"的直接读数;基座在 t=0.95 处为 0.6%。
+3. **解耦图例注意力** `model.py::LegendCrossAttention`(`--legend_attn`):每个 DiT block 的交叉注意力加一路
+   图例专用 K/V(从图像 K/V 初始化,fp32,可训练)+ **零初始化读出矩阵** `to_out`(ControlNet 式 zero-linear,
+   `--out_lr` 默认 3e-4),与图像注意力共用 q;第 0 步与基座完全一致。图例 token 不再拼进图像上下文,而是经
+   `set_legend_context` 送给各 block。(第一版的零初始化标量 tanh 门控 500 步都打不开,见 REPORT 7.3(c)。)
+
+```bat
+finetune\run_ft.bat cell_labels.py --dataset_root E:\...\pv                       REM <obj>\cell_part.npz
+finetune\run_ft.bat color_probe.py --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt
+finetune\run_ft.bat make_samples_partial.py --dataset_root E:\...\pv --per_view 2   REM kind=partial
+finetune\train_loop.bat 3 finetune\runs\pv_v4 --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt ^
+    --text_cache E:\...\concept_bank_v3\text_cache.pt --pair --legend_attn --p_drop_legend 0.1 ^
+    --color_probe finetune\color_probe.pt --color_weight 0.3 --color_tau 0.03 ^
+    --max_steps 1500 --check_every 250 --check_ts 0.5,0.8,0.95 --wandb
+REM 对照:同参数 + --legend_shuffle --out_dir finetune\runs\pv_v4_shuffle;看 holdout/masked_acc_hi_partial 是否分开
+finetune\run_ft.bat merge_lora.py --lora finetune\runs\pv_v4\lora_last.pt --out ckpt\full_seg_v4.ckpt
+REM 生成 ckpt\full_seg_v4_legend.pt(图例编码器 + 图例注意力 K/V 与读出矩阵,约 630 MB);推理/评估命令与 v3 相同
+```
+
+wandb 新增指标:`train/color`、`train/color_acc(_kind)`、`train/masked_acc`,`holdout/color_*`、`holdout/masked_acc_hi_partial`。
+
+v4 结论(REPORT 7.6):颜色损失有效(留出 partial color CE 4.25→0.84),但真/乱图例读数三次检查完全一致,
+且 `--check_only --check_no_legend` 消融显示拿掉图例反而更好——全局图例路径只学到对训练对象的记忆。
+
+## v5:逐 token 语义注入
+
+把部件名字加到它所在的 DINO patch token 上(而不是全局图例),颜色缺失处的 token 仍带名字,
+模型只需做局部"按名查色";正常区域名字是"同一部件"的先验。REPORT 第 8 节。
+
+- `token_labels.py`:每个变体一个 `tokens.npz`(32×32 patch 的部件名,复现 img_to_cond 的裁切;GT 变体用 `ids.npy`,
+  sam3 变体用提示词掩码)。全量 13.7k 变体约 100 s。
+- `dataset.py --token_text`:`token_text` [1029,256];`legend_shuffle` 同时置换图例与逐 token 名字。
+- `model.py::LegendEncoder.tok_proj`:零初始化、无偏置的 256→1024 线性层,无名 token 不受影响;`tok_gain()` 看它是否在学。
+- `inference_full.py`:v5 编码器下由色图颜色反推每 patch 名字(`token_text_from_map`),无需新输入。
+
+```bat
+finetune\run_ft.bat token_labels.py --dataset_root E:\...\pv
+finetune\train_loop.bat 3 finetune\runs\pv_v5 --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt ^
+    --text_cache E:\...\concept_bank_v3\text_cache.pt --pair --token_text --p_drop_legend 0.1 --check_shuffle ^
+    --color_probe finetune\color_probe.pt --color_weight 0.3 --color_tau 0.03 ^
+    --max_steps 1500 --check_every 250 --check_ts 0.5,0.8,0.95 --wandb
+REM 消融:finetune\run_ft.bat train.py ... --check_only --check_no_legend --resume_lora finetune\runs\pv_v5\lora_step500.pt
+```
+
+wandb 新增 `train/tok_gain`。判据:holdout 与 holdout_shuffled 的 `masked_acc_hi_partial` 是否分开。
+
+结果(REPORT 8.5、9.1):20 硬对象上 v5 带文本 fidelity 0.185(base 0.617),无文本 0.598;名字只被当成"这里该上色"的开关。
+
+## 轨迹探针与 v6 轨迹训练
+
+`trajectory_probe.py` 用推理采样器(12 步 Euler,rescale_t 3)在留出对象上逐步解码颜色,比较自由轨迹与
+teacher-forced 两条曲线。结论(REPORT 9.2):颜色布局在 t=1 的第一步就定了,自由轨迹 acc 全程 ≈ 不变(base clean 0.72→0.73),
+而 teacher-forced 在 t≤0.9 已 ≥0.92——训练时的单步颜色监督在"抄 x_t 里的答案"。
+
+```bat
+finetune\run_ft.bat trajectory_probe.py --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt --limit 20 --out E:\...\traj\base.json
+finetune\run_ft.bat trajectory_probe.py ... --lora finetune\runs\pv_v4\lora_step1500.pt --out E:\...\traj\v4.json
+```
+
+v6(Path A):`--p_traj 0.5 --traj_steps 3` 让一半样本的 x_t 来自模型自己的采样轨迹(`rollout()`,同 cond、无 CFG),
+颜色 CE 只在 `--color_t_min 0.8` 以上计。纯图像条件 + LoRA r16,不带图例/逐 token 文本:
+
+```bat
+finetune\train_loop.bat 3 finetune\runs\pv_v6 --dataset_root E:\...\pv --holdout_file E:\...\pv_holdout_v3.txt ^
+    --kinds clean corrupt sam3 --color_probe finetune\color_probe.pt --color_weight 0.3 --color_tau 0.03 --color_t_min 0.8 ^
+    --p_traj 0.5 --traj_steps 3 --batch_size 4 --grad_accum 4 --max_steps 1500 --check_ts "0.5,0.95,1.0" --wandb
+```
+
+`--check_ts` 在 `cmd /c "..."` 里必须带引号,否则逗号被 cmd 拆成多个参数。看 `color_acc_traj`(rollout 样本上的颜色准确率)。
+
+结果(REPORT 9.4、10.3):自由轨迹颜色准确率 clean 0.733→0.850、sam3 0.520→0.621;20 硬对象 fidelity 0.617→0.663(11 优/8 差),
+`eval_parts` mIoU 0.278→0.296(14 优/5 差)、边界 F1 0.666→0.704——首个全面优于基座的版本。合并权重:`ckpt/full_seg_v6.ckpt`
+(`merge_lora.py --lora finetune/runs/pv_v6/lora_step1500.pt`)。
+
+## 统一 3D 评测:`eval_parts.py`
+
+按独立 GT 部件计分(含隐藏部件、未覆盖部件计漏分),SegviGen 输出与外部面标签同一口径(REPORT 10.1):
+
+```bat
+finetune\run_ft.bat eval_parts.py --object E:\...\pv\<id> --segvigen <infer.glb> --variant sam3_az0 --report r.json
+finetune\run_ft.bat eval_parts.py --object E:\...\pv\<id> --segvigen <infer.glb> --legend <map_legend.json>
+finetune\run_ft.bat eval_parts.py --object E:\...\pv\<id> --faces <mesh.glb> --face_labels <labels.npy> --labels_json labels.json
+```
+
+`miou`(类无关,最佳匹配)/ `miou_matched`(一对一)/ `sem_miou`(按唯一名字,同名部件合并)/ `name_acc` /
+`small_part_recall`(<1% 面积)/ `over_seg_parts` / `under_seg_segments` / `boundary_f1` / `unlabelled_share`。
+
+## GeoSAM2 对照
+
+GeoSAM2(CVPR 2026)装在 `E:\AI_New\ModelGen\GeoSAM2` + `.venv_geosam2`(Windows 修复见 REPORT 10.2)。
+SAM3 概念库出的掩码作为它的 mask prompt,输出面标签,与 SegviGen 在 `eval_parts.py` 同表比较:
+
+```bat
+REM 1. 按 GeoSAM2 约定渲染 12 视角(bpy,主 venv)
+finetune\run_ft.bat geosam2_render.py --dataset_root E:\...\pv --objects_file E:\...\pv_hard.txt --out E:\...\geosam2\renders
+finetune\run_ft.bat geosam2_render.py --glb E:\...\ext_parts\小狗.glb --name dog --out E:\...\geosam2\renders
+REM 2. SAM3 + 概念库 → 每视角标签图(.venv_holo)
+.venv_holo\Scripts\python finetune\geosam2_masks.py --renders E:\...\geosam2\renders --dataset_root E:\...\pv ^
+    --objects_file E:\...\pv_hard.txt --concept_bank E:\...\concept_bank_v3\bank.pt
+.venv_holo\Scripts\python finetune\geosam2_masks.py --renders ... --objects dog --prompts head ear body leg tail --concept_bank ...
+REM 3a. single:一个视角的标签图做 prompt + 对面视角自动分割(GeoSAM2 默认用法)
+..\.venv_geosam2\Scripts\python finetune\geosam2_run.py --renders ... --out E:\...\geosam2\results --dataset_root E:\...\pv ^
+    --objects_file E:\...\pv_hard.txt --view match
+REM 3b. dual:v 与 v+6 两张标签图都做 prompt,不跑自动分割
+..\.venv_geosam2\Scripts\python finetune\geosam2_dual.py --renders ... --out ... --dataset_root ... --objects_file ... --view match
+REM 4. 面标签 → 每部件平色材质 GLB(原资产坐标系),可用 render_cond_view.py 渲染或直接拆件
+finetune\run_ft.bat geosam2_to_glb.py --mesh <geosam2.glb> --labels <labels.npy> --labels_json labels.json --ref <input.glb> --out parts.glb
+```
+
+`--view match` 选与 SegviGen az0 轮廓最接近的视角(同一输入视角比较),`best` 选 SAM3 找到最多部件的视角。
+`*_filled.npy` 把 GeoSAM2 留白的面(0/999)按最近已标面填充,与 SegviGen"从不留空"同口径。
+
+结果(REPORT 10.3,20 硬对象):同一套 SAM3 掩码下,GeoSAM2 与 SegviGen 部署路径的语义 mIoU 打平(0.19–0.21 vs 0.22),
+SegviGen 边界 F1 更高(0.67–0.70 vs 0.55–0.63)、碎片更少;GeoSAM2 小件召回更高、默认用法留白 15–17%,~200 万面的网格要先减面
+(500–960 s/对象,机器人 CPU 内存溢出)。single 模式的 SAM2 自动分割约需 10 GB 显存,不要和训练同时跑。
+
+## 外部资产对照:`ext_bench.py`
+
+用户自己的 10 个模型(`datasets/ext_parts/`,即 `3D拆件.zip`)上,SegviGen 原生 / base+SAM3 / v6+SAM3 / GeoSAM2 single / dual
+同机位出图并统计。没有 GT,`score` 给的是结构统计(段数、每段连通块数、留白、边界密度)和方法间一致性,不是准确率:
+
+```bat
+finetune\run_ft.bat ext_bench.py all                    REM 或分阶段:
+finetune\run_ft.bat ext_bench.py front mesh sam3        REM 8 机位选正面(FRONT_OVERRIDE 手工纠正前/背)、>200k 面减面、SAM3+概念库 2D 图
+finetune\run_ft.bat ext_bench.py segvigen               REM full_seg / full_seg_w_2d_map / full_seg_v6,~1 min/次,峰值 21 GB
+finetune\run_ft.bat ext_bench.py geo_prep               REM GeoSAM2 12 视角渲染 + SAM3 标签图(轻,可与上一步并行)
+finetune\run_ft.bat ext_bench.py geosam2                REM single/dual × match/best,200k 面约 2 min/次
+finetune\run_ft.bat ext_bench.py score montage report   REM scores.json、compare_front/back.png、REPORT.md
+```
+
+输出在 `datasets/ext_bench/`:每资产一个目录(`render.png`/`map.png`/`legend.json`/`seg_*_upright.glb`/`geosam2_*_parts.glb`/`vis/`),
+`REPORT.md` 汇总。提示词与正面机位写在脚本顶部的 `ASSETS` / `FRONT_OVERRIDE`。`compare_*.png` 最右两列是消融里最好的两行
+(`GeoSAM2 p2 (fixed)`、`SAM3 tracker p2 (best)`,GLB 由 `ablation_score.py ext` 生成),`GeoSAM2 dual (filled)` 列是变换 bug 修正前的旧结果。`decimate_glb.py`(bpy Decimate,保 UV)供 GeoSAM2
+用;bpy 模块导出成功后常在退出时崩溃(0xC0000005),脚本按输出文件是否存在判断成功。
+
+结果(REPORT 11):SAM3+概念库对前视图 51 个提示词命中 48 个;v6 与 base 一致性 0.86,v6 多找回小件、留白更少但碎片略多(背面轮子/后脑易变色);
+GeoSAM2 与 v6 类无关一致性 0.71,重复件颜色更一致、背面有异色补丁、raw 留白 7–8%;SegviGen 原生是另一套划分(一致性 0.51),块最整但无名字、不受控。
+
+## GeoSAM2 消融 / SAM2→SAM3:`geosam2_ablate.py`、`sam3_track.py`
+
+不训练 GeoSAM2,固定它的提升(`lift_2dmask_3d`)与填充(`complete_labels`),只换 12 视角 2D 标签图的来源,回答"SAM2+LoRA+几何传播值多少、
+能不能用 SAM3 取代"。结论与三个路线问题(DINOv3 微调 / SAM2 换 SAM3 / 逆向训练)的评估在 `REPORT_geosam2_ablation.md`。
+
+| 模式 | 2D 标签图来源 |
+|---|---|
+| `sam3_pK` (K=1/2/4/12) | K 个均匀视角各跑一次 SAM3(概念库+用户提示),不传播;`sam3_p12` = SAM3 完全取代 SAM2 |
+| `geo_pK` (K=1/2/4) | K 个视角的 SAM3 掩码作提示,GeoSAM2 自己的传播;K 次传播结果逐像素多数票 |
+| `lift:<dir>` | 外部标签图目录,这里接 `sam3_track.py` 的输出 = SAM3 tracker(`facebook/sam3`,PE 骨干,RGB,无几何,零训练)传播 |
+
+```bat
+REM 1) SAM3 tracker 传播(SegviGen venv):对每个物体、每个 K,把锚视角+均匀分布的 K-1 个视角当提示,正反两个半圈各跑一次,重叠帧 logits 取平均
+finetune\run_ft.bat sam3_track.py --renders datasets\geosam2\renders --out datasets\geosam2\results --objects <ids...> --n_prompts 1 2 4 --view match --ref_render_pattern "<正面图路径,含 {obj}>"
+REM 2) 消融(GeoSAM2 venv,.venv_geosam2):所有模式共用同一条提升+填充
+set OPENCV_IO_ENABLE_OPENEXR=1
+.venv_geosam2\Scripts\python SegviGen\finetune\geosam2_ablate.py --renders datasets\geosam2\renders --out datasets\geosam2\results --objects <ids...> ^
+    --modes sam3_p1 sam3_p2 sam3_p4 sam3_p12 geo_p1 geo_p2 geo_p4 lift:sam3track_p1_match lift:sam3track_p2_match lift:sam3track_p4_match
+REM 3) 打分:hard 集用 eval_parts 对 GT;外部资产出结构统计 + 一致性 + ablation_front/back.png;tables 出 markdown
+finetune\run_ft.bat ablation_score.py hard
+finetune\run_ft.bat ablation_score.py ext
+finetune\run_ft.bat ablation_score.py tables       REM -> datasets\geosam2\eval\ablation_tables.md
+```
+
+每行输出在 `<results>/<obj>/abl_<mode>_match/`:`faces.npy`(面标签)、`labels.json`(id→名字、原始留白、秒数)、`mesh.glb`。
+两个修掉的问题:(a) K<12 时未提示视角原来会投 999 票压过有标签像素,现在按 alpha 全 0 处理;(b) GeoSAM2 `prepare_mesh_and_point_cloud`
+先平移后缩放,与渲染器(先缩放后平移)不一致,bbox 中心不在原点的资产(dog)深度测试只剩 9% 的面通过——`geosam2_ablate.prepare_mesh` 用
+正确顺序,`GeoSAM2/inference.py` 已同步修。hard 集(偏移 0)不受影响;`ext_bench` 里 dog/mickey/pineapple/shelf 的旧 GeoSAM2 行受影响。
+
+结果(hard 20,mIoU):SAM3 ×1 直接提升 0.209 < 任何传播 0.246–0.276;SAM3 tracker p2 0.276 ≥ GeoSAM2 传播最好 0.254(几何分支在
+语义部件上无可测增益);SAM3 ×12 直接投票 0.230 且最碎;v6+SAM3 仍最好(0.296,边界 F1 0.704 vs 提升类 ≤0.56)。外部资产上各提升行几乎无差别。

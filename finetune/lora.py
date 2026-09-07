@@ -39,7 +39,8 @@ def _attn_modules(flow_model, targets: set[str]):
         if "self" in targets and hasattr(block, "self_attn"):
             yield block.self_attn
         if "cross" in targets and hasattr(block, "cross_attn"):
-            yield block.cross_attn
+            # v4 LegendCrossAttention wraps the original attention as .inner
+            yield getattr(block.cross_attn, "inner", block.cross_attn)
 
 
 def inject_lora(flow_model, r: int = 16, alpha: float = 32.0, targets=("self", "cross"), dropout: float = 0.0) -> list[nn.Parameter]:

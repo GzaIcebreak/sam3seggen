@@ -432,13 +432,15 @@ def map_to_cond(cond_models, image_path: str, save_path: str) -> None:
 def write_variant(obj: ObjectDir, name: str, labels: np.ndarray, groups: list[list[int]],
                   grey_parts: list[int], colors: list[tuple[int, int, int]], kind: str, view: str,
                   encoders, cond_models, extra: dict | None = None, force: bool = False,
-                  target_from: str | None = None) -> str:
+                  target_from: str | None = None, mask_2d: list[int] | None = None) -> str:
     """Materialise one (2D map, 3D target, cond) triple.
 
     groups[g] lists the parts sharing colors[g]; grey_parts are painted GREY in 3D;
     `labels` is the already-corrupted 2D label raster (part index / LABEL_BG / LABEL_GREY).
     `target_from` names a sibling variant with the identical (groups, grey, colors): its
     output_tex_slat.pth is copied instead of re-encoded (paired views share one 3D target).
+    `mask_2d` parts are painted GREY in the 2D map only (v4 "partial" variants): they keep their
+    colour in 3D and in the legend, so only the legend says what colour they are.
     """
     vdir = obj.variant_dir(name)
     done = os.path.join(vdir, "meta.json")
@@ -452,7 +454,7 @@ def write_variant(obj: ObjectDir, name: str, labels: np.ndarray, groups: list[li
         for p in members:
             part_color[p] = colors[g]
             label_color[p] = colors[g]
-    for p in grey_parts:
+    for p in list(grey_parts) + list(mask_2d or []):
         label_color.pop(p, None)
     label_color[LABEL_GREY] = GREY
 
@@ -478,6 +480,9 @@ def write_variant(obj: ObjectDir, name: str, labels: np.ndarray, groups: list[li
         "grey_pixels": int((labels == LABEL_GREY).sum()),
         "fg_pixels": int((labels != LABEL_BG).sum()),
     }
+    if mask_2d:
+        meta["masked_parts"] = list(mask_2d)
+        meta["masked_pixels"] = int(np.isin(labels, list(mask_2d)).sum())
     if extra:
         meta.update(extra)
     with open(done, "w", encoding="utf-8") as f:
