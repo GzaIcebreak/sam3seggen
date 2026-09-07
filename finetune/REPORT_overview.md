@@ -300,12 +300,15 @@ LoRA 在 MSE 上的下降就是约 8 %，五分之四在前 1000 步拿到；但
 
 ### 8.6 外部资产（10 个，无 GT）：结构统计
 
+`ext_bench.py score` 9-07 重跑（表面采样无固定种子，段数 / 碎片数有 ±0.1–0.4 抖动；消融行取自 `ablation_scores.json`）：
+
 | 方法 | 段数 | 碎片/段 | 留白 | 边界密度 | 与 v6 一致（类无关 / 按名） | 秒 |
 |---|---|---|---|---|---|---|
-| SegviGen 原生 `full_seg`（无 SAM3） | 5.5 | **1.20** | 0 | **0.018** | 0.51 / – | 65 |
+| SegviGen 原生 `full_seg`（无 SAM3，无名字） | 5.7 | 1.59 | 0 | **0.019** | 0.51 / – | 65 |
+| P3-SAM 原版 auto-mask（无 SAM3，无名字） | 13.9 | **1.02** | 0 | 0.058 | 0.43 / – | **24** |
 | SegviGen base + SAM3 | 4.4 | 1.94 | 0.04 | 0.034 | 0.86 / 0.75 | 52 |
-| **v6 + SAM3** | 4.7 | 2.11 | 0.03 | 0.040 | – | 49 |
-| GeoSAM2 single（raw，旧流程） | 5.1 | 1.57 | 0.08 | 0.051 | 0.72 / 0.55 | 75 |
+| **v6 + SAM3** | 4.7 | 2.07 | 0.03 | 0.040 | – | 49 |
+| GeoSAM2 single（raw，旧流程） | 5.1 | 1.53 | 0.08 | 0.051 | 0.72 / 0.55 | 75 |
 | GeoSAM2 dual（填充，旧流程）† | 4.7 | 1.83 | 0 | 0.037 | 0.71 / 0.56 | 89 |
 | GeoSAM2 传播 p2（修正） | 4.9 | 2.58 | 0 | 0.039 | 0.82 / 0.67 | 57 |
 | SAM3 tracker p2 | 4.9 | 2.50 | 0 | 0.039 | 0.79 / 0.65 | 54 |
@@ -313,9 +316,13 @@ LoRA 在 MSE 上的下降就是约 8 %，五分之四在前 1000 步拿到；但
 
 † dog / mickey / pineapple / shelf 受 GeoSAM2 变换顺序 bug 影响（§9.2）。
 
+P3-SAM（Hunyuan3D-Part，`E:\p3part\P3-SAM\demo\auto_mask.py`，Sonata 骨干 108 M，100k 采样点、400 个 FPS 点提示、阈值 0.95、含默认后处理；
+经 `finetune/p3sam_run.py` 跑在与 GeoSAM2 相同的 ≤200k 面网格上）是纯几何部件先验的参照：逐资产段数 human 20 / dog 4 / robot 31 / chair 16 /
+mickey 10 / shelf 10 / pineapple 7 / car 7 / sword 5 / plane 29，10 个里 8 个每段都是整块。
+
 ### 8.7 定性图
 
-正面（列：输入 / SAM3 图 / SegviGen 原生 / base+SAM3 / **v6+SAM3** / GeoSAM2 single raw / GeoSAM2 dual 填充(旧) / GeoSAM2 p2 修正 / SAM3 tracker p2）：
+正面（列：输入 / SAM3 图 / SegviGen 原生 / **P3-SAM 原版** / base+SAM3 / **v6+SAM3** / GeoSAM2 single raw / GeoSAM2 dual 填充(旧) / GeoSAM2 p2 修正 / SAM3 tracker p2）：
 
 ![外部资产正面对照](../assets/ext_bench/compare_front.png)
 
@@ -325,7 +332,10 @@ LoRA 在 MSE 上的下降就是约 8 %，五分之四在前 1000 步拿到；但
 
 观察：
 - **v6 相对 base**：多找回小件（米老鼠 ear / foot、飞机 propeller）、留白更少（机器人 0.08 → 0.02），碎片略多；跑车 / 米老鼠背面未观测的轮子、后脑更易变色。
-- **SegviGen 原生**是另一套划分：有机体极粗（小狗 3 段）、人造物按几何拆细（椅子 10 段），块最整但无名字、不受控。
+- **SegviGen 原生**是另一套划分：有机体极粗（小狗 3 段）、人造物按几何拆细（椅子 10 段），块整但无名字、不受控。
+- **P3-SAM 原版**给的是关节级 / 零件级的过分割：人体按头、胸、腹、上臂、前臂、手、大腿、小腿、脚拆成 20 段，椅子每根撑条一段，菠萝叶冠拆成多簇，
+  每段几乎都是整块（碎片/段 1.02）、20–30 s 最快；但软过渡的有机体切不开（小狗头、身、四腿一块，只分出耳朵，与 SegviGen 原生一致 0.75），
+  粒度比用户提示细一档、没有名字、无法按提示合并（与 v6 一致仅 0.43）。它适合作"候选切口"（先过分割再按 SAM3 名字合并），不适合作最终输出。
 - **提升类**正面与 v6 一致（0.8），背面靠传播 + 最近面填充：重复部件（4 个轮子）颜色一致是优势，后脑 / 后腿出现异色补丁、薄件（飞机、剑）碎。
 - 消融各列（GeoSAM2 p2 vs SAM3 tracker p2）肉眼几乎无差别，与 §8.5 一致。
 - 消融列的颜色按提示序号固定分配，不是 SAM3 图的调色板（shelf 的框架 / 层板在两组列里颜色互换是正常的）。
@@ -430,6 +440,7 @@ LoRA 在 MSE 上的下降就是约 8 %，五分之四在前 1000 步拿到；但
 | `finetune/eval_parts.py`、`eval_fidelity.py` | 3D 评测 |
 | `finetune/ext_bench.py`、`decimate_glb.py` | 外部资产多方法对照、减面 |
 | `finetune/geosam2_render.py`、`geosam2_masks.py`、`geosam2_run.py`、`geosam2_dual.py`、`geosam2_to_glb.py` | GeoSAM2 接入 |
+| `finetune/p3sam_run.py`、`run_p3sam.bat` | 原版 P3-SAM auto-mask（跑在 `.venv`，补装 addict / fpsample / numba / scikit-learn） |
 | `finetune/sam3_track.py`、`geosam2_ablate.py`、`ablation_score.py` | SAM3 tracker 传播、消融、打分 |
 
 ## 附录 C. 复现命令
@@ -452,6 +463,6 @@ python inference_full.py --ckpt_path ckpt\full_seg_v6.ckpt --glb input.glb --inp
 REM 评测（单物体；hard 20 的批量表由 geosam2_chain / ablation_score 生成）
 finetune\run_ft.bat eval_parts.py --object datasets\pv\<id> --segvigen out.glb --legend legend.json --report out.json
 finetune\run_ft.bat eval_parts.py --object datasets\pv\<id> --faces mesh.glb --face_labels faces.npy --labels_json labels.json
-finetune\run_ft.bat ext_bench.py all
+finetune\run_ft.bat ext_bench.py all                  REM 含 p3sam 阶段；单独：ext_bench.py p3sam score montage report
 finetune\run_ft.bat ablation_score.py hard / ext / tables
 ```

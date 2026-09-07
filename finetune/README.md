@@ -9,6 +9,8 @@
 
 当前状态的单一入口（路线、数据集、v1–v6 训练参数与结果、GeoSAM2 消融、外部资产定性图）见 [`REPORT_overview.md`](REPORT_overview.md)；
 改动全貌、v1/v2 结果、数据修复与原论文的损失/条件结构对照见 [`REPORT_v3_changes.md`](REPORT_v3_changes.md)。
+云服务器接手（要搬什么、Linux 环境、先复现哪些数字、下一步实验与验收标准）：SegviGen 路线见
+[`HANDOVER_cloud_segvigen.md`](HANDOVER_cloud_segvigen.md)，GeoSAM2 路线见 [`HANDOVER_cloud_geosam2.md`](HANDOVER_cloud_geosam2.md)。
 
 所有脚本在 SegviGen 根目录下通过 `finetune\run_ft.bat <脚本> <参数>` 运行
 (它设置了与推理 .bat 相同的环境变量并使用 `.venv`);只有 `sam3_masks.py` 用 `.venv_holo`,
@@ -339,7 +341,7 @@ SegviGen 边界 F1 更高(0.67–0.70 vs 0.55–0.63)、碎片更少;GeoSAM2 小
 
 ## 外部资产对照:`ext_bench.py`
 
-用户自己的 10 个模型(`datasets/ext_parts/`,即 `3D拆件.zip`)上,SegviGen 原生 / base+SAM3 / v6+SAM3 / GeoSAM2 single / dual
+用户自己的 10 个模型(`datasets/ext_parts/`,即 `3D拆件.zip`)上,SegviGen 原生 / P3-SAM 原版 / base+SAM3 / v6+SAM3 / GeoSAM2 single / dual
 同机位出图并统计。没有 GT,`score` 给的是结构统计(段数、每段连通块数、留白、边界密度)和方法间一致性,不是准确率:
 
 ```bat
@@ -348,13 +350,18 @@ finetune\run_ft.bat ext_bench.py front mesh sam3        REM 8 机位选正面(FR
 finetune\run_ft.bat ext_bench.py segvigen               REM full_seg / full_seg_w_2d_map / full_seg_v6,~1 min/次,峰值 21 GB
 finetune\run_ft.bat ext_bench.py geo_prep               REM GeoSAM2 12 视角渲染 + SAM3 标签图(轻,可与上一步并行)
 finetune\run_ft.bat ext_bench.py geosam2                REM single/dual × match/best,200k 面约 2 min/次
+finetune\run_ft.bat ext_bench.py p3sam                  REM 原版 P3-SAM auto-mask(run_p3sam.bat -> p3sam_run.py),同一减面网格,20-60 s/次
 finetune\run_ft.bat ext_bench.py score montage report   REM scores.json、compare_front/back.png、REPORT.md
 ```
 
-输出在 `datasets/ext_bench/`:每资产一个目录(`render.png`/`map.png`/`legend.json`/`seg_*_upright.glb`/`geosam2_*_parts.glb`/`vis/`),
+输出在 `datasets/ext_bench/`:每资产一个目录(`render.png`/`map.png`/`legend.json`/`seg_*_upright.glb`/`geosam2_*_parts.glb`/`p3sam_parts.glb`/`vis/`),
 `REPORT.md` 汇总。提示词与正面机位写在脚本顶部的 `ASSETS` / `FRONT_OVERRIDE`。`compare_*.png` 最右两列是消融里最好的两行
-(`GeoSAM2 p2 (fixed)`、`SAM3 tracker p2 (best)`,GLB 由 `ablation_score.py ext` 生成),`GeoSAM2 dual (filled)` 列是变换 bug 修正前的旧结果。`decimate_glb.py`(bpy Decimate,保 UV)供 GeoSAM2
+(`GeoSAM2 p2 (fixed)`、`SAM3 tracker p2 (best)`,GLB 由 `ablation_score.py ext` 生成),`GeoSAM2 dual (filled)` 列是变换 bug 修正前的旧结果。`decimate_glb.py`(bpy Decimate,保 UV)供 GeoSAM2 / P3-SAM
 用;bpy 模块导出成功后常在退出时崩溃(0xC0000005),脚本按输出文件是否存在判断成功。
+
+`P3-SAM (auto, no SAM3)` 列是 Hunyuan3D-Part 原版 `demo/auto_mask.py` 的结果(`E:\p3part\P3-SAM`,Sonata 骨干,400 个 FPS 点提示,
+阈值 0.95,含默认后处理),不看文本也不看 SAM3,是纯几何部件先验的参照;它原来的 conda 环境已不在,`p3sam_run.py` 在 SegviGen 的 `.venv` 里跑
+(补装了 addict / fpsample / numba / scikit-learn)。结果在 `datasets/ext_bench/p3sam/<key>/{mesh.glb, faces.npy, info.json}`,颜色按部件面积排序固定分配,与 SAM3 调色板无关。
 
 结果(REPORT 11):SAM3+概念库对前视图 51 个提示词命中 48 个;v6 与 base 一致性 0.86,v6 多找回小件、留白更少但碎片略多(背面轮子/后脑易变色);
 GeoSAM2 与 v6 类无关一致性 0.71,重复件颜色更一致、背面有异色补丁、raw 留白 7–8%;SegviGen 原生是另一套划分(一致性 0.51),块最整但无名字、不受控。
