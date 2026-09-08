@@ -204,19 +204,25 @@ huggingface-cli download dscdyc/partversexl --repo-type dataset --local-dir /dat
 datasets/xl_new_ids.txt    25 406 个 id，已确认与 pv/ + pv_new/ 交集为 0
 ```
 
-### 8.2 仓库命名与隔离约定
+### 8.2 仓库与隔离约定
 
-**已重标注的和未重标的永远分开放**，靠仓库边界而不是靠清单文件来保证：
+**只有三个仓，不随来源增加。** 隔离的边界是「清洗状态」而不是「来源」，因为前者决定数据能不能用于训练，后者只是元信息：
 
-| 角色 | 命名 | 已有实例 |
+| 角色 | 仓库（固定） | 内容随来源增长的方式 |
 |---|---|---|
-| 已重标 + 人工复核（唯一可用于训练 / 评测 / 留出集） | `segvigen-pv-2view` | 2 000 个物体 |
-| 原始未清洗的两视角数据，每个来源一个 | `segvigen-<source>-raw` | `segvigen-pv-raw`（5 826） |
-| 清洗作业包，每个来源一个 | `segvigen-relabel-<source>` | `segvigen-relabel-work`（5 826） |
+| 已重标 + 人工复核，唯一可用于训练 / 评测 / 留出集 | `segvigen-pv-2view` | 每批一个归档：`cb_data.tar.gz`（首批 2 000）、`<source>_clean_2view.tar.gz` |
+| 原始未清洗的两视角数据 | `segvigen-pv-raw` | 每来源一个归档：`pv_raw_2view.tar.gz`、`xl_raw_2view.tar.gz`、`partnext_raw_2view.tar.gz` |
+| 清洗作业包 | `segvigen-relabel-work` | 每来源一个归档：`batches.tar.gz`（首批）、`<source>_batches.tar.gz` |
 
-原始仓的 README 必须以「名字未清洗，不要直接训练」开头，并链回已复核的那个仓。
-清洗验收通过后，把该来源的数据并入已复核仓（或让训练脚本吃多个 root），
-**但留出集永远只从最初那 2 000 个里选**，否则历史指标失去可比性。
+**每个来源必须带一份 id 清单**（`ids_<source>.txt`）传进对应仓，否则解包后无法分辨物体来自哪个源——
+而这是必需的：PartVerse 系的名字来自 caption 重标，PartNeXt 的来自人工层级标注，两者的命名口径和许可都不同。
+原始仓 README 顶部保持「名字未清洗，不要直接训练」的警告，并按来源分别写明许可。
+
+**追加而不是重打包。** 新一批清洗完成后往 `pv-2view` 里加一个新归档，不要把已有的 `cb_data.tar.gz` 重新生成——
+重打包要重传 765 MB，且会让「哪些物体是人工复核过的」这段历史变得不可追溯。
+
+**留出集永远只从最初那 2 000 个里选**，否则历史指标（概念库 mIoU 0.368）失去可比性。
+`pv_holdout_v3.txt` / `pv_hard.txt` / `pv_holdout_mix.txt` 不随扩容改动。
 
 ### 8.3 每个来源的差异
 

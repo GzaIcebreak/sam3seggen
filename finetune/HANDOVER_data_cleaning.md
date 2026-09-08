@@ -41,6 +41,9 @@ mIoU 0.368 这个基线失去可比性：
 | `Zaun1996/segvigen-pv-raw` | 5 826 | 原始启发式，未清洗 | 你要清洗的数据本体（两视角渲染） |
 | `Zaun1996/segvigen-relabel-work` | 5 826（同上） | — | 你的作业包（批次 / 审阅图 / 参考输出） |
 
+这三个仓是固定的，后续来源以新归档形式加入（见 §8），不会新建仓。
+注意**工具不在 HF 上**，在 git 仓 `finetune/relabel/`（§3）：规则改一次要让所有批次的校验口径同步变化，所以工具必须版本管理。
+
 日常只需要第三个仓；只有要跑完整训练验证时才需要第二个。工作包（需要一个有读权限的 token）：
 
 ```bash
@@ -350,8 +353,9 @@ for d in /data/pv_new/*/; do [ -f "$d/names_v1.json" ] && cp "$d/names_v1.json" 
 | **PartVerse-XL** | 25 406 净新增 → 约 14 700 可用（294 批） | 无差异。caption 来源、目录结构、工具全部相同。**导入时必须只喂 `xl_new_ids.txt`**，因为 XL 会把我们已人工标好的 1 245 个物体重新标注，整包导入会静默冲掉那批人工成果 |
 | **PartNeXt** | 23 519 | **不走重标，走校验。** 它的部件名是人工标的，直接用 `check_names.py` 全量校验，只把不通过的部件送去改写。预计主要问题是词数超 3（层级路径拼接）和粒度过细 |
 
-新来源开工时你会拿到三个新仓：`segvigen-<source>-raw`（未清洗数据）、`segvigen-relabel-<source>`（作业包），
-以及始终不变的 `segvigen-pv-2view`（已复核基线，**不要动**）。
+**仓库不会变，还是这三个**（见 §2）。新来源以新归档的形式加进去，文件名带来源前缀：
+`segvigen-pv-raw` 里多一个 `xl_raw_2view.tar.gz`，`segvigen-relabel-work` 里多一个 `xl_batches.tar.gz`，
+并各带一份 `ids_xl.txt`。你清洗完的成果作为新归档进 `segvigen-pv-2view`，**不要重新生成已有的 `cb_data.tar.gz`**。
 
 ## 9. 三条纪律
 
