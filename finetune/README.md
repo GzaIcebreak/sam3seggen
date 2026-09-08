@@ -12,7 +12,8 @@
 云服务器接手（要搬什么、Linux 环境、先复现哪些数字、下一步实验与验收标准）：SegviGen 路线见
 [`HANDOVER_cloud_segvigen.md`](HANDOVER_cloud_segvigen.md)，GeoSAM2 路线见 [`HANDOVER_cloud_geosam2.md`](HANDOVER_cloud_geosam2.md)。
 准备 SAM3 概念库训练数据（最小文件集、`names.json` / `ids.npy` 格式、命名口径、云端训练与 v3 实测结果、自检）见
-[`DATA_concept_bank.md`](DATA_concept_bank.md)；概念库继续提升的方案见 [`PLAN_concept_bank_v4.md`](PLAN_concept_bank_v4.md)。
+[`DATA_concept_bank.md`](DATA_concept_bank.md)；概念库继续提升的方案见 [`PLAN_concept_bank_v4.md`](PLAN_concept_bank_v4.md)；
+扩大数据集的路线与实测成本（本地 PartVerse 还剩 10 030 个未用、PartVerse-XL / PartNeXt 评估）见 [`PLAN_data_expansion.md`](PLAN_data_expansion.md)。
 数据与权重（私有 HF 仓）：[`Zaun1996/segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view)（730 MB 训练包）、
 [`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank)（v3 权重 + 日志）。
 
