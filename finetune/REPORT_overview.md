@@ -87,7 +87,7 @@ map.png ─► BiRefNet 去背 ─► DINOv3 ViT-L/16 ─► ≈1029 token（cro
 
 | 文件 | 数量 | 用途 |
 |---|---|---|
-| `pv_holdout_v3.txt` | 56 物体 | 训练留出；MSE / 颜色检查、轨迹探针（其中 20 个） |
+| `pv_holdout_v3.txt` | 55 物体（35 mixed + 20 hard） | 训练留出；MSE / 颜色检查、轨迹探针（其中 20 个） |
 | `pv_hard.txt` | 20 物体 | 端到端评测集（细小部件多，平均 13.6 个 GT 部件 / 8.8 个名字，112 个 <1 % 面积小件） |
 | `pv_holdout_mix.txt` | 35 物体 | v1/v2 时期的留出集；回归集 |
 | `pv_list_a_v3.txt` | 1028 物体 | Path A（跑 SAM3）名单 |
@@ -194,7 +194,7 @@ r=16、α=32（scale 2），B 零初始化；挂在 DiT 每个 block 的 self / 
 | `batch_size × grad_accum` | 4 × 4（v1 为 4 × 1） | `grad_clip` | 1.0 |
 | `p_uncond` | 0.1（条件置零） | 优化器 | AdamW β=(0.9, 0.99) |
 | 时间步分布 | logit-normal(0,1)，batch 内分层 | 精度 | bf16 权重 + fp32 LoRA / 损失 |
-| `holdout_file` | v1/v2 `pv_holdout_mix`(35)；v3–v6 `pv_holdout_v3`(56) | 检查 | 每 250 步，t∈{0.5, 0.95, 1.0}（v6），固定噪声 |
+| `holdout_file` | v1/v2 `pv_holdout_mix`(35)；v3–v6 `pv_holdout_v3`(55) | 检查 | 每 250 步，t∈{0.5, 0.95, 1.0}（v6），固定噪声 |
 | v3–v5 新模块 lr | `new_lr` 1e-3（LegendEncoder）、`attn_lr` 1e-4、`out_lr` 3e-4 | dropout | 图例 0.1–0.2、第二视角 0.3 |
 | v4–v6 颜色项 | `color_weight` 0.3、`color_tau` 0.03、`min_purity` 0.9 | v6 轨迹 | `p_traj` 0.5、`traj_steps` 3、`color_t_min` 0.8 |
 

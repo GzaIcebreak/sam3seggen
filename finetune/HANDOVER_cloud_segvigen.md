@@ -30,7 +30,7 @@
 | SAM3 | HF cache `models--facebook--sam3` | ~3.4 GB | SAM3 环境下 `transformers` 自动下载（gated，需 HF token） |
 | 概念库 | `datasets/concept_bank_v3/bank.pt` + `report.json` | < 10 MB | 必需 |
 | 训练数据 | `datasets/pv/` | **132.8 GB** | 见下方"怎么瘦身" |
-| 数据清单 | `datasets/pv_holdout_v3.txt`（69 个留出物体，**包含全部 20 个 hard 物体**，训练时用 `--holdout_file` 排除）、`pv_hard.txt`（20 个 hard 评测物体）、`pv_list_a.txt`、`pv_list_b.txt`、`pv_list_c_new.txt` | KB | 必需 |
+| 数据清单 | `datasets/pv_holdout_v3.txt`（55 个留出物体 = 35 mixed + 20 hard，**包含全部 20 个 hard 物体**，训练时用 `--holdout_file` 排除）、`pv_hard.txt`（20 个 hard 评测物体）、`pv_list_a.txt`、`pv_list_b.txt`、`pv_list_c_new.txt` | KB | 必需 |
 | 颜色探针 | `SegviGen/finetune/color_probe.pt` | KB | 必需（v4–v6 颜色 CE 用的冻结线性探针；在 git 里） |
 | 评测缓存 | `datasets/geosam2/`（5.9 GB）、`datasets/ext_bench/`（6.2 GB） | 可选 | 只是历史结果；重跑评测会重建 |
 
@@ -66,7 +66,7 @@ for i, m in enumerate(maps):
 
 ### 每个物体目录里各文件的用途（决定哪些不能少）
 
-| 文件 | 谁写的 | 谁读 |
+| 文件 | 谁写的 | 谁读 |  12131112312312332132 
 |---|---|---|
 | `input.glb`、`input.vxz`、`ids.vxz`、`ids.glb`、`ids_meta.json` | `common.prepare_object` | 评测（`eval_parts` / `eval_fidelity` 在 GT 上打分）、重新生成变体 |
 | `shape_slat.pth`、`input_tex_slat.pth`、`common_coords.pth` | 同上 | **训练**（形状条件、纹理输入） |

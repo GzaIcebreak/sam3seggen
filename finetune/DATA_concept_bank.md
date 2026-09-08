@@ -137,10 +137,41 @@ finetune\run_ft.bat import_glb.py --glb your.glb --out <root>\<id> --names head 
 
 | 文件 | 作用 |
 |---|---|
-| `pv_holdout_v3.txt`（或你自己的 holdout） | 一行一个 `object_id`。训练时 `--holdout_file` 排除它们。现有清单 69 个，**含全部 20 个 hard 物体** |
+| `pv_holdout_v3.txt`（或你自己的 holdout） | 一行一个 `object_id`（`#` 开头是注释）。训练时 `--holdout_file` 排除它们。现有清单 **55 个** = 35 mixed + 20 hard |
 | 没有 holdout 文件 | `concept_bank.py` 按 `--holdout_frac 0.10` 随机留出 |
 
-概念库训练命令（SAM3 环境，`transformers>=5`）：
+留出集实际构成：`--holdout_file` 里的 id 全部进留出，再随机补到 `--holdout_frac`。v3 是 55 固定 + 145 随机 = **200 个留出 / 1800 训练**，写在 `<out>/split.json`。补的那 145 个由 `--seed` 和**根目录下的物体列表**共同决定，所以物体集合一变，split 就变；要严格对比就直接沿用旧的 `split.json` 或保持物体集合不变。
+
+---
+
+## 5. 在云服务器上训练
+
+### 5.1 只需要传这些（本地已打好包）
+
+概念库不需要 `datasets/pv` 的全部 133 GB，只要第 2 节那份最小集：
+
+| | 大小 |
+|---|---|
+| 2000 物体 × (`names.json` + `names_meta.json` + 2 视角 × (`render.png` + `ids.npy`)) | 2.87 GB（12 000 个文件） |
+| 打包后 `cb_data.tar.gz` | **730 MB**（`ids.npy` 里几乎全是背景，gzip 压到 0.5 %） |
+
+包里还含 `pv_holdout_v3.txt`、`pv_hard.txt`、`pv_holdout_mix.txt` 和 `concept_bank_v3/{bank.pt, split.json, text_cache.pt, log.jsonl}`（对照基线，共 3.2 MB）。
+
+```bash
+# 本地（Windows，datasets 目录下已生成）
+#   sha256 = b2b0ca006492ac9eb6e10a09c7b5b03a147418a6e413da655be3d955aa998ded
+scp E:/AI_New/ModelGen/datasets/cb_data.tar.gz user@cloud:/data/
+
+# 云端
+cd /data && sha256sum cb_data.tar.gz && tar -xzf cb_data.tar.gz
+# 得到 /data/pv/<id>/...、/data/pv_holdout_v3.txt、/data/concept_bank_v3/
+```
+
+重新生成这个包（本地）：`datasets/cb_filelist.txt` 是文件清单，`tar -czf cb_data.tar.gz -T cb_filelist.txt`（在 `datasets/` 下执行）。
+
+环境只要 SAM3 那一个 venv（`transformers>=5`、torch、PIL、numpy），**不需要** TRELLIS.2 / bpy / nvdiffrast / o_voxel——那些只在生成 `render.png` / `ids.npy` 时用得到，而这两样已经在包里。SAM3 权重 `facebook/sam3` 是 gated，云端要先 `huggingface-cli login`。
+
+### 5.2 训练命令（复现 v3 的配置）
 
 ```bash
 .venv_holo/bin/python finetune/concept_bank.py \
@@ -148,16 +179,83 @@ finetune\run_ft.bat import_glb.py --glb your.glb --out <root>\<id> --names head 
   --out /data/concept_bank_v4 \
   --template name --epochs 3 --neg_mode mixed --negatives 3 --neg_weight 0.5 \
   --lr_e0 5e-4 --holdout_file /data/pv_holdout_v3.txt \
-  --azimuths 0,135 --min_count 8
+  --azimuths 0,135 --min_count 8 --max_prompts 12 \
+  --eval_thresholds 0.4,0.5,0.6 --wandb --wandb_project segvigen-sam3
 ```
 
-产物：`<out>/bank.pt`（推理加载）、`split.json`、`log.jsonl`、`text_cache.pt`。
+v3 的实际开销：3 epoch × 3600 step，**70 min**、峰值 **15.3 GB** 显存（SAM3 全程冻结，只有两个 256 维张量有梯度）。`--max_prompts 12` 控制单步的 `[N, Q, h, w]` 掩码显存，显存小就调低。
 
-验收对照（v3，阈值 0.5）：留出集 2D mIoU 0.288 → **0.368**，难负例误检率基本持平。新数据训完应不低于这个数。
+只评测已有 bank，不训练：
+
+```bash
+.venv_holo/bin/python finetune/concept_bank.py --dataset_root /data/pv --out /tmp/eval \
+  --eval_only --resume /data/concept_bank_v3/bank.pt --holdout_file /data/pv_holdout_v3.txt \
+  --eval_thresholds 0.4,0.5,0.6
+```
 
 ---
 
-## 5. 交数据前自检
+## 6. 训练结果是什么
+
+### 6.1 产物文件
+
+| 文件 | 内容 | 用途 |
+|---|---|---|
+| `bank.pt` | 287 KB。`{E_0: [256], E: [N_names, 256], names: [...], template, base, meta}`。v3 是 **280 个名字**（训练集出现 ≥ 8 次的），`template = "{name}"`，`base = facebook/sam3`，`meta` 里存了全部训练参数 | **这是唯一的部署产物**。`sam3_to_2dmap.py` / `sam3_masks.py` / `geosam2_masks.py` 的 `--concept_bank` 加载它 |
+| `bank_epoch1/2/3.pt` | 每个 epoch 的快照 | 挑最好的那个 epoch |
+| `split.json` | `{train: [...], holdout: [...]}` | 复现同一划分 |
+| `log.jsonl` | 每 50 step 一行 `{loss, e0_norm, e_norm, vram_gib}`；每 epoch 一行 `kind="eval"` 的完整指标 | 曲线与验收 |
+| `text_cache.pt` | 2.8 MB。全部词表名字 + 物体名的 256 维文本向量（已加偏移） | v3–v5 的图例 token 用；v6/v7 路线**不用** |
+
+模型本体没有任何改动——SAM3 权重全程冻结，学到的东西只有 `E_0`（一个共享 256 维偏移）和 `E[name]`（280 个名字各一个）。所以 287 KB 就是全部成果。
+
+### 6.2 指标含义
+
+每个 epoch 在留出集上跑一次评测（v3 用 240 张图 / 1068 个提示词），同一次前向在 4 个分数阈值上出数：
+
+| 指标 | 定义 | 越大越好？ |
+|---|---|---|
+| `miou` | 每个提示词的「预测并集 vs 该名字的 GT 并集」IoU 的均值 | ↑ |
+| `bind_rate` | IoU ≥ 0.5 的提示词占比 | ↑ |
+| `false_positive_rate` | 随机负例名字（本物体没有的名字）里，吐出了任何像素的占比 | ↓ |
+| `false_positive_rate_hard` | 同上，但负例是共现 / 文本相似的名字（更难） | ↓ |
+| `part_bound_rate` | 可见部件实例中，被自己名字覆盖 ≥ 50 % 像素的占比 | ↑ |
+| `grey_pixel_ratio` | 部件像素里最终没被任何名字绑定的比例 → 在 2D 图上变灰 | ↓ |
+
+对下游最关键的是 **`grey_pixel_ratio`**（灰色 = SegviGen 拿不到颜色 = 漏件）和 **`false_positive_rate_hard`**（把 A 涂成 B）。`miou` 高但 hard FP 也高，说明只是把阈值效果整体放宽了，没有真正学会区分——所以要看整条阈值扫描，而不是单个数。
+
+### 6.3 v3 实测（`concept_bank_v3/log.jsonl`，留出集 200 物体 / 1068 提示词）
+
+epoch 0 = 裸 SAM3（不加 bank）的基线，epoch 3 = 最终产物：
+
+| 阈值 | mIoU 基线 → v3 | bind 基线 → v3 | 灰像素 基线 → v3 | 随机 FP | 难负例 FP |
+|---|---|---|---|---|---|
+| 0.3 | 0.323 → **0.409** | 0.331 → 0.419 | 0.558 → **0.281** | 0.103 → 0.124 | 0.289 → 0.324 |
+| 0.4 | 0.309 → **0.397** | 0.322 → 0.406 | 0.607 → **0.321** | 0.074 → 0.093 | 0.229 → 0.254 |
+| **0.5**（部署常用） | 0.288 → **0.368** | 0.301 → 0.383 | 0.654 → **0.381** | 0.057 → 0.062 | 0.186 → 0.188 |
+| 0.6 | 0.259 → **0.333** | 0.268 → 0.348 | 0.685 → 0.501 | 0.043 → 0.044 | 0.142 → 0.121 |
+
+逐 epoch（阈值 0.5 的 mIoU）：0.288 → 0.351 → 0.365 → 0.368，**收益基本在第 1 个 epoch**，第 3 个只 +0.003；训练损失 1.105 → 0.851；`E_0` 范数 0.13 → 4.21，`E[name]` 平均范数 0.62 → 6.13。
+
+怎么读这张表：
+
+- **主收益是「找得到」**：灰像素在阈值 0.5 上 0.654 → 0.381（少了 42 %），部件绑定率 0.429 → 0.543。对 SegviGen 直接意味着 2D 图上被涂色的部件更多。
+- **误检没有变坏**：阈值 0.5 上随机 FP 0.057 → 0.062、难负例 FP 0.186 → 0.188，基本持平；阈值 0.6 上难负例 FP 甚至更低（0.142 → 0.121）。这就是「不是靠整体放宽阈值换来的」的证据。
+- **阈值 0.3 别用**：那里难负例 FP 从 0.289 涨到 0.324。部署统一用 **0.4**（`ext_bench.py` / `geosam2_masks.py` 的默认）或 0.5。
+- **绝对值不高是正常的**：mIoU 0.37 是「名字级并集」的 2D IoU，GT 是 PartVerse 的部件划分，很多名字本身就有歧义（`body` 到哪算完）。它只作相对比较用。
+
+### 6.4 新数据训完的验收标准
+
+在**同一个留出集**上（要么沿用 `concept_bank_v3/split.json`，要么保证物体集合不变）：
+
+1. 阈值 0.5 的 mIoU ≥ 0.368，且难负例 FP ≤ 0.19。只涨 mIoU 不看 FP 不算通过。
+2. 阈值 0.5 的灰像素 ≤ 0.381。
+3. `min_count 8` 的词表覆盖率（打印在启动日志里，"they cover X% of train part instances"）不低于 80 %。v3 是 280 个名字覆盖约 82 % 的部件实例；如果新数据全是一次性名字，覆盖率会掉，`E[name]` 学不到东西，只剩 `E_0`。
+4. 下游抽查：拿新 bank 跑 `sam3_to_2dmap.py --threshold 0.4`，对 10 个外部资产的提示词命中率不低于 48/51（v3 的数）。
+
+---
+
+## 7. 交数据前自检
 
 对每个物体：
 
@@ -196,11 +294,11 @@ for az in ("az0", "az135"):
 
 ---
 
-## 6. 从现有仓库扩数据的最短路径
+## 8. 从现有仓库扩数据的最短路径
 
 1. 每个新物体：`input.glb` + 按件拆开的 `parts/*.glb` + 按上面口径写好的 `names.json` / `names_meta.json`
 2. `render_views.py --azimuths 0,135`（可再加更多方位；目录名跟着改，训练 `--azimuths` 对齐）
-3. 跑第 5 节自检，抽查看图
+3. 跑第 7 节自检，抽查看图
 4. 把新物体目录拷进同一个 `--dataset_root`（或再给 `concept_bank.py` 一个根；当前脚本只接受一个 root）
 5. holdout 不要混进训练：新物体要么全部训练，要么自己列一份 holdout
 
@@ -208,7 +306,7 @@ for az in ("az0", "az135"):
 
 ---
 
-## 7. 和 SegviGen LoRA 数据的关系
+## 9. 和 SegviGen LoRA 数据的关系
 
 | | 概念库 | SegviGen LoRA（v6/v7） |
 |---|---|---|

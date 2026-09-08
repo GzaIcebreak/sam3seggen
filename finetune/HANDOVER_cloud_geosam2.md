@@ -132,7 +132,7 @@ A 方案的产出：`finetune/geosam2_pipeline.py`（渲染 → SAM3 → tracker
 
 **数据（最花时间的部分，2–3 天）**：
 
-1. 物体：`datasets/pv` 的 1319 个已准备物体（有 `parts/` 与人工审阅过的 `names.json`），排除 `pv_holdout_v3.txt` 的 69 个。可再加 PartVerse-XL / PartNeXt 扩到 5k（GeoSAM2 的数据来自 PartVerse 系列 + 私有数据，重叠不可避免）。
+1. 物体：`datasets/pv` 的 1319 个已准备物体（有 `parts/` 与人工审阅过的 `names.json`），排除 `pv_holdout_v3.txt` 的 55 个。可再加 PartVerse-XL / PartNeXt 扩到 5k（GeoSAM2 的数据来自 PartVerse 系列 + 私有数据，重叠不可避免）。
 2. 每物体跑 `geosam2_render.py` 出 12 视角 rgb / normal / pos / depth（1319 × 12，CYCLES 约 12 h，EEVEE 3 h）。
 3. **新写 `geosam2_gt_masks.py`**：用 GeoSAM2 相同的 12 个相机（`geosam2_render_upstream` 里的相机参数）渲染每个部件的 id 图，写成每视角每部件的二值掩码。`common.render_part_ids` 已有部件 id 渲染（nvdiffrast），只需换相机。
 4. 训练样本 = (提示视角 k 的某部件掩码, 其余 11 视角的该部件 GT 掩码)。每物体每部件 12 个锚 → 样本量约 1319 × 8 部件 × 12 ≈ 12 万条"视频"。
