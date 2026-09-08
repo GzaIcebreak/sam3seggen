@@ -13,9 +13,12 @@
 [`HANDOVER_cloud_segvigen.md`](HANDOVER_cloud_segvigen.md)，GeoSAM2 路线见 [`HANDOVER_cloud_geosam2.md`](HANDOVER_cloud_geosam2.md)。
 准备 SAM3 概念库训练数据（最小文件集、`names.json` / `ids.npy` 格式、命名口径、云端训练与 v3 实测结果、自检）见
 [`DATA_concept_bank.md`](DATA_concept_bank.md)；概念库继续提升的方案见 [`PLAN_concept_bank_v4.md`](PLAN_concept_bank_v4.md)；
-扩大数据集的路线与实测成本（本地 PartVerse 还剩 10 030 个未用、PartVerse-XL / PartNeXt 评估）见 [`PLAN_data_expansion.md`](PLAN_data_expansion.md)。
+扩大数据集的路线与实测成本（本地 PartVerse 剩余物体已导入完成、PartVerse-XL / PartNeXt 实测体积与净新增量）见 [`PLAN_data_expansion.md`](PLAN_data_expansion.md)。
+部件名重标注外包（口径、prompt 原文、校验与审阅流程、故障处理、交付标准）见 [`HANDOVER_data_cleaning.md`](HANDOVER_data_cleaning.md)，
+工具在 [`relabel/`](relabel)。
 数据与权重（私有 HF 仓）：[`Zaun1996/segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view)（730 MB 训练包）、
-[`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank)（v3 权重 + 日志）。
+[`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank)（v3 权重 + 日志）、
+[`Zaun1996/segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work)（5 826 个物体的重标工作包）。
 
 所有脚本在 SegviGen 根目录下通过 `finetune\run_ft.bat <脚本> <参数>` 运行
 (它设置了与推理 .bat 相同的环境变量并使用 `.venv`);只有 `sam3_masks.py` 用 `.venv_holo`,
@@ -142,6 +145,45 @@ finetune\run_ft.bat run_batch.py --dataset_root E:\AI_New\ModelGen\datasets\pv -
 ```
 
 当前机器上的吞吐(串行、无争用):路 B 约 14 s/对象(2 视角 × (1 干净 + 3 腐蚀)),路 A 约 18 s/对象(含 bpy 渲染 + SAM3)。
+
+### 扩容数据源:`fetch_part_datasets.py`
+
+下 PartVerse-XL(净新增 25 406 个物体,与本地 PartVerse 目录结构一致,`import_partverse.py` 不用改)
+和 PartNeXt(23 519 个物体,**部件名是人工标的**,不需要重标)。体积与取舍见 `PLAN_data_expansion.md`。
+
+```bat
+finetune\run_ft.bat fetch_part_datasets.py --which xl --workers 8        REM 106 GB,大分卷,带宽型
+finetune\run_ft.bat fetch_part_datasets.py --which partnext --workers 48 REM 57.5 GB,23 231 个小文件,延迟型
+```
+
+两者**不要并行下**,会互抢代理连接池(实测把 XL 从 180 MB/s 压到近乎 0)。脚本自带看门狗:
+大分卷经代理下载会出现连接已死但不抛异常、进程 0% CPU 卡住的情况,普通重试循环永远不触发,
+所以看门狗按**磁盘增长**判活,`--stall_s` 秒没增长就杀掉子进程重进(`snapshot_download` 从 `.incomplete` 续传)。
+
+### 部件名重标注:`relabel/`
+
+`names.json` 的名字决定 SAM3 提示词,PartVerse 自带的启发式名字约 17.6% 没有语义
+(`cylindrical component`、`texture`、`representing the ground`)。第一批 2 000 个物体靠 Grok 4.6 重标
++ 三轮人工复核解决(改了 92% 的名字),概念库 2D mIoU 因此 0.288 → 0.368。
+
+完整作业手册(口径、prompt 原文、逐批校验、审阅流程、6 类已知故障与处理)见
+[`HANDOVER_data_cleaning.md`](HANDOVER_data_cleaning.md)。工具全部参数化,可在别的机器上跑,
+标注阶段只需 Python 标准库(审阅阶段加 numpy + pillow):
+
+```bash
+python finetune/relabel/prep_batches.py --root /data/pv_new --out /data/relabel --chunk 50   # 出批
+python finetune/relabel/check_names.py  --dir /data/relabel --batch 007 --dump               # 逐批校验
+python finetune/relabel/check_names.py  --dir /data/relabel --all                           # 合并 names_v2.json
+python finetune/relabel/screen_large.py --root /data/pv_new --out /data/relabel/review/large # 强制:主导部件筛查
+python finetune/relabel/review_sheet.py --root /data/pv_new --out /data/relabel/review --n 30 --seed 42
+python finetune/relabel/apply_names.py  --root /data/pv_new --names /data/relabel/names_v2.json --dry
+```
+
+命名规则(禁用词、body 类白名单)只写在 `relabel/rules.py`,所有校验脚本从那里 import——
+被替换掉的临时脚本各带一份黑名单副本,已经漂移过。
+`check_names.py` 退出码非零表示有问题,可以直接串进驱动脚本。
+`screen_large.py` 是**最不能省的一步**:它筛「可见占比 ≥ 45% 却给了局部名」的部件(整个雪人被叫成 `head`),
+第一批 139 处错误来自这里,而自动校验查不出来。
 
 ## 评估
 

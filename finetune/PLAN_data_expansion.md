@@ -11,9 +11,9 @@
 
 | 路线 | 新增可用物体 | 下载 | 代码改动 | 计算 | 磁盘 |
 |---|---|---|---|---|---|
-| **A. 用完本地 PartVerse** | +5 800（10 030 × 58 % 产出率） | 0 | 0 | 6.4 h | 39 GB |
-| **B. PartVerse-XL** | +16 000（净新增约 28 000 × 58 %） | ~106 GB | 0（格式相同） | 18 h | 107 GB |
-| **C. PartNeXt** | +23 500（**自带人工部件名**） | 待查 | 新 importer 约 300 行 | 26 h | 160 GB |
+| **A. 用完本地 PartVerse** | **+5 826（已导入完成）** | 0 | 0 | 2.4 h | 39 GB |
+| **B. PartVerse-XL** | +14 700（净新增 **25 406** 实测 × 58 %） | 106 GB | 0（格式相同） | 10 h | 107 GB |
+| **C. PartNeXt** | +23 500（**自带人工部件名**） | **57.5 GB** | 新 importer 约 300 行 | 15 h | 120 GB |
 | **D. 挖已有物体**（视角 / 层级 / 补变体） | 0（同样物体，更多样本） | 0 | 小 | 11–31 h | 18–110 GB |
 
 E 盘剩余 **1.1 TB**，磁盘不是概念库数据的约束；只有 SegviGen LoRA 的 `variants/` 才吃盘（见 §5）。
@@ -24,13 +24,13 @@ E 盘剩余 **1.1 TB**，磁盘不是概念库数据的约束；只有 SegviGen 
 
 ## 2. 实测数据（本机，2026-09-08）
 
-在 40 个从未处理过的 PartVerse 物体上跑 `import_partverse.py --dry_run`，再对其中 7 个跑真实导入 + 渲染：
+先在 40 个从未处理过的物体上探针，随后**路线 A 已全量跑完** 10 030 个物体，两者产出率一致：
 
 | 项 | 实测 |
 |---|---|
-| 导入产出率 | **58 %**（40 个 → 23 保留 / 15 被部件数过滤 / 2 因 `segmented.glb` 与整网格对不齐失败）。真实导入 12 → 7，同样 58 % |
-| `import_partverse.py` | 0.17 s/物体（dry-run）、约 0.4 s/物体（含导出 `parts/*.glb`） |
-| `render_views.py --azimuths 0,135` | **3.4 s/物体**（Cycles 32 samples 的 `render.png` + nvdiffrast 的 `ids.npy`，两视角） |
+| 导入产出率 | **58 %**。探针 40 个 → 23 保留；全量 **10 030 → 5 826 保留 / 3 874 被部件数过滤 / 330 因 `segmented.glb` 与整网格对不齐失败**（58.1 %，与探针完全一致） |
+| `import_partverse.py` | 0.17 s/物体（dry-run）；全量实测 **0.15 s/物体**（10 030 个约 25 min，含导出 `parts/*.glb`） |
+| `render_views.py --azimuths 0,135` | 探针 3.4 s/物体；全量实测 **1.0 s/物体**（5 826 个 ETA 约 95 min）。探针那 7 个物体偏大，别按 3.4 s 估算 |
 | 磁盘：概念库最小集 | **1.46 MB/物体**（`names.json` + 2 × (`render.png` + `ids.npy`)） |
 | 磁盘：整个物体目录 | **6.7 MB/物体**（再加 `parts/*.glb` + `input.glb` + `captions.json`） |
 | 产出校验 | 7/7 通过：`ids.npy` 是 int16 512×512、与 `render.png` 严格对齐、id 全部 < `len(names)` |
@@ -45,25 +45,32 @@ E 盘剩余 **1.1 TB**，磁盘不是概念库数据的约束；只有 SegviGen 
 
 三步，全部有现成脚本：
 
+三步都已执行（2026-09-08），命令留在这里供路线 B/C 复用：
+
 ```bat
-REM 1. 导入：切 parts、写占位 names.json / captions.json（约 40 min）
+REM 1. 导入：切 parts、写占位 names.json / captions.json（实测 25 min，5 826/10 030 通过）
+REM    注意导入到 pv_new 而非 pv：新物体没经过人工复核，必须和那 2 000 个分开放
 finetune\run_ft.bat import_partverse.py --partverse E:\AI_New\ModelGen\datasets\partverse ^
-  --out E:\AI_New\ModelGen\datasets\pv --min_parts 3 --max_parts 24 ^
-  --ids @E:\AI_New\ModelGen\datasets\pv_fresh_all.txt
+  --out E:\AI_New\ModelGen\datasets\pv_new --min_parts 3 --max_parts 24 ^
+  --ids_file E:\AI_New\ModelGen\datasets\pv_fresh_all.txt
 
-REM 2. 重标名字：prep_relabel.py 出批 → Grok 4.6 逐批 → merge → apply（见 relabel\HANDOVER.md §5、§6）
-REM    5 800 个物体 = 116 批 × 50。并行 6–8 个 subagent，每批 1–3 min
+REM 2. 出批（117 批 × 50 物体，4.4 MB），然后外包重标
+python finetune\relabel\prep_batches.py --root E:\AI_New\ModelGen\datasets\pv_new ^
+  --out E:\AI_New\ModelGen\datasets\relabel_new --chunk 50
 
-REM 3. 渲染两视角（5 800 × 3.4 s ≈ 5.5 h，可断点续跑）
-finetune\run_ft.bat render_views.py --dataset_root E:\AI_New\ModelGen\datasets\pv --azimuths 0,135 --chunk 25
+REM 3. 渲染两视角（实测 1.0 s/物体 ≈ 95 min，可断点续跑）
+finetune\run_ft.bat render_views.py --dataset_root E:\AI_New\ModelGen\datasets\pv_new --azimuths 0,135 --chunk 25
 ```
 
-做完概念库训练集从 **2 000 → 约 7 800（3.9×）**，打包体积从 730 MB → 约 2.8 GB。
+`--ids_file` 是这次新加的：10 030 个 id 用 `--ids` 传会超出 Windows 命令行长度上限。
+
+做完概念库训练集从 **2 000 → 7 826（3.9×）**，打包体积从 730 MB → 约 2.8 GB。
+重标工作已打包成 HF 私有仓 [`Zaun1996/segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work)，作业手册见 `HANDOVER_data_cleaning.md`。
 
 **风险与注意：**
 
-- **名字质量是唯一真实风险。** 2 000 个物体的质量是靠人工复核撑起来的（`review_md.py` 抽样 + `screen_dominant.py` 全库主导部件筛查 + uncertain 清零三轮）。5 800 个没法同等力度人工过。建议：自动校验（`review_relabel.py` 的泛称词 / 词数 / 覆盖检查）全量必过，**人工只抽 5 %**，并把 `screen_dominant.py`（占比 ≥ 45 % 却给了局部名的部件）作为强制筛查——那是当初 139 处错误的来源，也是最伤 SAM3 的一类错。
-- **旧的 2 000 个要单独成一层。** 它们经过人工复核，新的 5 800 个没有。训练时按 `--min_count` 统计词表没问题，但**留出集必须继续只从旧 2 000 里选**，否则 v3 的 0.368 就没法比了。建议把新物体记进 `pv_list_d_new.txt`，`names_meta.json` 的 `source` 字段标明来源。
+- **名字质量是唯一真实风险。** 2 000 个物体的质量是靠人工复核撑起来的（抽样看图 + 全库主导部件筛查 + uncertain 清零三轮）。5 826 个没法同等力度人工过。做法：自动校验（`relabel/check_names.py` 的泛称词 / 词数 / 覆盖检查）全量必过，**人工只抽 5 %**，并把 `relabel/screen_large.py`（占比 ≥ 45 % 却给了局部名的部件）作为强制筛查——那是当初 139 处错误的来源，也是最伤 SAM3 的一类错。
+- **旧的 2 000 个要单独成一层，已通过物理隔离实现**：新物体导入到 `datasets/pv_new/`，不碰 `datasets/pv/`。**留出集必须继续只从旧 2 000 里选**，否则 v3 的 0.368 就没法比了。清洗验收后再决定是合并目录还是让训练脚本吃两个 root。
 - 那 2 个 `segmented.glb` 对不齐的物体（`419b01d4`、`794f3801`）是数据本身的问题，`max_far_frac` 已经把它们挡掉了，不用管。
 - 想再多要一些物体，可以把 `--max_parts` 从 24 放到 32（脚本默认），产出率会上去，代价是多部件物体的渲染更慢、SAM3 提示词更多。
 
@@ -128,9 +135,24 @@ huggingface-cli download dscdyc/partversexl --repo-type dataset --local-dir /dat
 # anno_infos 8.97 GB + normalized_glbs 9 × 10.7 GB ≈ 106 GB
 ```
 
-**先做一件便宜的事**：只下 `anno_infos.tar.gz` 或 `metadata.csv`，和本地 12 030 个 id 求交集，确认净新增量。论文说 XL 是 PartVerse 的 "expanded and **refined** extension"，"refined" 意味着部分旧物体被重新标注过——如果重标了，那 2 000 个人工复核过的名字与新标签的对应关系需要重新确认。这一步花 10 分钟，能避免下 106 GB 之后才发现问题。
+### id 交集探查结果（已完成，2026-09-08）
 
-净新增按 28 000 估、产出率 58 %，得约 16 000 个新物体：渲染 18 h、磁盘 107 GB、命名 320 批 Grok。
+只下 `metadata.csv` + `train.csv` + `val.csv`（34 MB，13 s）就能确认净新增量：
+
+| 项 | 数量 |
+|---|---|
+| XL 已发布物体 | **32 659**（`train.csv` 32 559 + `val.csv` 100；论文的 40 K 未全部放出） |
+| 与本地 PartVerse 重叠 | 7 253 |
+| **XL 独有（净新增）** | **25 406** |
+| 本地有、XL 已剔除 | **4 777** |
+| 我们已标注的 2 000 个中在 XL 里的 | 1 245 |
+
+两个发现值得注意：
+
+1. **XL 剔除了 4 777 个旧物体**，符合论文说的丢弃低质量 / 歧义资产。我们那 2 000 个里有 **755 个属于被剔除的集合**——它们可能就是质量偏低的一批。这给了一个免费的质量信号：如果留出集上的失败样本明显集中在这 755 个里，说明该按 XL 的口径清一遍。
+2. **1 245 个我们人工复核过的物体在 XL 里被重新标注过**（"refined"）。用 XL 覆盖导入会**冲掉这批人工成果**，所以导入时必须 `--ids_file` 只喂那 25 406 个独有 id，不能整包导。
+
+净新增 25 406 × 58 % ≈ **14 700 个新物体**：渲染约 4 h（按实测 1.0 s/物体）、磁盘 107 GB、命名 294 批。
 
 **注意**：B 只是把同一个分布（Objaverse 系、同一套标注流程与部件粒度口径）线性放大。它能改善长尾名字的覆盖率和词表规模，但**不解决**「外部资产上提升有限」这个问题——那是分布差异，要靠 C 或者真正的目标域资产。
 
@@ -139,6 +161,8 @@ huggingface-cli download dscdyc/partversexl --repo-type dataset --local-dir /dat
 ## 7. 路线 C：PartNeXt（+23 500，自带人工部件名）
 
 [`AuWang/PartNeXt`](https://huggingface.co/datasets/AuWang/PartNeXt) + [`AuWang/PartNeXt_mesh`](https://huggingface.co/datasets/AuWang/PartNeXt_mesh)（NeurIPS 2025 D&B，[arXiv 2510.20155](https://arxiv.org/abs/2510.20155)）。**23 519 个带纹理物体 / 350 187 个部件 / 50 类**，来源 Objaverse 14 811 + ABO 2 633 + 3D-FUTURE 6 075。
+
+**实测体积（2026-09-08）**：标注 `AuWang/PartNeXt` 2.4 GB（5 个 arrow 分片）+ 网格 `AuWang/PartNeXt_mesh` 55.1 GB（23 231 个 glb），合计 **57.5 GB**——比路线 B 便宜一半。但网格是 23 231 个**小文件**，每个文件的元数据往返开销占主导：8 线程只有 0.4 MB/s（要 6 h），必须把 `--workers` 提到 32–48。大分卷（B）反过来是带宽型，独占时能到 180 MB/s。**两者不要并行下**，会互抢代理连接池，实测把 B 从 180 MB/s 压到近乎 0。
 
 对我们有两个别处拿不到的东西：
 
@@ -157,12 +181,14 @@ huggingface-cli download dscdyc/partversexl --repo-type dataset --local-dir /dat
 
 | 批次 | 内容 | 成本 | 通过判据 |
 |---|---|---|---|
-| 1 | **D1** 视角 2 → 6（现有 2 000 个物体） | 4 h、12 GB | 概念库在新方位上的灰像素不显著高于 az0 |
-| 2 | **A** 导入 + 重标 + 渲染剩余本地 PartVerse | 6.4 h 计算 + 116 批标注 | 自动校验 problems = 0；5 % 抽样人工过；`screen_dominant.py` 全量筛查完 |
-| 3 | 用 A 的数据重训概念库 v4 | 70 min × N | **在旧 2 000 的留出集上**，阈值 0.5 mIoU ≥ 0.368 且难负例误检 ≤ 0.19；词表覆盖率 ≥ 80 % |
-| 4 | **D3** 补齐 682 个 `variants/`（每物体 6 变体） | 20 h、40 GB | LoRA 训练集 2 000 个物体 |
-| 5 | **B** 的 id 交集探查（只下 metadata） | 10 min | 确认净新增量与旧标签是否被 refine |
-| 6 | **B** 或 **C** 全量 | 18–26 h + 下载 | 同批次 3 的判据 |
+| ~~5~~ | ~~**B** 的 id 交集探查~~ | 13 s | **已完成**：净新增 25 406，且 1 245 个已标注物体被 XL 重标（见 §6） |
+| 1 | **A** 导入剩余本地 PartVerse | 25 min | **已完成**：5 826 个物体、41 129 个部件、117 批 |
+| 2 | **A** 重标名字（外包给另一台服务器） | 117 批标注 | 自动校验 problems = 0；5 % 抽样人工过；`screen_large.py` 全量筛查完。见 `HANDOVER_data_cleaning.md` |
+| 3 | **A** 渲染两视角 | 95 min、8.5 GB | 5 826 个物体都有 `views/az0|az135/{render.png, ids.npy}` |
+| 4 | **D1** 视角 2 → 6（现有 2 000 个物体） | 4 h、12 GB | 概念库在新方位上的灰像素不显著高于 az0 |
+| 5 | 用 A 的数据重训概念库 v4 | 70 min × N | **在旧 2 000 的留出集上**，阈值 0.5 mIoU ≥ 0.368 且难负例误检 ≤ 0.19；词表覆盖率 ≥ 80 % |
+| 6 | **D3** 补齐 682 个 `variants/`（每物体 6 变体） | 20 h、40 GB | LoRA 训练集 2 000 个物体 |
+| 7 | **B**（只导 25 406 个独有 id）或 **C** 全量 | 4–15 h + 下载 | 同批次 5 的判据 |
 
 两条贯穿始终的纪律：
 

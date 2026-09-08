@@ -169,8 +169,16 @@ def main():
                         help="Skip objects where more than this fraction of faces has no nearby segmented.glb face")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ids", nargs="*", default=None)
+    parser.add_argument("--ids_file", default=None,
+                        help="one object id per line; use instead of --ids, which does not fit a "
+                             "Windows command line beyond ~1000 ids")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
+
+    if args.ids_file:
+        with open(args.ids_file, "r", encoding="utf-8") as f:
+            from_file = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        args.ids = (args.ids or []) + from_file
 
     glb_dir = args.glb_dir or os.path.join(args.partverse, "normalized_glbs")
     parts_dir = args.parts_dir or os.path.join(args.partverse, "textured_part_glbs")
