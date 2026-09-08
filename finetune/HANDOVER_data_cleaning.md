@@ -43,8 +43,9 @@ cd /data && tar -xzf /data/relabel_work/review_views.tar.gz  # 渲染图 + ids.n
 
 | 内容 | 体积 | 什么时候需要 |
 |---|---|---|
-| `batches.tar.gz` → `batch_NNN.json` | ~25 MB | **标注阶段**（第 4 节） |
-| `review_views.tar.gz` → `pv_new/<id>/{names.json, captions.json, views/az0/{render.png, ids.npy}}` | ~9 GB | **审阅阶段**（第 5 节） |
+| `batches.tar.gz` → `batch_NNN.json` | 4.4 MB | **标注阶段**（第 4 节） |
+| `example_out_000.json` | 30 KB | 已通过校验的参考输出，先复现它（§4.3） |
+| `review_views.tar.gz` → `pv_new/<id>/{names.json, captions.json, views/az0/{render.png, ids.npy}}` | 1.1 GB | **审阅阶段**（第 5 节） |
 | `finetune/relabel/` | 仓库内 | 全程 |
 
 目录结构（`--root` 指向 `pv_new`）：
@@ -58,6 +59,9 @@ pv_new/<object_id>/
   views/az0/render.png   # 512×512 RGBA 纹理渲染
   views/az0/ids.npy      # int16 512×512，值 = 部件 id，-1 = 背景，与 render.png 严格对齐
 ```
+
+工作包里只有 `az0` 一个视角（审阅工具默认也只看 az0），`az135` 和 `parts/*.glb`、`input.glb` 留在本机，
+因为审阅不需要它们。所以 4.2 GB 未压缩的内容打包后只有 1.1 GB。
 
 ---
 
@@ -142,7 +146,31 @@ Every object_id and every part_id from the input must be present; `uncertain` mu
 When done, reply with only: number of objects and parts written, and how many parts you marked uncertain.
 ```
 
-### 4.3 逐批校验
+### 4.3 参考批次（已跑通，可直接对标）
+
+`batch_000` 已经用上面这段 prompt 实跑并通过全部校验，输出作为 `example_out_000.json` 放在 HF 仓里。
+**先复现它的数字**，再开始批量作业——对不上说明 prompt 或模型配置有问题。
+
+```
+batch 000: 50 objects, 326 parts, 296 names changed, 52 uncertain, 0 junk-word
+problems: 0
+```
+
+改动率 296/326 = 91 %，与第一批 2000 个物体的 92 % 一致。典型改动：
+
+| 占位名字 | 重标后 |
+|---|---|
+| `cylindrical component` | `legging` |
+| `textured fabric component` | `sleeve` |
+| `resembling the sole` | `sole` |
+| `spherical object` | `ball` |
+| `human leg model` | `leg` |
+| `character's hair` | `hair` |
+
+注意最后两行：**去掉 `model`、`character's` 这类修饰，只留核心名词**，并且同一物体的三条腿都归到 `leg`
+（该批 `leg` 出现 23 次、`leaf` 覆盖全部叶片）。这个「同类归并」是概念库能学到东西的前提，见 §7 关于唯一名字数的说明。
+
+### 4.4 逐批校验
 
 每批标完立刻校验，不要攒到最后：
 
@@ -165,7 +193,7 @@ python finetune/relabel/check_names.py --dir /data/relabel_work --batch 007 --du
 
 退出码非零表示有问题，可以直接用在驱动脚本里。
 
-### 4.4 全量合并
+### 4.5 全量合并
 
 全部批次通过后：
 
