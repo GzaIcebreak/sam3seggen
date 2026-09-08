@@ -157,15 +157,27 @@ finetune\run_ft.bat import_glb.py --glb your.glb --out <root>\<id> --names head 
 
 包里还含 `pv_holdout_v3.txt`、`pv_hard.txt`、`pv_holdout_mix.txt` 和 `concept_bank_v3/{bank.pt, split.json, text_cache.pt, log.jsonl}`（对照基线，共 3.2 MB）。
 
-```bash
-# 本地（Windows，datasets 目录下已生成）
-#   sha256 = b2b0ca006492ac9eb6e10a09c7b5b03a147418a6e413da655be3d955aa998ded
-scp E:/AI_New/ModelGen/datasets/cb_data.tar.gz user@cloud:/data/
+数据和权重已上传到 HF（**私有仓**，云端需要一个有读权限的 token）：
 
+| 仓库 | 内容 |
+|---|---|
+| [`Zaun1996/segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view)（dataset） | `cb_data.tar.gz` + 三份物体清单 |
+| [`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank)（model） | v3 的 `bank.pt` / `bank_epoch*.pt` / `split.json` / `log.jsonl` / `text_cache.pt` |
+
+```bash
 # 云端
+export HF_TOKEN=<你的读 token>
+huggingface-cli download Zaun1996/segvigen-pv-2view cb_data.tar.gz \
+  --repo-type dataset --local-dir /data
 cd /data && sha256sum cb_data.tar.gz && tar -xzf cb_data.tar.gz
 # 得到 /data/pv/<id>/...、/data/pv_holdout_v3.txt、/data/concept_bank_v3/
+
+# 只要 v3 权重做对照
+huggingface-cli download Zaun1996/sam3-concept-bank --local-dir /data/concept_bank_v3
 ```
+
+sha256 `b2b0ca006492ac9eb6e10a09c7b5b03a147418a6e413da655be3d955aa998ded`。
+也可以直接 `scp E:/AI_New/ModelGen/datasets/cb_data.tar.gz user@cloud:/data/`。
 
 重新生成这个包（本地）：`datasets/cb_filelist.txt` 是文件清单，`tar -czf cb_data.tar.gz -T cb_filelist.txt`（在 `datasets/` 下执行）。
 
