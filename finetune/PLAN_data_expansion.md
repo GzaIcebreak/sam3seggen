@@ -181,7 +181,61 @@ huggingface-cli download dscdyc/partversexl --repo-type dataset --local-dir /dat
 
 ---
 
-## 8. 执行顺序与判据
+## 8. 对新数据源重复这套流程
+
+路线 A 已经把流程跑通一遍，XL 和 PartNeXt 照同样的模板走。**七步，每一步的产物都有名字**，这样中途换人接手不会丢上下文。
+
+### 8.1 通用模板
+
+| 步 | 动作 | 产物 | 通过判据 |
+|---|---|---|---|
+| 1 | 求净新增 id（与已有 12 030 个求差集） | `<source>_new_ids.txt` | 与 `pv/` + `pv_new/` 的交集为 **0** |
+| 2 | 导入（`import_partverse.py --ids_file`，或新 importer） | `datasets/<source>/<id>/` | 产出率约 58 %；`names.json` 长度 = `captions.json` 的 `source_part_ids` 长度 = `parts/` 里 glb 数 |
+| 3 | 出批（`relabel/prep_batches.py`） | `batch_NNN.json` | 物体数 × 部件数与导入结果一致 |
+| 4 | 渲染两视角（`render_views.py`） | `views/az0|az135/{render.png, ids.npy}` | 每个物体都有；`ids.npy` 是 int16 512×512 且 id < `len(names)` |
+| 5 | 传**原始**数据集 + 作业包（`relabel/pack_work_package.py`） | 两个 HF 仓（见 §8.2） | 原始仓 README 顶部有「名字未清洗」警告 |
+| 6 | 外包清洗（`HANDOVER_data_cleaning.md`） | `names_v2.json` | `problems: 0`、坏批次 0、主导部件筛查过完、5 % 抽样过完 |
+| 7 | 回写并并入训练集（`relabel/apply_names.py`） | `names.json` + `names_v1.json` | 复核报告里唯一名字数与高频名字数达标（`HANDOVER_data_cleaning.md` §7 的基线表） |
+
+**第 1 步是最容易出错的一步**，因为 XL 会把我们已经人工标好的物体重新标注一遍（"refined"），
+整包导入会静默冲掉那批人工成果。清单已经生成好：
+
+```
+datasets/xl_new_ids.txt    25 406 个 id，已确认与 pv/ + pv_new/ 交集为 0
+```
+
+### 8.2 仓库命名与隔离约定
+
+**已重标注的和未重标的永远分开放**，靠仓库边界而不是靠清单文件来保证：
+
+| 角色 | 命名 | 已有实例 |
+|---|---|---|
+| 已重标 + 人工复核（唯一可用于训练 / 评测 / 留出集） | `segvigen-pv-2view` | 2 000 个物体 |
+| 原始未清洗的两视角数据，每个来源一个 | `segvigen-<source>-raw` | `segvigen-pv-raw`（5 826） |
+| 清洗作业包，每个来源一个 | `segvigen-relabel-<source>` | `segvigen-relabel-work`（5 826） |
+
+原始仓的 README 必须以「名字未清洗，不要直接训练」开头，并链回已复核的那个仓。
+清洗验收通过后，把该来源的数据并入已复核仓（或让训练脚本吃多个 root），
+**但留出集永远只从最初那 2 000 个里选**，否则历史指标失去可比性。
+
+### 8.3 每个来源的差异
+
+**PartVerse-XL**：目录结构与本地 PartVerse 完全一致，`import_partverse.py` 不用改，只要 `--ids_file xl_new_ids.txt`。
+清洗流程与路线 A 完全相同（caption 来自 `text_captions.json`）。预计 25 406 × 58 % ≈ 14 700 个物体、294 批。
+
+**PartNeXt**：**不走重标流程，走校验流程。** 它的部件名是人工标的（`hierarchyList` 每个节点的 `name`），
+所以第 3、6 步换成（`relabel/rules.py` 的规则本身不变，只是改为「校验 + 挑出不合格的」而不是「全量重写」）：
+
+1. 把 `hierarchyList` 的名字按我们的规则规范化后，用 `relabel/check_names.py` 全量校验——它的名字来自 50 类的固定层级模板，
+   大概率不违反禁用词，但**词数可能超 3**（层级路径拼接）且**粒度可能过细**（10 层深度的叶子可能是螺丝级别）。
+2. 只对校验不通过的部件出批送去人工/模型改写，而不是全量重标。这能省掉整个瓶颈环节。
+
+另外 PartNeXt 需要一个新 importer（约 300 行）：arrow 格式、`masks` 是叶子节点面索引、
+`mesh_face_num` 是逐 mesh 面数（一个物体可能多 mesh，要先拼成统一面序）。**先下 100 个物体验证名字口径再决定是否全量。**
+
+---
+
+## 9. 执行顺序与判据
 
 | 批次 | 内容 | 成本 | 通过判据 |
 |---|---|---|---|
