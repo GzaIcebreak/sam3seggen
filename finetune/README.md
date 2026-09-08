@@ -16,9 +16,14 @@
 扩大数据集的路线与实测成本（本地 PartVerse 剩余物体已导入完成、PartVerse-XL / PartNeXt 实测体积与净新增量）见 [`PLAN_data_expansion.md`](PLAN_data_expansion.md)。
 部件名重标注外包（口径、prompt 原文、校验与审阅流程、故障处理、交付标准）见 [`HANDOVER_data_cleaning.md`](HANDOVER_data_cleaning.md)，
 工具在 [`relabel/`](relabel)。
-数据与权重（私有 HF 仓）：[`Zaun1996/segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view)（730 MB 训练包）、
-[`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank)（v3 权重 + 日志）、
-[`Zaun1996/segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work)（5 826 个物体的重标工作包）。
+数据与权重（私有 HF 仓）。**已重标注的和未重标的分开放**,把未复核的名字混进基线集会让 mIoU 0.368 失去可比性:
+
+| 仓库 | 物体 | 名字状态 | 用途 |
+|---|---|---|---|
+| [`segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view) | 2 000 | 已重标 + 三轮人工复核 | 训练 / 评测 / 留出集(730 MB) |
+| [`segvigen-pv-raw`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-raw) | 5 826 | 原始启发式,未清洗 | 待清洗的两视角数据(~2.3 GB) |
+| [`segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work) | 5 826(同上) | — | 清洗任务包(批次 / 审阅图 / 参考输出) |
+| [`sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank) | — | — | 概念库 v3 权重 + 日志 |
 
 所有脚本在 SegviGen 根目录下通过 `finetune\run_ft.bat <脚本> <参数>` 运行
 (它设置了与推理 .bat 相同的环境变量并使用 `.venv`);只有 `sam3_masks.py` 用 `.venv_holo`,

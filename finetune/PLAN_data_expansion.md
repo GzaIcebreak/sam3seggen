@@ -64,8 +64,12 @@ finetune\run_ft.bat render_views.py --dataset_root E:\AI_New\ModelGen\datasets\p
 
 `--ids_file` 是这次新加的：10 030 个 id 用 `--ids` 传会超出 Windows 命令行长度上限。
 
-做完概念库训练集从 **2 000 → 7 826（3.9×）**，打包体积从 730 MB → 约 2.8 GB。
-重标工作已打包成 HF 私有仓 [`Zaun1996/segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work)，作业手册见 `HANDOVER_data_cleaning.md`。
+做完概念库训练集从 **2 000 → 7 826（3.9×）**，打包体积从 730 MB → 约 3 GB。
+
+已上传三个 HF 私有仓，**已重标注的与未重标的分开存放**（混用会让 mIoU 0.368 基线失去可比性）：
+[`segvigen-pv-2view`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-2view)（2 000，已复核）、
+[`segvigen-pv-raw`](https://huggingface.co/datasets/Zaun1996/segvigen-pv-raw)（5 826，未清洗的两视角数据）、
+[`segvigen-relabel-work`](https://huggingface.co/datasets/Zaun1996/segvigen-relabel-work)（清洗任务包）。作业手册见 `HANDOVER_data_cleaning.md`。
 
 **风险与注意：**
 

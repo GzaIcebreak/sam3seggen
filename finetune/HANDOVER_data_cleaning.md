@@ -32,7 +32,16 @@ representing the ground             highlighted component    various components
 
 ## 2. 数据在哪
 
-工作包（HF 私有仓，需要一个有读权限的 token）：
+三个 HF 私有仓，**已重标注的和未重标的分开存放**——把未复核的名字混进人工复核过的那批，会让
+mIoU 0.368 这个基线失去可比性：
+
+| 仓库 | 物体 | 名字状态 | 用途 |
+|---|---|---|---|
+| `Zaun1996/segvigen-pv-2view` | 2 000 | 已重标 + 三轮人工复核 | 训练 / 评测 / 留出集。**你不要动它** |
+| `Zaun1996/segvigen-pv-raw` | 5 826 | 原始启发式，未清洗 | 你要清洗的数据本体（两视角渲染） |
+| `Zaun1996/segvigen-relabel-work` | 5 826（同上） | — | 你的作业包（批次 / 审阅图 / 参考输出） |
+
+日常只需要第三个仓；只有要跑完整训练验证时才需要第二个。工作包（需要一个有读权限的 token）：
 
 ```bash
 export HF_TOKEN=<读 token>

@@ -22,7 +22,8 @@ import os
 import tarfile
 import time
 
-REVIEW_FILES = ["names.json", "captions.json", "views/{az}/render.png", "views/{az}/ids.npy"]
+PER_OBJECT = ["names.json", "names_meta.json", "captions.json"]
+PER_VIEW = ["render.png", "ids.npy"]
 
 
 def objects(root: str) -> list[str]:
@@ -53,21 +54,24 @@ def pack_batches(batches: str, out: str) -> str:
     return path
 
 
-def pack_review(root: str, out: str, az: str) -> str:
-    path = os.path.join(out, "review_views.tar.gz")
+def pack_views(root: str, out: str, azs: list[str], name: str) -> str:
+    """Per-object text plus the listed views. One view is enough to review names; the concept bank
+    trains on two, so the same function builds both packages."""
+    path = os.path.join(out, name)
     base = os.path.basename(root.rstrip("\\/"))
     n = 0
     with tarfile.open(path, "w:gz", compresslevel=6) as tf:
         for oid in objects(root):
-            if not ready(root, oid, az):
+            if not all(ready(root, oid, a) for a in azs):
                 continue
-            for rel in REVIEW_FILES:
-                rel = rel.format(az=az)
+            rels = list(PER_OBJECT) + [f"views/{a}/{f}" for a in azs for f in PER_VIEW]
+            for rel in rels:
                 p = os.path.join(root, oid, *rel.split("/"))
                 if os.path.exists(p):
                     tf.add(p, arcname=f"{base}/{oid}/{rel}")
             n += 1
-    print(f"[pack] {n} objects -> {path} ({os.path.getsize(path) / 1e9:.2f} GB)", flush=True)
+    print(f"[pack] {n} objects, views {','.join(azs)} -> {path} "
+          f"({os.path.getsize(path) / 1e9:.2f} GB)", flush=True)
     return path
 
 
@@ -76,21 +80,24 @@ def main() -> None:
     ap.add_argument("--root", required=True, help="dataset root, e.g. datasets/pv_new")
     ap.add_argument("--batches", default=None, help="directory with batch_NNN.json")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--az", default="az0")
+    ap.add_argument("--az", default="az0", help="comma-separated views to include")
+    ap.add_argument("--name", default="review_views.tar.gz", help="archive filename")
     ap.add_argument("--wait", action="store_true", help="block until every object is rendered")
     ap.add_argument("--repo", default=None, help="HF dataset repo to upload to; needs HF_TOKEN")
-    ap.add_argument("--skip_review", action="store_true")
+    ap.add_argument("--skip_views", action="store_true")
     args = ap.parse_args()
 
+    azs = [a.strip() for a in args.az.split(",") if a.strip()]
     os.makedirs(args.out, exist_ok=True)
     if args.wait:
-        wait_for_renders(args.root, args.az)
+        for a in azs:
+            wait_for_renders(args.root, a)
 
     files = []
     if args.batches:
         files.append(pack_batches(args.batches, args.out))
-    if not args.skip_review:
-        files.append(pack_review(args.root, args.out, args.az))
+    if not args.skip_views:
+        files.append(pack_views(args.root, args.out, azs, args.name))
 
     if args.repo:
         from huggingface_hub import HfApi
