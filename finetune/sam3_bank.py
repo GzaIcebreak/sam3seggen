@@ -64,22 +64,42 @@ def decoder_cross_attns(model, scope: str = "mask"):
     return mods
 
 
+def lora_targets(model, scope: str):
+    """(parent module, attribute name) pairs to wrap. Scopes: mask / text (cross-attn q,k,v,o),
+    embed (mask_embedder MLP = left side of the mask dot product), proj (instance_projection 1x1 conv =
+    right side). See PLAN_concept_bank_v5.md section 2."""
+    parts = {p.strip() for p in scope.split(",") if p.strip()}
+    out = []
+    for attn in decoder_cross_attns(model, scope):
+        out += [(attn, n) for n in ("q_proj", "k_proj", "v_proj", "o_proj")]
+    md = getattr(model, "mask_decoder", None)
+    if md is not None:
+        if "embed" in parts:
+            out += [(md.mask_embedder.layers, str(i)) for i in range(len(md.mask_embedder.layers))]
+        if "proj" in parts:
+            out.append((md, "instance_projection"))
+    return out
+
+
 def inject_decoder_lora(model, r: int = 8, alpha: float | None = None, scope: str = "mask",
                         dropout: float = 0.0):
-    """Wrap q/k/v/o of the chosen decoder cross-attentions. Image encoder stays frozen."""
-    from lora import LoRALinear
+    """Wrap the chosen decoder linears / 1x1 convs with LoRA. Image encoder stays frozen."""
+    from lora import LoRALinear, LoRAConv1x1
     alpha = float(alpha if alpha is not None else 2 * r)
     params = []
     n = 0
-    for attn in decoder_cross_attns(model, scope):
-        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            lin = getattr(attn, name, None)
-            if isinstance(lin, torch.nn.Linear):
-                wrapped = LoRALinear(lin, r, alpha, dropout)
-                wrapped.to(lin.weight.device)
-                setattr(attn, name, wrapped)
-                params += [wrapped.lora_A, wrapped.lora_B]
-                n += 1
+    for parent, name in lora_targets(model, scope):
+        lin = getattr(parent, name, None)
+        if isinstance(lin, torch.nn.Linear):
+            wrapped = LoRALinear(lin, r, alpha, dropout)
+        elif isinstance(lin, torch.nn.Conv2d) and lin.kernel_size == (1, 1):
+            wrapped = LoRAConv1x1(lin, r, alpha)
+        else:
+            continue
+        wrapped.to(lin.weight.device)
+        setattr(parent, name, wrapped)
+        params += [wrapped.lora_A, wrapped.lora_B]
+        n += 1
     return params, n
 
 
@@ -87,7 +107,7 @@ def name_words(name: str) -> list[str]:
     return [w for w in name.lower().replace("-", " ").replace("_", " ").split() if w]
 
 
-_OPTIONAL = ("b", "E_word", "tvec", "ctx", "lr_down", "lr_up")
+_OPTIONAL = ("b", "E_word", "tvec", "ctx", "lr_down", "lr_up", "bg")
 
 
 @dataclass
@@ -107,6 +127,7 @@ class ConceptBank:
     ctx: torch.Tensor | None = None        # [K, D] learnable context tokens
     lr_down: torch.Tensor | None = None    # [D, r]
     lr_up: torch.Tensor | None = None      # [r, D]
+    bg: torch.Tensor | None = None         # []   v5 background logit of the per-pixel assignment softmax
 
     def index(self) -> dict[str, int]:
         return {n: i for i, n in enumerate(self.names)}
@@ -116,8 +137,11 @@ class ConceptBank:
 
     def parameters(self) -> list[torch.Tensor]:
         ps = [self.E_0, self.E]
-        ps += [getattr(self, k) for k in ("b", "E_word", "ctx", "lr_down", "lr_up") if getattr(self, k) is not None]
+        ps += [getattr(self, k) for k in ("b", "E_word", "ctx", "lr_down", "lr_up", "bg") if getattr(self, k) is not None]
         return ps
+
+    def bg_logit(self) -> float:
+        return float(self.bg.item()) if self.bg is not None else 0.0
 
     def detached(self) -> "ConceptBank":
         kw = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in self.__dict__.items()}
@@ -221,6 +245,8 @@ class ConceptBank:
             s += f", rank {self.lr_down.shape[1]}"
         if self.nn_cos > 0 and self.tvec is not None:
             s += f", nn fallback cos>{self.nn_cos:g}"
+        if self.bg is not None:
+            s += f", bg={self.bg.item():.2f}"
         return s
 
 
@@ -340,6 +366,49 @@ def batch_soft_union(outputs, bias: torch.Tensor | None = None) -> torch.Tensor:
     m = outputs.pred_masks.sigmoid()                                 # [N, Q, h, w]
     p = (m * scores[:, :, None, None]).clamp(max=1 - 1e-6)
     return 1.0 - torch.exp(torch.log1p(-p).sum(1))
+
+
+def name_logit_maps(outputs, bias: torch.Tensor | None = None,
+                    log_weight: torch.Tensor | None = None) -> torch.Tensor:
+    """v5: one pixel logit per prompt, float [N, h, w] at the mask head's resolution:
+        L_n(p) = logsumexp_q [ mask_logit_{n,q}(p) + log score_{n,q} + log_weight_{n,q} ]
+    Raw mask logits (the query . pixel dot product) rather than sigmoid(mask) and a log-score weight
+    rather than a hard `score > t` gate, so the gradient reaches both ends of the dot product and a
+    query that is not detected simply drops out of the competition. Multiple instances of one name
+    (four legs) merge through the logsumexp.
+
+    `log_weight` [N, Q] is the Mask RankGNN's contribution (lambda * log keep); None keeps the score
+    ordering SAM3 assigned to each query on its own."""
+    scores = batch_scores(outputs, bias).float().clamp(min=1e-6)      # [N, Q]
+    L = outputs.pred_masks.float() + scores.log()[:, :, None, None]
+    if log_weight is not None:
+        L = L + log_weight.float()[:, :, None, None]
+    return torch.logsumexp(L, dim=1)
+
+
+def assign_probs(maps: torch.Tensor, bg_logit: float, size: tuple[int, int] | None = None,
+                 temp: float = 1.0) -> torch.Tensor:
+    """Per-pixel softmax over [prompts..., background], float [N + 1, H, W]."""
+    if size is not None and tuple(maps.shape[-2:]) != tuple(size):
+        maps = F.interpolate(maps[None], size=size, mode="bilinear", align_corners=False)[0]
+    L = torch.cat([maps, torch.full_like(maps[:1], float(bg_logit))], 0) / temp
+    return torch.softmax(L, dim=0)
+
+
+def paint_argmax(maps: torch.Tensor, fg: torch.Tensor, bg_logit: float, tau: float = 0.0,
+                 temp: float = 1.0) -> torch.Tensor:
+    """v5 deployment operator: every silhouette pixel goes to the prompt with the highest assignment
+    probability; -1 (grey) where the background wins or the winner's probability is below `tau`.
+    Returns long [H, W] like `paint`."""
+    n = maps.shape[0]
+    out = torch.full(fg.shape, -1, dtype=torch.long, device=maps.device)
+    if n == 0:
+        return out
+    p = assign_probs(maps, bg_logit, tuple(fg.shape), temp)
+    conf, lab = p.max(0)
+    keep = fg & (lab < n) & (conf >= tau)
+    out[keep] = lab[keep]
+    return out
 
 
 def paint(unions: torch.Tensor, fg: torch.Tensor) -> torch.Tensor:
