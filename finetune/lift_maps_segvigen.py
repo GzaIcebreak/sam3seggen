@@ -43,6 +43,8 @@ TAG_MAP = {
     # same 2D map as "ease", lifted through the v6 LoRA merged into the base ckpt
     # (Zaun1996/segvigen-lora v6/lora_last.pt -> merge_lora.py -> ckpt/full_seg_v6.ckpt)
     "ease_v6": "map_ease",
+    # v3 overlay map lifted through the v6 ckpt (pair with --ckpt ckpt/full_seg_v6.ckpt)
+    "v3_v6": "map",
 }
 
 

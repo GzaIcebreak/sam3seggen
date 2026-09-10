@@ -1,4 +1,12 @@
-"""Full segmentation first, semantics second: a 3D model + text prompts -> named objects.
+"""DEPRECATED -- use segment_parts.py instead.
+
+Full segmentation first, semantics second: a 3D model + text prompts -> named objects.
+
+This was the first version of that idea and it is superseded on both of its stages:
+one full_seg sample regularly fuses neighbouring parts (segment_parts intersects
+several), and coverage voting hands a unit to whichever concept is largest rather than
+most specific, so feet became legs and arms became torso (segment_parts breaks ties by
+IoU and votes per connected component). Kept only so old runs stay reproducible.
 
 Pipeline (the inverse of segment_api.py, which lets a single 2D map steer the
 generative model directly):
@@ -21,6 +29,7 @@ import argparse
 import os
 import subprocess
 import sys
+import warnings
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -53,7 +62,13 @@ def segment_vote(
     camera grid SAM3 votes over (no per-model "front" azimuth is needed, which is
     the whole point of voting across views). `min_cover` keeps a part unassigned
     unless its winning name's masks covered that fraction of the pixels it owns.
+
+    Deprecated: segment_parts.segment_parts supersedes this.
     """
+    warnings.warn(
+        "segment_vote() is deprecated; use segment_parts.segment_parts()",
+        DeprecationWarning, stacklevel=2,
+    )
     from data_toolkit.part_vote import (
         assign_parts,
         load_parts,
@@ -141,7 +156,8 @@ def segment_vote(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="model + text prompts -> named objects, via full segmentation + SAM3 part voting"
+        description="DEPRECATED (use segment_parts.py): model + text prompts -> named objects, "
+                    "via one full segmentation + SAM3 coverage voting"
     )
     parser.add_argument("--glb", required=True, help="Input 3D model")
     parser.add_argument("--prompts", nargs="+", required=True,

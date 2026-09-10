@@ -18,9 +18,10 @@ mesh，带真实贴图。
 保证输出部件数与提示词数严格一致。
 
 **合并 —— 每个语义物体恰好一个 mesh。**
-朴素 2D 引导会把复杂壳体拆成几十块碎片。`segment_vote.py` 换了一条路：先做无提示全量分割，
-再多视角渲染交给 SAM3 打掩码，每个**部件**投票选覆盖率最高的提示词（覆盖率门槛防止掩码边缘渗漏
-污染大部件），同名部件通过贴图图集合并成单个 mesh——UV 无损重映射，不重烘。
+朴素 2D 引导会把复杂壳体拆成几十块碎片。`segment_parts.py` 换了一条路：先做多次无提示全量
+分割并对分区取交（故意过分割），再多视角渲染交给 SAM3 打掩码，每个**原子连通分量**投票选最
+贴合它的提示词，同名部件通过贴图图集合并成单个 mesh——UV 无损重映射，不重烘。语言只决定名字，
+边界全部来自几何，所以一个标错的像素再也撕不开一条边。
 
 **正面视角自动选择。**
 2D 引导模式对渲染朝向敏感。`--front_view` 自动挑选条件视角：
@@ -129,7 +130,38 @@ huggingface-cli download Zaun1996/sam3-concept-bank bank.pt --local-dir datasets
 
 ## 📒 接口
 
-### `segment_api.py` —— 输入提示词，输出一个带命名部件的 GLB
+### `segment_parts.py` —— 当前主线：先过分割，再命名
+
+```sh
+python segment_parts.py \
+  --glb model.glb \
+  --prompts head torso arm hand leg foot \
+  --unassigned_to torso \
+  --out out/parts.glb --work_dir out/work
+```
+
+边界全部由几何决定，语言只负责取名：
+
+1. 跑 `--samples` 次无提示 `full_seg`，条件相机在 `--azimuth` 两侧按 `--azimuth_jitter`
+   抖动（`sample_azimuths`：先基准视角，再 ±抖动）；
+2. 对所有采样的分区取共同细化——只有每一次采样都同色的面才属于同一个原子，因此任何一次
+   采样划出的边界都会保留（`data_toolkit/meet_samples.py`）；
+3. 用固定视角网格渲染**原始模型**，SAM3 逐视角出掩码；
+4. 每个原子的连通分量取掩码覆盖它的名字，同时覆盖的取最贴合的那个；相机看不到的内壁按
+   最近可见面继承（`data_toolkit/unit_vote.py`）；
+5. 按名字导出，并把原模型的 albedo 烘回每个部件。
+
+为什么要先过分割：`full_seg` 没有粒度旋钮，单次采样把相邻部件粘连的概率高到无法忽略——
+机器人测试模型上，肩甲和两条手臂在**每一次**同视角采样里都是同一个 2.4 万面的原子，只有抖动
+条件视角才能把它们分开。过分割对命名这一步毫无代价（它只会合并），欠分割则不可挽回。
+
+`work/atoms.glb` 是投票前的原子（每块一色），`work/vote_report.json` 是逐单元的
+覆盖率/IoU 表。部件不对时先看 `atoms.glb`：如果那条边界根本不存在，调提示词也变不出来。
+
+### `segment_api.py` —— 已弃用：输入提示词，输出一个带命名部件的 GLB
+
+已由 `segment_parts.py` 取代。这条路是用单视角的 2D 图去引导生成模型，一个像素标错就会在
+3D 上撕出一条边界。保留作为 2D 引导路线的参考实现，它的正面视角选择和 SAM3 上色选项仍在用。
 
 ```sh
 python segment_api.py \
@@ -143,9 +175,36 @@ python segment_api.py \
 - `--prompts`：每个输出部件一条；用 `+` 连接多个概念合并为一个部件
   （`body=head+face+hand`），可加 `name=` 显式命名。完全自定义，无写死内容。
 - `--front_view metric|auto|vlm`：自动选择条件视角；`--azimuth`（角度）仍可手动固定视角。
+- `--parts_output combined|separate`：默认 `combined`，只写 `--out` 那一个 GLB（每个部件一个
+  节点）。`separate` 额外把每个部件单独导出到旁边的 `parts/` 目录，并给 `parts.json` 每行加
+  `file` 字段；单件是从合并结果里切出来的，节点名和烘焙贴图与合并模式完全一致。
+- `--split_mode stain|weld|refine`：染色如何变成部件边界。默认 `stain` 严格沿 SegviGen 的染色切，
+  只把不到 100 面的碎块并给邻居（就是 SegviGen 自带 `split.py` 的规则），拆出来的件和染色图
+  一致。`weld` 保留同样的切口，但以同色连通块为单位看 2D 引导图：一块有足够比例朝着相机、
+  且可见面多数票明确指向另一个部件时，整块换名（块内不切、背面的块不动）。`refine` 是旧流程：
+  逐像素回写可见面、投票接缝带、把游离小岛判给包围它的部件——正面和引导图更贴，但碎块数是
+  `stain` 的 3–5 倍。`finetune/split_bench.py` 在 ext_bench 资产上对三者做无 GT 的量化对比。
+- `--no_v6`：退回 base 2D-map 权重。默认用 `ckpt/full_seg_v6.ckpt`（轨迹监督 LoRA 已合并进去）；
+  `--no_sam` 或显式 `--ckpt` 时它本来就不生效。
 - `--no_sam`：完全跳过 SAM3，用无提示 full_seg 权重在普通渲染图上分割（部件无命名，按颜色聚类）。
 - `--no_texture`：跳过 Blender 重展开 UV + 烘焙（更快）；默认保留真实贴图。
 - `--sam3_only`：在渲染 + SAM3 之后停止，保留 `render.png` / `sam3_2d_map.png` / 图例用于审核。
+
+2D 图默认由概念库 v3 的文本偏移 + 阈值 0.4 的小掩码优先叠涂生成。
+
+- `--assign rank`：让 EASE Mask RankGNN 编辑叠涂集合（keep<0.1 丢弃、keep>=0.9 补入）。
+  它在同分布上更好，但会把某个提示词的掩码整组删掉，所以默认不开。
+- `--assign auto`：同一次前向里把两张图都画出来，只有排序器没丢掉任何提示词时才采用它的结果，
+  决策写在 `<map>_auto.json`。代价是多画一遍，不是多跑一遍 SAM3。
+- `--assign argmax`：v5 的逐像素竞争。
+- `--no_concept_bank`：用原生 SAM3 词嵌入，不加载 v3 概念库。
+- `--concept_bank` / `--rank_model`：换权重路径（也可用环境变量 `SEGVIGEN_CONCEPT_BANK` /
+  `SEGVIGEN_RANK_MODEL`）。任一默认权重不在本机时会自动降级并打印提示，不会直接失败；
+  显式指定的路径找不到则报错。
+- `--sam3_threshold`：默认按画笔取标定值——带概念库 0.4，不带 0.3。
+
+任一提示词没有掩码时，严格校验（默认）会报
+`SAM3 produced no mask for requested component(s)`；放宽用 `--allow_partial`。
 
 Python 调用：
 
@@ -156,15 +215,44 @@ manifest = segment(
     "model.glb", ["mushroom=small mushroom", "chair"], "out/parts.glb",
     with_texture=True,            # 贴图烘焙为可选项，默认开启
     front_view="auto",            # metric | auto | vlm | None
+    use_v6=True,                  # 默认；False 用 base 2D-map 权重
+    assign="paint",               # 默认；rank = EASE，auto = 两张图择优
+    parts_output="combined",      # 默认；separate 额外每件一个 GLB
+    split_mode="stain",           # 默认；weld = 按引导图整块换名，refine = 逐像素回写
     unassigned_to="chair",
     work_dir="out/work",          # 保留中间产物便于检查
 )
 # manifest: [{"label": 0, "name": "mushroom", "node": "part_00_mushroom", "faces": ..., ...}]
 ```
 
-### `segment_vote.py` —— 多视角投票，产出无碎片的语义物体
+### `serve_api.py` —— HTTP 接口
 
-当单张 2D 引导图会把部件拆碎时，改用投票而非引导：
+```sh
+./run_serve.sh --port 8020          # 交互式文档在 /docs
+
+curl -X POST http://127.0.0.1:8020/segment \
+  -F "glb=@model.glb" \
+  -F "prompts=leaves" -F "prompts=fruit" \
+  -F "unassigned_to=fruit" -F "samples=5"
+```
+
+`POST /segment` 走 `segment_parts.py`；`POST /segment_legacy` 是旧的 2D 引导路线，保留
+`azimuth` / `front_view` / `assign` / `split_mode` 这些选项。
+
+返回 `parts` 清单和下载链接：`GET /jobs/{id}/download` 取结果，
+`GET /jobs/{id}/parts/{node}.glb` 取单件，`GET /jobs/{id}/atoms` 取投票前的原子、
+`GET /jobs/{id}/report` 取投票表（旧路线的任务则是 `/map` 和 `/render`）。
+`GET /health` 列出当前默认权重和 GPU 是否占用。
+
+`prompts` 必须每个部件传一次，不要用空格拼在一起——概念本身可以带空格（`small mushroom`）。
+
+各阶段仍是各自加载模型的子进程，一次请求约两分钟，而且只有一块卡：任务串行加锁，第二个请求
+直接返回 409 而不是排队。它是给外部联调用的测试服务，不是吞吐服务。
+
+### `segment_vote.py` —— 已弃用：单次采样 + 覆盖率投票
+
+已由 `segment_parts.py` 取代：后者对多次采样取交而不是相信单次，并用 IoU 而不是覆盖率决胜
+（覆盖率总是把单元判给最大的那张掩码，于是脚被判成腿、手臂被判成躯干）。
 
 ```sh
 python segment_vote.py \

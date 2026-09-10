@@ -6,9 +6,13 @@ import unittest
 import numpy as np
 
 from data_toolkit.parts_rebake import (
+    SPLIT_MODES,
+    _split_labels,
+    absorb_small_fragments,
     merge_labels_by_part,
     palette_from_legend,
     reassign_label_islands,
+    weld_pieces_to_map,
 )
 
 
@@ -49,3 +53,41 @@ class PartsRebakeGroupingTest(unittest.TestCase):
         self.assertEqual(names, ["body", "staff"])
         self.assertEqual(int((merged == 0).sum()), 5)
         self.assertEqual(int((merged == 1).sum()), 2)
+
+    def test_stain_split_only_moves_fragments_below_the_face_floor(self):
+        # A chain: torso x4 | foot x1 (a speck) | leg x3 | foot x3 (real, detached from
+        # the other foot). Island cleanup would fold the 3-face foot into leg because
+        # it is small next to leg; the stain rule keeps it and only absorbs the speck.
+        self.assertEqual(SPLIT_MODES, ("stain", "weld", "refine"))
+        labels = np.array([0, 0, 0, 0, 2, 1, 1, 1, 2, 2, 2], dtype=np.int32)
+        adjacency = np.array([[i, i + 1] for i in range(len(labels) - 1)], dtype=np.int64)
+
+        out = absorb_small_fragments(adjacency, labels, min_faces=2)
+
+        self.assertEqual(out.tolist(), [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2])
+        self.assertEqual(labels.tolist(), [0, 0, 0, 0, 2, 1, 1, 1, 2, 2, 2])
+
+        untouched = absorb_small_fragments(adjacency, labels, min_faces=0)
+        self.assertEqual(untouched.tolist(), labels.tolist())
+
+    def test_weld_renames_whole_pieces_and_never_cuts_inside_one(self):
+        # Two torso pieces (label 0) separated by a leg run (label 1). The map paints
+        # the second torso piece as leg on most of its visible faces -> whole piece
+        # becomes leg. The first piece has a split vote -> stays. A hidden piece stays.
+        labels = np.array([0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 2, 2, 2], dtype=np.int32)
+        adjacency = np.array([[i, i + 1] for i in range(len(labels) - 1)], dtype=np.int64)
+        seen = np.array([0, 1, 0, 1, 1, 1, 1, 1, 1, 0, -1, -1, -1], dtype=np.int32)
+
+        out, moved_faces, moved_pieces = weld_pieces_to_map(
+            adjacency, labels, seen, min_visible_share=0.5, min_visible_faces=2, min_agreement=0.6)
+
+        self.assertEqual(out.tolist(), [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2])
+        self.assertEqual((moved_faces, moved_pieces), (4, 1))
+
+        # Faces that face away from the camera cannot outvote SegviGen: with only one
+        # visible face the piece is below the visibility floor and keeps its colour.
+        seen_sparse = np.array([-1] * 6 + [1, -1, -1, -1, -1, -1, -1], dtype=np.int32)
+        same, moved_faces, _ = weld_pieces_to_map(
+            adjacency, labels, seen_sparse, min_visible_share=0.5, min_visible_faces=2)
+        self.assertEqual(same.tolist(), labels.tolist())
+        self.assertEqual(moved_faces, 0)

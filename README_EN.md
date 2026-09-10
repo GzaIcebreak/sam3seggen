@@ -19,12 +19,13 @@ concepts into one output part, and `--unassigned_to` folds whatever no prompt cl
 a named part, so the output has exactly as many parts as requested.
 
 **Merging — every semantic object comes out as ONE mesh.**
-Naive 2D guidance shatters complex shells into dozens of fragments. `segment_vote.py`
-takes the other route: full (prompt-free) segmentation first, then multi-view renders are
-masked by SAM3 and every *part* votes for the prompt that best covers it (a coverage
-threshold stops mask bleed from hijacking large parts). Parts sharing a name are merged
-into a single mesh with their textures packed into an atlas — lossless UV remapping, no
-rebake.
+Naive 2D guidance shatters complex shells into dozens of fragments. `segment_parts.py`
+takes the other route: several prompt-free full segmentations are intersected into
+deliberately over-segmented atoms, then multi-view renders are masked by SAM3 and every
+atom *component* takes the prompt that covers it most specifically. Parts sharing a name
+are merged into a single mesh with their textures packed into an atlas — lossless UV
+remapping, no rebake. Language only picks names; every boundary comes from geometry, so a
+mislabelled pixel can no longer tear one open.
 
 **Automatic front-view selection.**
 The 2D-guided mode is sensitive to which side of the model gets rendered. `--front_view`
@@ -134,7 +135,44 @@ Runtime configuration:
 
 ## 📒 The interface
 
-### `segment_api.py` — prompts in, one named-parts GLB out
+### `segment_parts.py` — the current pipeline: over-segment, then name
+
+```sh
+python segment_parts.py \
+  --glb model.glb \
+  --prompts head torso arm hand leg foot \
+  --unassigned_to torso \
+  --out out/parts.glb --work_dir out/work
+```
+
+Geometry decides every boundary, language only picks names:
+
+1. `--samples` prompt-free `full_seg` runs, the conditioning camera jittered by
+   `--azimuth_jitter` around `--azimuth` (`sample_azimuths`: base view, then ±jitter);
+2. their partitions are intersected — two faces share an atom only if *every* sample
+   coloured them alike, so every cut any sample drew survives (`data_toolkit/meet_samples.py`);
+3. the source model is rendered over a fixed view grid and SAM3 masks every view;
+4. each atom's connected components take the name whose masks cover them, the most
+   specific one winning; unseen inner walls inherit the nearest visible face
+   (`data_toolkit/unit_vote.py`);
+5. faces are exported per name with the source albedo baked back on.
+
+Why over-segment first: `full_seg` has no granularity knob and a single sample fuses
+neighbouring parts often enough to matter — on the robot test model, shoulder armour and
+both arms came out as one 24k-face atom in *every* same-view sample, and only a jittered
+conditioning view broke it apart. Over-segmentation costs the naming step nothing (it can
+only merge), while under-segmentation is unrecoverable.
+
+`work/atoms.glb` shows the atoms the vote merged, one colour each; `work/vote_report.json`
+has the per-unit coverage/IoU table. When a part comes out wrong, look at `atoms.glb`
+first: if the boundary is not there, no amount of prompt tuning will produce it.
+
+### `segment_api.py` — deprecated: prompts in, one named-parts GLB out
+
+Superseded by `segment_parts.py`. A 2D map painted from one view steers the generative
+model here, so a mislabelled pixel becomes a torn 3D boundary. Kept as the reference
+implementation of the 2D-map route; its front-view selection and SAM3 painter options are
+still used elsewhere.
 
 ```sh
 python segment_api.py \
@@ -150,11 +188,47 @@ python segment_api.py \
   nothing hard-coded.
 - `--front_view metric|auto|vlm`: pick the conditioning view automatically; `--azimuth`
   (degrees) remains available to pin a fixed view.
+- `--parts_output combined|separate`: `combined` (default) writes only `--out`, one node per
+  part. `separate` additionally exports each part on its own into a `parts/` directory beside
+  it and adds a `file` key to every `parts.json` row. The single files are carved out of the
+  combined result, so node names and baked textures are identical either way.
+- `--split_mode stain|weld|refine`: how SegviGen's colouring becomes part boundaries. `stain`
+  (default) cuts exactly along the predicted colours and only hands fragments under 100 faces
+  to their neighbour — SegviGen's own `split.py` rule — so the parts match the coloured mesh.
+  `weld` keeps the same cuts but looks at the 2D guide map one same-colour piece at a time:
+  when enough of a piece faces the camera and its visible faces clearly vote for another
+  part, the whole piece is renamed (never cut inside, hidden pieces never touched). `refine`
+  is the older pipeline: it overwrites visible faces pixel by pixel, votes seam bands and
+  gives detached islands to the part surrounding them — closer to the guide map from the
+  front, at 3–5x the number of pieces. `finetune/split_bench.py` scores the three on the
+  ext_bench assets without ground truth.
+- `--no_v6`: fall back to the base 2D-map checkpoint. The default is
+  `ckpt/full_seg_v6.ckpt` (trajectory-supervision LoRA merged in); `--no_sam` or an explicit
+  `--ckpt` bypasses it anyway.
 - `--no_sam`: drop SAM3 entirely and run the prompt-free full_seg checkpoint on a plain
   render (unnamed, color-clustered parts).
 - `--no_texture`: skip the Blender re-UV + bake step (fast); default keeps real textures.
 - `--sam3_only`: stop after render + SAM3 and keep `render.png` / `sam3_2d_map.png` /
   legend for auditing.
+
+The 2D map is painted by concept bank v3's text offsets and the score-0.4 smallest-first
+overlay.
+
+- `--assign rank`: let the EASE Mask RankGNN edit that overlay set (drop keep<0.1, add
+  keep>=0.9). It wins in-distribution but can delete a prompt outright, so it is off by default.
+- `--assign auto`: paint both maps from the one forward pass and keep the ranker's edit only
+  where it costs no prompt; the decision lands in `<map>_auto.json`. That is a second
+  painting, not a second SAM3 run.
+- `--assign argmax`: v5's per-pixel competition.
+- `--no_concept_bank`: use stock SAM3 embeddings instead of concept bank v3.
+- `--concept_bank` / `--rank_model`: point at other weights (or set `SEGVIGEN_CONCEPT_BANK` /
+  `SEGVIGEN_RANK_MODEL`). A default that is not on this box downgrades with a printed note
+  rather than failing; a path you name explicitly is an error if it is missing.
+- `--sam3_threshold`: defaults to the calibrated value for the painter in use — 0.4 with the
+  concept bank, 0.3 without.
+
+When any prompt ends up with no mask, strict validation (the default) reports `SAM3 produced
+no mask for requested component(s)`; relax it with `--allow_partial`.
 
 Python:
 
@@ -165,15 +239,48 @@ manifest = segment(
     "model.glb", ["mushroom=small mushroom", "chair"], "out/parts.glb",
     with_texture=True,            # texture baking is optional, default on
     front_view="auto",            # metric | auto | vlm | None
+    use_v6=True,                  # default; False falls back to the base 2D-map checkpoint
+    assign="paint",               # default; rank = EASE, auto = score both and keep one
+    parts_output="combined",      # default; separate also writes one glb per part
+    split_mode="stain",           # default; weld = rename whole pieces from the map, refine = per-pixel overwrite
     unassigned_to="chair",
     work_dir="out/work",          # keep intermediates for inspection
 )
 # manifest: [{"label": 0, "name": "mushroom", "node": "part_00_mushroom", "faces": ..., ...}]
 ```
 
-### `segment_vote.py` — fragment-free semantic objects via multi-view voting
+### `serve_api.py` — the same pipeline over HTTP
 
-For models where a single 2D guide shatters parts, vote instead of guide:
+```sh
+./run_serve.sh --port 8020          # interactive docs at /docs
+
+curl -X POST http://127.0.0.1:8020/segment \
+  -F "glb=@model.glb" \
+  -F "prompts=leaves" -F "prompts=fruit" \
+  -F "unassigned_to=fruit" -F "samples=5"
+```
+
+`POST /segment` runs `segment_parts.py`; `POST /segment_legacy` is the old 2D-map route
+with its `azimuth` / `front_view` / `assign` / `split_mode` options.
+
+The response carries the `parts` manifest and download links: `GET /jobs/{id}/download`
+for the result, `GET /jobs/{id}/parts/{node}.glb` for one part, `GET /jobs/{id}/atoms` for
+the atoms the vote merged and `GET /jobs/{id}/report` for the vote table (legacy jobs have
+`/map` and `/render` instead). `GET /health` reports the resolved default weights and
+whether the GPU is busy.
+
+Repeat `prompts` once per part rather than space-separating them — a concept may itself
+contain spaces (`small mushroom`).
+
+Every stage still runs as a subprocess that loads its own model, so a request costs a couple
+of minutes, and the box has one GPU: jobs take a lock and a second request gets 409 instead
+of queueing invisibly. This is a test harness, not a throughput service.
+
+### `segment_vote.py` — deprecated: one sample, coverage voting
+
+Superseded by `segment_parts.py`, which intersects several samples instead of trusting
+one and breaks ties by IoU instead of coverage (coverage hands a unit to whichever mask is
+largest, so feet became legs and arms became torso).
 
 ```sh
 python segment_vote.py \

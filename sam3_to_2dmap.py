@@ -266,6 +266,42 @@ def rank_parts(fields: dict, prompts: list[str], score_k: float, drop: float, ad
     return parts
 
 
+def auto_parts(fields: dict, prompts: list[str], score_k: float, drop: float, add: float,
+               order: str = "small", min_comp: float = 0.0) -> tuple[list[dict], dict]:
+    """Paint the overlay both ways and keep the ranker's edit only when it costs no prompt.
+
+    Both maps come out of the single forward pass `rank_fields` already did -- drop = 0 and
+    add > 1 leave paint_hybrid with v3's own selection rule -- so this is a second painting,
+    not a second SAM3 run. The plain side is v3 over the ranker's top-K candidates rather
+    than over every query, so it lands within a pixel or two of --assign paint rather than
+    on top of it. It is a guard, not a quality metric: the ranker is better where
+    it was trained but its out-of-distribution failure is deleting a prompt outright
+    (REPORT_mask_rank_v3.md section 4.1), and that is the one thing a bare 2D map can tell
+    us for certain. Coverage is reported but deliberately not part of the decision -- the
+    ranker shrinks the painted area on purpose when it throws bad masks away.
+    """
+    print("  auto: painting the plain overlay ...")
+    plain = rank_parts(fields, prompts, score_k, 0.0, 2.0, order, min_comp)
+    print("  auto: painting the ranker's edit ...")
+    edited = rank_parts(fields, prompts, score_k, drop, add, order, min_comp)
+
+    fg = max(1, int(fields["fg"].sum().item()))
+
+    def summary(parts):
+        return {"prompts": sorted(part["prompt"] for part in parts),
+                "coverage": round(sum(int(part["mask"].sum()) for part in parts) / fg, 4)}
+
+    lost = sorted(set(summary(plain)["prompts"]) - set(summary(edited)["prompts"]))
+    record = {"chosen": "paint" if lost else "rank", "lost_to_ranker": lost,
+              "paint": summary(plain), "rank": summary(edited)}
+    if lost:
+        print(f"  auto: ranker dropped {lost} entirely; keeping the plain overlay")
+    else:
+        print(f"  auto: ranker kept every prompt; using its edit "
+              f"(coverage {record['paint']['coverage']:.3f} -> {record['rank']['coverage']:.3f})")
+    return (plain if lost else edited), record
+
+
 @torch.no_grad()
 def segment_prompts(processor, model, image: Image.Image, prompts: list[str], threshold: float, device: str,
                     bank=None, use_e0: bool = True):
@@ -329,13 +365,19 @@ def segment_parts_sweep(processor, model, image: Image.Image, specs, threshold: 
                         allow_missing: bool = False, bank=None, use_e0: bool = True,
                         assign: str = "paint", taus=(0.5,),
                         gate_rel: float = 0.0, gate_topk: int = 0, min_comp: float = 0.0,
-                        rank: dict | None = None) -> list[list[dict]]:
+                        rank: dict | None = None, report: dict | None = None) -> list[list[dict]]:
     """`segment_parts` for a whole confidence sweep: one part list per tau, sharing a single forward pass.
     `paint` and `rank` have no tau, so they return a single list however many were asked for.
-    `rank` = {model, drop, add, order} for --assign rank."""
+    `rank` = {model, drop, add, order} for --assign rank/auto; `report` collects --assign auto's choice."""
     unique = list(dict.fromkeys(prompt for _, prompts in specs for prompt in prompts))
-    if assign == "rank":
+    if assign in ("rank", "auto"):
         fields = rank_fields(processor, model, image, unique, device, rank["model"], bank=bank, use_e0=use_e0)
+        if assign == "auto":
+            got, record = auto_parts(fields, unique, threshold, rank["drop"], rank["add"], rank["order"],
+                                     min_comp)
+            if report is not None:
+                report.update(record)
+            return [group_parts(got, specs, allow_missing)]
         return [group_parts(rank_parts(fields, unique, threshold, rank["drop"], rank["add"], rank["order"],
                                        min_comp), specs, allow_missing)]
     if assign != "argmax":
@@ -487,11 +529,13 @@ def main():
     parser.add_argument("--concept_bank", default=None,
                         help="Stage-B bank.pt: adds learned offsets to the text features (SAM3 stays frozen)")
     parser.add_argument("--no_e0", action="store_true", help="With --concept_bank: per-name offsets only")
-    parser.add_argument("--assign", choices=["paint", "argmax", "rank"], default="paint",
+    parser.add_argument("--assign", choices=["paint", "argmax", "rank", "auto"], default="paint",
                         help="paint = score threshold then smallest-mask-first overlay (v3); "
                              "argmax = per-pixel softmax over the prompts + learned background (v5); "
-                             "rank = v3's set edited by the Mask RankGNN (--rank_model), same overlay")
-    parser.add_argument("--rank_model", default=None, help="--assign rank: mask_rank.py checkpoint")
+                             "rank = v3's set edited by the Mask RankGNN (--rank_model), same overlay; "
+                             "auto = paint both from the one forward pass and keep the ranker's edit "
+                             "only where it costs no prompt")
+    parser.add_argument("--rank_model", default=None, help="--assign rank/auto: mask_rank.py checkpoint")
     parser.add_argument("--rank_drop", type=float, default=0.1,
                         help="--assign rank: drop a v3 mask whose ranker weight is below this")
     parser.add_argument("--rank_add", type=float, default=0.9,
@@ -511,8 +555,8 @@ def main():
     args = parser.parse_args()
 
     taus = args.tau if args.assign == "argmax" else args.tau[:1]
-    if args.assign == "rank" and not args.rank_model:
-        raise SystemExit("--assign rank needs --rank_model")
+    if args.assign in ("rank", "auto") and not args.rank_model:
+        raise SystemExit(f"--assign {args.assign} needs --rank_model")
     if len(args.out) != len(taus):
         raise SystemExit(f"got {len(args.out)} --out paths for {len(taus)} threshold(s)")
     if args.legend and len(args.legend) != len(args.out):
@@ -530,12 +574,14 @@ def main():
     bank = load_concept_bank(args.concept_bank, device)
     if bank is not None:
         attach_decoder_lora(model, bank, args.concept_bank, args.decoder_lora_file, device)
+    report: dict = {}
     sweep = segment_parts_sweep(processor, model, image, specs, args.threshold, device,
                                 allow_missing=args.allow_missing, bank=bank, use_e0=not args.no_e0,
                                 assign=args.assign, taus=taus,
                                 gate_rel=args.gate_rel, gate_topk=args.gate_topk, min_comp=args.min_comp,
                                 rank={"model": args.rank_model, "drop": args.rank_drop, "add": args.rank_add,
-                                      "order": args.rank_order})
+                                      "order": args.rank_order},
+                                report=report)
     for i, parts in enumerate(sweep):
         if not parts and not args.allow_missing:
             raise SystemExit("SAM3 produced no masks. Try different --prompts or a lower --threshold.")
@@ -548,6 +594,11 @@ def main():
             json.dump(legend, f, ensure_ascii=False, indent=2)
         print(f"saved map {out}")
         print(f"saved legend {legend_path}")
+        if report:
+            auto_path = os.path.splitext(out)[0] + "_auto.json"
+            with open(auto_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            print(f"saved auto-pick report {auto_path}")
         for row in legend:
             print(f"  {row['prompt']}: rgb={row['color']} pixels={row['pixels']}")
 

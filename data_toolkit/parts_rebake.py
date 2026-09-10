@@ -24,7 +24,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data_toolkit.project_2d import label_mesh_from_map
+from data_toolkit.project_2d import face_map_labels, label_mesh_from_map
 
 
 def load_single_mesh(path):
@@ -104,14 +104,31 @@ def welded_face_adjacency(mesh):
     by vertex position first so neighbours are actually recognised. The mesh itself is left
     alone: welding it would collapse the UVs the bake needs.
     """
-    positions, inverse = np.unique(mesh.vertices.round(6), axis=0, return_inverse=True)
-    faces = inverse[np.asarray(mesh.faces)]
-    faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])]
-    if len(faces) != len(mesh.faces):
-        # Face indices have to keep lining up with labels/areas, so fall back rather than
-        # silently re-index if welding degenerated any face.
-        return np.asarray(mesh.face_adjacency)
-    return np.asarray(trimesh.Trimesh(vertices=positions, faces=faces, process=False).face_adjacency)
+    _, inverse = np.unique(np.asarray(mesh.vertices).round(6), axis=0, return_inverse=True)
+    faces = inverse.reshape(-1)[np.asarray(mesh.faces)]
+    # Pair faces through shared welded edges by hand: face indices must keep lining up
+    # with labels/areas, and a face that welding degenerates to a sliver simply ends up
+    # with fewer (or no) neighbours instead of being dropped.
+    corners = np.stack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=1).reshape(-1, 2)
+    owner = np.repeat(np.arange(len(faces)), 3)
+    keep = corners[:, 0] != corners[:, 1]
+    corners, owner = np.sort(corners[keep], axis=1), owner[keep]
+    order = np.lexsort((corners[:, 1], corners[:, 0]))
+    corners, owner = corners[order], owner[order]
+    new_edge = np.ones(len(corners), dtype=bool)
+    new_edge[1:] = np.any(corners[1:] != corners[:-1], axis=1)
+    edge_id = np.cumsum(new_edge) - 1
+    counts = np.bincount(edge_id)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    pairs = []
+    two = counts == 2
+    pairs.append(np.stack([owner[starts[two]], owner[starts[two] + 1]], axis=1))
+    for e in np.nonzero(counts > 2)[0]:
+        members = owner[starts[e]:starts[e] + counts[e]]
+        ii, jj = np.triu_indices(len(members), k=1)
+        pairs.append(np.stack([members[ii], members[jj]], axis=1))
+    adjacency = np.concatenate(pairs, axis=0) if pairs else np.zeros((0, 2), dtype=np.int64)
+    return adjacency[adjacency[:, 0] != adjacency[:, 1]].astype(np.int64)
 
 
 def smooth_labels(adjacency, labels, n_labels, iterations, self_weight=2):
@@ -175,6 +192,82 @@ def reassign_label_islands(adjacency, labels, areas, min_island_ratio=0.2):
             if winner != part:
                 labels[patch] = winner
     return labels
+
+
+def absorb_small_fragments(adjacency, labels, min_faces=100, iterations=3):
+    """Hand same-label patches under `min_faces` faces to their majority neighbour.
+
+    This is split.py's topology fix and nothing more: a blob big enough to be a real
+    part is never touched, whatever it is connected to, so the split follows SegviGen's
+    colouring instead of second-guessing it. Small islands that texture filtering or
+    seam inpainting produced are the only thing that moves.
+    """
+    from trimesh.graph import connected_components
+
+    adjacency = np.asarray(adjacency)
+    if len(adjacency) == 0 or min_faces <= 0:
+        return labels
+
+    labels = labels.copy()
+    for _ in range(iterations):
+        same = labels[adjacency[:, 0]] == labels[adjacency[:, 1]]
+        patches = connected_components(adjacency[same], nodes=np.arange(len(labels)))
+        small = [p for p in patches if len(p) < min_faces]
+        if not small:
+            break
+        changed = False
+        for patch in small:
+            member = np.zeros(len(labels), dtype=bool)
+            member[patch] = True
+            crossing = adjacency[member[adjacency[:, 0]] != member[adjacency[:, 1]]]
+            outside = np.where(member[crossing[:, 0]], crossing[:, 1], crossing[:, 0])
+            if len(outside) == 0:
+                continue
+            winner = int(np.bincount(labels[outside]).argmax())
+            if winner != labels[patch[0]]:
+                labels[patch] = winner
+                changed = True
+        if not changed:
+            break
+    return labels
+
+
+def weld_pieces_to_map(adjacency, labels, seen, min_visible_share=0.25, min_visible_faces=20,
+                       min_agreement=0.6):
+    """Rename whole same-label pieces after the guide map, never cutting inside one.
+
+    `seen` is the palette index the 2D map paints on each face (-1 when hidden or on
+    background). A piece changes label only when enough of it faces the camera and the
+    visible faces clearly agree on another label; hidden pieces and split votes keep
+    SegviGen's colour. This is the "weld" between the stain split (which trusts every
+    colour) and the refine pipeline (which rewrites faces pixel by pixel and fragments them).
+
+    Returns (labels, moved_faces, moved_pieces).
+    """
+    from trimesh.graph import connected_components
+
+    adjacency = np.asarray(adjacency)
+    labels = labels.copy()
+    seen = np.asarray(seen)
+    if len(adjacency) == 0 or not (seen >= 0).any():
+        return labels, 0, 0
+
+    same = labels[adjacency[:, 0]] == labels[adjacency[:, 1]]
+    pieces = connected_components(adjacency[same], nodes=np.arange(len(labels)))
+    moved_faces = moved_pieces = 0
+    for piece in pieces:
+        votes = seen[piece]
+        votes = votes[votes >= 0]
+        if len(votes) < min_visible_faces or len(votes) < min_visible_share * len(piece):
+            continue
+        counts = np.bincount(votes)
+        winner = int(counts.argmax())
+        if winner == labels[piece[0]] or counts[winner] < min_agreement * len(votes):
+            continue
+        labels[piece] = winner
+        moved_faces += len(piece)
+        moved_pieces += 1
+    return labels, moved_faces, moved_pieces
 
 
 def drop_small_parts(labels, centers, areas, min_area_ratio, names=None):
@@ -542,15 +635,32 @@ def load_face_labels(labels_path, names_path, n_faces):
     return labels.astype(np.int64), list(names), centers
 
 
-def _split_labels(mesh, palette=None, color_tol=40.0, min_area_ratio=0.01,
-                  smooth_iterations=3, min_island_ratio=0.2,
-                  two_d_map=None, transforms=None, azimuth=0.0,
-                  labels_npy=None, label_names=None):
+SPLIT_MODES = ("stain", "weld", "refine")
+
+
+def _face_labels(mesh, palette=None, color_tol=40.0, min_area_ratio=0.01,
+                 smooth_iterations=3, min_island_ratio=0.2,
+                 two_d_map=None, transforms=None, azimuth=0.0,
+                 labels_npy=None, label_names=None,
+                 split_mode="stain", min_fragment_faces=100,
+                 weld_min_visible=0.25, weld_min_agreement=0.6):
+    """One part label per face, plus the part colours and names: (labels, centers, names).
+
+    split_mode "stain" trusts SegviGen's colouring: nearest palette colour per face, then
+    only fragments under `min_fragment_faces` faces move (split.py's behaviour). "weld"
+    keeps every cut of the stain but renames whole same-colour pieces when the 2D guide
+    map clearly paints them as another part (weld_pieces_to_map). "refine" is the older
+    pipeline that overwrites visible faces from the 2D map, votes seam bands and
+    reassigns whole detached islands -- it repairs merged touching parts but also
+    redraws boundaries SegviGen already got right.
+    """
+    if split_mode not in SPLIT_MODES:
+        raise ValueError(f"split_mode must be one of {SPLIT_MODES}, got {split_mode!r}")
     areas = np.asarray(mesh.area_faces)
     if labels_npy:
         labels, names, centers = load_face_labels(labels_npy, label_names, len(mesh.faces))
         print(f"using {len(names)} precomputed face labels: {names}")
-        return part_geometries(mesh, labels, centers, names)
+        return labels, centers, names
 
     colors = face_base_colors(mesh)
     part_names_for_concepts = None
@@ -558,10 +668,10 @@ def _split_labels(mesh, palette=None, color_tol=40.0, min_area_ratio=0.01,
     if palette:
         centers, names, part_names_for_concepts = palette_from_legend(os.path.abspath(palette))
         labels = assign_to_palette(colors, centers)
-        if two_d_map and transforms:
+        if split_mode == "refine" and two_d_map and transforms:
             labels = label_mesh_from_map(
                 mesh, labels, os.path.abspath(two_d_map), centers,
-                os.path.abspath(transforms), azimuth, _undo_to_glb_rotation_np,
+                os.path.abspath(transforms), azimuth,
             )
             projected = True
             print(f"overwrote visible-face labels from {two_d_map}")
@@ -569,14 +679,38 @@ def _split_labels(mesh, palette=None, color_tol=40.0, min_area_ratio=0.01,
         labels, centers = cluster_parts(colors, areas, color_tol)
         names = None
     adjacency = welded_face_adjacency(mesh)
-    if not projected:
-        labels = smooth_labels(adjacency, labels, len(centers), smooth_iterations)
-    labels = reassign_label_islands(adjacency, labels, areas, min_island_ratio)
+    if split_mode in ("stain", "weld"):
+        if split_mode == "weld" and palette and two_d_map and transforms:
+            seen = face_map_labels(
+                mesh, os.path.abspath(two_d_map), centers,
+                os.path.abspath(transforms), azimuth,
+            )
+            labels, moved_faces, moved_pieces = weld_pieces_to_map(
+                adjacency, labels, seen, min_visible_share=weld_min_visible,
+                min_agreement=weld_min_agreement,
+            )
+            print(f"weld: {moved_pieces} pieces / {moved_faces} faces renamed after {two_d_map}")
+        elif split_mode == "weld":
+            print("weld: no palette/2D map/transforms given, falling back to the stain split")
+        before = labels.copy()
+        labels = absorb_small_fragments(adjacency, labels, min_fragment_faces)
+        print(f"{split_mode} split: absorbed {int((before != labels).sum())} fragment faces "
+              f"(<{min_fragment_faces} faces), boundaries otherwise as coloured")
+    else:
+        if not projected:
+            labels = smooth_labels(adjacency, labels, len(centers), smooth_iterations)
+        labels = reassign_label_islands(adjacency, labels, areas, min_island_ratio)
     if part_names_for_concepts is not None:
         labels, names = merge_labels_by_part(labels, part_names_for_concepts)
         centers = merge_centers_by_part(centers, part_names_for_concepts, names)
     else:
         labels, centers, names = drop_small_parts(labels, centers, areas, min_area_ratio, names)
+    return labels, centers, names
+
+
+def _split_labels(mesh, **kwargs):
+    """part_geometries of _face_labels; see there for the options."""
+    labels, centers, names = _face_labels(mesh, **kwargs)
     return part_geometries(mesh, labels, centers, names)
 
 
@@ -585,7 +719,9 @@ def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, 
                  cage_extrusion=0.02, max_ray_distance=0.05, samples=16, margin=2,
                  combined_name="parts.glb", save_textures=False, min_island_ratio=0.2,
                  two_d_map=None, transforms=None, azimuth=0.0,
-                 labels_npy=None, label_names=None):
+                 labels_npy=None, label_names=None,
+                 split_mode="stain", min_fragment_faces=100,
+                 weld_min_visible=0.25, weld_min_agreement=0.6):
     seg_glb = os.path.abspath(seg_glb)
     source_glb = os.path.abspath(source_glb)
     out_dir = os.path.abspath(out_dir)
@@ -596,6 +732,8 @@ def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, 
         smooth_iterations=smooth_iterations, min_island_ratio=min_island_ratio,
         two_d_map=two_d_map, transforms=transforms, azimuth=azimuth,
         labels_npy=labels_npy, label_names=label_names,
+        split_mode=split_mode, min_fragment_faces=min_fragment_faces,
+        weld_min_visible=weld_min_visible, weld_min_agreement=weld_min_agreement,
     )
 
     print(f"{len(parts)} parts from {len(mesh.faces)} faces")
@@ -611,7 +749,9 @@ def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, 
 def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_area_ratio=0.01,
                           smooth_iterations=3, combined_name="parts.glb", min_island_ratio=0.2,
                           two_d_map=None, transforms=None, azimuth=0.0,
-                          labels_npy=None, label_names=None):
+                          labels_npy=None, label_names=None,
+                          split_mode="stain", min_fragment_faces=100,
+                          weld_min_visible=0.25, weld_min_agreement=0.6):
     """Split into parts without Blender: no re-UV, no texture bake, no bpy dependency.
 
     Each part keeps its own flat "part colour" (the same colour it was assigned in the
@@ -628,6 +768,8 @@ def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_are
         smooth_iterations=smooth_iterations, min_island_ratio=min_island_ratio,
         two_d_map=two_d_map, transforms=transforms, azimuth=azimuth,
         labels_npy=labels_npy, label_names=label_names,
+        split_mode=split_mode, min_fragment_faces=min_fragment_faces,
+        weld_min_visible=weld_min_visible, weld_min_agreement=weld_min_agreement,
     )
 
     print(f"{len(parts)} parts from {len(mesh.faces)} faces (no texture bake)")
@@ -678,9 +820,26 @@ def main():
     parser.add_argument("--color_tol", type=float, default=40.0, help="RGB distance separating two parts")
     parser.add_argument("--min_area_ratio", type=float, default=0.01, help="Discard parts below this area share")
     parser.add_argument("--smooth_iterations", type=int, default=3, help="Neighbour vote passes over seam bands")
+    parser.add_argument("--split_mode", choices=list(SPLIT_MODES), default="stain",
+                        help="'stain' (default) cuts exactly along SegviGen's colouring and only "
+                             "absorbs fragments under --min_fragment_faces (split.py's rule). "
+                             "'weld' keeps those cuts but renames whole same-colour pieces the "
+                             "--two_d_map clearly paints as another part. 'refine' overwrites "
+                             "visible faces from the map pixel by pixel, votes seam bands and "
+                             "reassigns detached islands.")
+    parser.add_argument("--min_fragment_faces", type=int, default=100,
+                        help="--split_mode stain/weld: same-colour patches under this many faces go "
+                             "to their majority neighbour; larger patches are never touched.")
+    parser.add_argument("--weld_min_visible", type=float, default=0.25,
+                        help="--split_mode weld: a piece is only renamed when at least this share of "
+                             "its faces (and 20 faces) is visible in the map.")
+    parser.add_argument("--weld_min_agreement", type=float, default=0.6,
+                        help="--split_mode weld: ...and at least this share of those visible faces "
+                             "agree on the new label.")
     parser.add_argument("--min_island_ratio", type=float, default=0.2,
-                        help="Give a part's detached patch to the surrounding part when it is "
-                             "smaller than this share of that part's largest patch. 0 disables.")
+                        help="--split_mode refine: give a part's detached patch to the surrounding "
+                             "part when it is smaller than this share of that part's largest "
+                             "patch. 0 disables.")
     parser.add_argument("--uv_angle_limit", type=float, default=66.0)
     parser.add_argument("--uv_margin", type=float, default=0.003)
     parser.add_argument("--cage_extrusion", type=float, default=0.02)
@@ -749,6 +908,10 @@ def main():
             azimuth=args.azimuth,
             labels_npy=args.labels,
             label_names=args.label_names,
+            split_mode=args.split_mode,
+            min_fragment_faces=args.min_fragment_faces,
+            weld_min_visible=args.weld_min_visible,
+            weld_min_agreement=args.weld_min_agreement,
         )
         return
 
@@ -773,6 +936,10 @@ def main():
         azimuth=args.azimuth,
         labels_npy=args.labels,
         label_names=args.label_names,
+        split_mode=args.split_mode,
+        min_fragment_faces=args.min_fragment_faces,
+        weld_min_visible=args.weld_min_visible,
+        weld_min_agreement=args.weld_min_agreement,
     )
 
 
