@@ -34,6 +34,8 @@ def main():
              "With more than one value, --out is used as a template: 'view.png' becomes "
              "'view_0.png', 'view_135.png', ...",
     )
+    parser.add_argument("--samples", type=int, default=None,
+                        help="Cycles samples (default 128). Lower values are for seed-picking previews.")
     args = parser.parse_args()
 
     glb = os.path.abspath(args.glb)
@@ -43,7 +45,8 @@ def main():
     azimuths = [float(a) for a in args.azimuths.split(",") if a.strip() != ""]
     os.makedirs(os.path.dirname(out), exist_ok=True)
     print(f"rendering {glb} -> {out}")
-    written = render_from_transforms(glb, transforms, out, resolution=args.resolution, ref_glb=ref_glb, azimuths=azimuths)
+    written = render_from_transforms(glb, transforms, out, resolution=args.resolution, ref_glb=ref_glb,
+                                    azimuths=azimuths, samples=args.samples)
     for path in written:
         print(f"saved {path}")
 
