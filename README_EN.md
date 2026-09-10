@@ -87,10 +87,42 @@ SegviGen (transformers 4.57.6) conflict:
     pip install "transformers>=5"   # plus torch matching your CUDA
     ```
 
-3. Checkpoints (~24 GB total, resume-friendly download via hf-mirror)
-    ```sh
-    python download_ckpts.py   # -> ckpt/full_seg.ckpt, full_seg_w_2d_map.ckpt, interactive_seg.ckpt
-    ```
+3. Weights (see below)
+
+### Where the weights live
+
+The repo itself ships **no** weights (`weights/` is gitignored). Deployment needs three
+kinds of files: upstream public checkpoints, gated models, and the ones we trained.
+Direct access to huggingface.co is often blocked in CN; the download scripts default to
+[`hf-mirror.com`](https://hf-mirror.com) via `HF_ENDPOINT` (`env.sh` / `download_weights.sh`).
+
+| what | remote | lands at | how |
+|---|---|---|---|
+| three SegviGen ckpts (~7.3 GB each) | [`fenghora/SegviGen`](https://huggingface.co/fenghora/SegviGen) | `ckpt/full_seg.ckpt`, `full_seg_w_2d_map.ckpt`, `interactive_seg.ckpt` | `python download_ckpts.py` |
+| TRELLIS.2-4B (voxel / texture codecs) | [`microsoft/TRELLIS.2-4B`](https://huggingface.co/microsoft/TRELLIS.2-4B) | `microsoft/TRELLIS.2-4B/` | `./download_weights.sh` |
+| matting RMBG / BiRefNet | [`briaai/RMBG-2.0`](https://huggingface.co/briaai/RMBG-2.0) or [`ZhengPeng7/BiRefNet`](https://huggingface.co/ZhengPeng7/BiRefNet) | `weights/...`, pointed to by `SEGVIGEN_RMBG` | `./download_weights.sh` |
+| SAM3 (gated — accept the license on HF first) | [`facebook/sam3`](https://huggingface.co/facebook/sam3) | `weights/facebook/sam3` (`SEGVIGEN_SAM3`) | `export HF_TOKEN=… && ./download_weights.sh --gated` |
+| DINOv3 (gated) | [`facebook/dinov3-vitl16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m) | `weights/facebook/dinov3-vitl16-pretrain-lvd1689m` (`SEGVIGEN_DINOV3`) | same |
+| **SAM3 concept bank v3 (the deployed default)** | [`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank) root `bank.pt` | any path, `--concept_bank` at inference | `huggingface-cli download Zaun1996/sam3-concept-bank bank.pt` |
+| later concept-bank experiments (**not deployed**) | [`v5/`](https://huggingface.co/Zaun1996/sam3-concept-bank/tree/main/v5) and [`mask_rank_v3/`](https://huggingface.co/Zaun1996/sam3-concept-bank/tree/main/mask_rank_v3) on the same repo | ablation / reproduction | pull the subdirectory |
+| SegviGen LoRA (v6, …) | [`Zaun1996/segvigen-lora`](https://huggingface.co/Zaun1996/segvigen-lora) | download `v6/lora_last.pt`, then `finetune/merge_lora.py` into `ckpt/full_seg_w_2d_map.ckpt` | private; needs an HF token |
+
+```sh
+# upstream SegviGen ckpts → ckpt/
+python download_ckpts.py
+
+# plus TRELLIS.2-4B + matting; add --gated for SAM3 / DINOv3 (license + HF_TOKEN)
+./download_weights.sh
+# ./download_weights.sh --gated
+
+# the deployed SAM3 concept bank (287 KB)
+huggingface-cli download Zaun1996/sam3-concept-bank bank.pt --local-dir datasets/concept_bank_v3
+```
+
+Hook the bank in with `python sam3_to_2dmap.py --concept_bank datasets/concept_bank_v3/bank.pt --threshold 0.4 …`.
+`v5/` (per-pixel CE + decoder LoRA) and `mask_rank_v3/` (candidate ranker) look better on
+holdout numbers but worse on external assets, so **deployment stays on the root `bank.pt`
++ overlay @0.4**. Each subdirectory README has the metrics and the why.
 
 Runtime configuration:
 

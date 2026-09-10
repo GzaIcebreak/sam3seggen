@@ -85,10 +85,39 @@ metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
     pip install "transformers>=5"   # 外加与你 CUDA 匹配的 torch
     ```
 
-3. 模型权重（共约 24 GB，经 hf-mirror 断点续传下载）
-    ```sh
-    python download_ckpts.py   # -> ckpt/full_seg.ckpt, full_seg_w_2d_map.ckpt, interactive_seg.ckpt
-    ```
+3. 模型权重（见下节）
+
+### 权重位置
+
+仓库本身**不带**权重（`weights/` 已 gitignore）。部署用的东西分三类：上游公开仓、gated 仓、我们自己训的。
+国内直连 huggingface.co 经常不通，下载脚本默认走 [`hf-mirror.com`](https://hf-mirror.com)
+（`HF_ENDPOINT`，见 `env.sh` / `download_weights.sh`）。
+
+| 用途 | 远程 | 落到本地 | 怎么下 |
+|---|---|---|---|
+| SegviGen 三个 ckpt（各 ~7.3 GB） | [`fenghora/SegviGen`](https://huggingface.co/fenghora/SegviGen) | `ckpt/full_seg.ckpt`、`full_seg_w_2d_map.ckpt`、`interactive_seg.ckpt` | `python download_ckpts.py` |
+| TRELLIS.2-4B（体素 / 纹理编解码） | [`microsoft/TRELLIS.2-4B`](https://huggingface.co/microsoft/TRELLIS.2-4B) | `microsoft/TRELLIS.2-4B/` | `./download_weights.sh` |
+| 抠图 RMBG / BiRefNet | [`briaai/RMBG-2.0`](https://huggingface.co/briaai/RMBG-2.0) 或 [`ZhengPeng7/BiRefNet`](https://huggingface.co/ZhengPeng7/BiRefNet) | `weights/...`，由 `SEGVIGEN_RMBG` 指向 | `./download_weights.sh` |
+| SAM3（gated，先在 HF 上同意许可） | [`facebook/sam3`](https://huggingface.co/facebook/sam3) | `weights/facebook/sam3`（`SEGVIGEN_SAM3`） | `export HF_TOKEN=… && ./download_weights.sh --gated` |
+| DINOv3（gated） | [`facebook/dinov3-vitl16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m) | `weights/facebook/dinov3-vitl16-pretrain-lvd1689m`（`SEGVIGEN_DINOV3`） | 同上 |
+| **SAM3 概念库 v3（部署默认）** | [`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank) 根目录 `bank.pt` | 任意路径，推理时 `--concept_bank` | `huggingface-cli download Zaun1996/sam3-concept-bank bank.pt` |
+| 概念库后续实验（**不上线**） | 同上仓的 [`v5/`](https://huggingface.co/Zaun1996/sam3-concept-bank/tree/main/v5)、[`mask_rank_v3/`](https://huggingface.co/Zaun1996/sam3-concept-bank/tree/main/mask_rank_v3) | 对照 / 复现 | 按子目录拉 |
+| SegviGen LoRA（v6 等） | [`Zaun1996/segvigen-lora`](https://huggingface.co/Zaun1996/segvigen-lora) | 先下 `v6/lora_last.pt`，再 `finetune/merge_lora.py` 并进 `ckpt/full_seg_w_2d_map.ckpt` | 私有仓，需要 HF token |
+
+```sh
+# 上游 SegviGen 三个 ckpt → ckpt/
+python download_ckpts.py
+
+# 加上 TRELLIS.2-4B + 抠图；gated 的 SAM3 / DINOv3 再加 --gated（要先 accept license + HF_TOKEN）
+./download_weights.sh
+# ./download_weights.sh --gated
+
+# 部署用的 SAM3 概念库（287 KB）
+huggingface-cli download Zaun1996/sam3-concept-bank bank.pt --local-dir datasets/concept_bank_v3
+```
+
+推理接概念库：`python sam3_to_2dmap.py --concept_bank datasets/concept_bank_v3/bank.pt --threshold 0.4 …`。
+`v5/`（逐像素 CE + 解码器 LoRA）和 `mask_rank_v3/`（候选级排序器）定量有提升，外部资产定性不够，**部署仍用根目录 `bank.pt` + 叠涂 @0.4**。各目录 README 写了指标和根因。
 
 运行时配置：
 
