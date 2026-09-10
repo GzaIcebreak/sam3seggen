@@ -27,7 +27,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from prompt_specs import normalize_part_specs, part_names, validate_target_name
-from segment_api import DEFAULT_PY_SAM3, _run
+from segment_api import DEFAULT_PY_SAM3, DEFAULT_SAM3, _run
 
 
 def segment_vote(
@@ -40,7 +40,7 @@ def segment_vote(
     radius=2.0,
     resolution=512,
     py_sam3=None,
-    sam3_model="facebook/sam3",
+    sam3_model=DEFAULT_SAM3,
     sam3_threshold=0.3,
     unassigned_to=None,
     min_cover=0.25,
@@ -166,7 +166,7 @@ def main():
                         help="Skip the texture bake in step 1 (faster; SAM3 then votes on "
                              "flat-colour renders, which usually still works).")
     parser.add_argument("--py_sam3", default=None, help=f"default: {DEFAULT_PY_SAM3}")
-    parser.add_argument("--sam3_model", default="facebook/sam3")
+    parser.add_argument("--sam3_model", default=DEFAULT_SAM3)
     parser.add_argument("--sam3_threshold", type=float, default=0.3)
     args = parser.parse_args()
 

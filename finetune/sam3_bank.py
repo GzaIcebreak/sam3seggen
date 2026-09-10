@@ -411,6 +411,85 @@ def paint_argmax(maps: torch.Tensor, fg: torch.Tensor, bg_logit: float, tau: flo
     return out
 
 
+def query_gate(scores: torch.Tensor, rel: float = 0.0, topk: int = 0) -> torch.Tensor | None:
+    """`log_weight` for name_logit_maps that drops a prompt's weak queries from the pixel competition.
+
+    The logsumexp weights a query only by log(score): one SAM3 scored 0.01 is 4.6 logits down and still
+    wins any pixel where its (garbage) mask logit is high, which is the speckle on out-of-distribution
+    renders. v3 never saw it because `--threshold` removed those queries before the union. `rel` keeps the
+    queries scoring at least rel x the prompt's own best, so no prompt is ever dropped outright (an absolute
+    floor would lose `leg` at 0.297); `topk` caps the count. Both given = intersection. None = no gate."""
+    if rel <= 0 and topk <= 0:
+        return None
+    keep = torch.ones_like(scores, dtype=torch.bool)
+    if rel > 0:
+        keep &= scores >= rel * scores.max(dim=1, keepdim=True).values
+    if topk > 0:
+        top = torch.zeros_like(keep)
+        top.scatter_(1, scores.topk(min(topk, scores.shape[1]), dim=1).indices, True)
+        keep &= top
+    return torch.where(keep, 0.0, -1e4).to(scores.dtype)
+
+
+def connected_components(lab: torch.Tensor, max_iter: int = 512) -> torch.Tensor:
+    """4-connected components of a label map, long [H, W]; the id is the largest flat pixel index in the
+    component, -1 where lab < 0. Max-propagation to same-label neighbours plus pointer jumping, so it
+    converges in O(log diameter) rounds on the GPU without scipy."""
+    H, W = lab.shape
+    idx = torch.arange(H * W, device=lab.device)
+    comp = torch.where(lab.flatten() >= 0, idx, torch.full_like(idx, -1))
+    same_x = lab[:, 1:] == lab[:, :-1]
+    same_y = lab[1:, :] == lab[:-1, :]
+    for _ in range(max_iter):
+        prev = comp
+        c = comp.view(H, W)
+        best = c.clone()
+        best[:, :-1] = torch.where(same_x, torch.maximum(best[:, :-1], c[:, 1:]), best[:, :-1])
+        best[:, 1:] = torch.where(same_x, torch.maximum(best[:, 1:], c[:, :-1]), best[:, 1:])
+        best[:-1, :] = torch.where(same_y, torch.maximum(best[:-1, :], c[1:, :]), best[:-1, :])
+        best[1:, :] = torch.where(same_y, torch.maximum(best[1:, :], c[:-1, :]), best[1:, :])
+        comp = best.flatten()
+        valid = comp >= 0
+        for _ in range(2):
+            comp = torch.where(valid, comp[comp.clamp(min=0)], comp)
+        if torch.equal(comp, prev):
+            break
+    return comp.view(H, W)
+
+
+def clean_components(lab: torch.Tensor, fg: torch.Tensor, min_frac: float = 0.005) -> torch.Tensor:
+    """Re-label every 4-connected fragment (of a prompt, or of grey) smaller than `min_frac` of the
+    silhouette to the label its boundary touches most among the fragments that are not small themselves.
+    A small fragment with no such neighbour becomes grey. What downstream paints onto the mesh are
+    blocks of one colour, so a fleck this size is noise by definition whichever prompt it carries."""
+    n_fg = int(fg.sum().item())
+    if n_fg == 0 or min_frac <= 0:
+        return lab
+    n_lab = int(lab.max().item()) + 1
+    grey = n_lab                                             # treat grey inside the silhouette as a label too
+    work = torch.where(fg, torch.where(lab >= 0, lab, torch.full_like(lab, grey)), torch.full_like(lab, -1))
+    comp = connected_components(work)
+    valid = comp >= 0
+    ids, counts = torch.unique(comp[valid], return_counts=True)
+    small_ids = ids[counts < min_frac * n_fg]
+    if small_ids.numel() == 0:
+        return lab
+    small = torch.isin(comp, small_ids)
+    # comp id -> row in the vote table; only meaningful where `small`, clamped so the gather below stays in range
+    slot = torch.searchsorted(small_ids, comp.clamp(min=0)).clamp(max=small_ids.numel() - 1)
+    votes = torch.zeros((small_ids.numel(), n_lab + 1), dtype=torch.long, device=lab.device)
+    H, W = lab.shape
+    for (a, b) in (((slice(None), slice(0, W - 1)), (slice(None), slice(1, W))),
+                   ((slice(0, H - 1), slice(None)), (slice(1, H), slice(None)))):
+        for src, dst in ((a, b), (b, a)):
+            m = small[src] & ~small[dst] & (work[dst] >= 0)
+            votes.index_put_((slot[src][m], work[dst][m]), torch.ones_like(slot[src][m]), accumulate=True)
+    winner = votes.argmax(dim=1)
+    winner[votes.sum(dim=1) == 0] = grey
+    out = torch.where(small, winner[slot], work)
+    return torch.where(out == grey, torch.full_like(out, -1), out)
+
+
 def paint(unions: torch.Tensor, fg: torch.Tensor) -> torch.Tensor:
     """What sam3_to_2dmap.colorize does with one union mask per prompt: clip to the silhouette and paint
     the smallest masks first, each only where nothing was painted yet. Returns the per-pixel prompt
@@ -424,6 +503,65 @@ def paint(unions: torch.Tensor, fg: torch.Tensor) -> torch.Tensor:
         free = unions[i] & fg & (out < 0)
         out[free] = i
     return out
+
+
+# --------------------------------------------------------------------------- candidate-level painters
+# (Mask RankGNN, REPORT_mask_rank_v3.md). `cands` is the dict mask_rank_paint.keep_weights / sam3_to_2dmap.rank_fields
+# build from one forward pass: logits [N, Q, h, w], scores [N, Q], idx [N, k] (the re-ranked top-K queries per
+# prompt), keep [N, k] (ranker weight), fg [H, W]. Nothing here is decided per pixel: what gets painted is a
+# SAM3 mask or nothing, which is what keeps these free of the argmax speckle.
+
+def hard_masks(logits: torch.Tensor, size: tuple[int, int], chunk: int = 32) -> torch.Tensor:
+    """[C, h, w] mask logits -> bool [C, H, W], sigmoid > 0.5 after bilinear upsampling (sam3_to_2dmap)."""
+    out = []
+    for c0 in range(0, logits.shape[0], chunk):
+        up = F.interpolate(logits[c0:c0 + chunk].float().sigmoid()[None], size=size,
+                           mode="bilinear", align_corners=False)[0]
+        out.append(up > 0.5)
+    return torch.cat(out, 0) if out else torch.zeros((0, *size), dtype=torch.bool, device=logits.device)
+
+
+def paint_masks(cands: dict, sel: torch.Tensor, w: torch.Tensor, order: str = "small") -> torch.Tensor:
+    """Overlay the selected top-K candidates (bool [N, k]) as hard masks. order = small: union per prompt,
+    smallest first (v3's rule); keep: single masks in descending `w`, never overwriting."""
+    n, k = cands["idx"].shape
+    fg = cands["fg"]
+    out = torch.full(fg.shape, -1, dtype=torch.long, device=fg.device)
+    ni, ri = sel.nonzero(as_tuple=True)
+    if ni.numel() == 0:
+        return out
+    masks = hard_masks(cands["logits"][ni, cands["idx"][ni, ri]], tuple(fg.shape)) & fg
+    if order == "small":
+        unions = torch.zeros((n, *fg.shape), dtype=torch.bool, device=fg.device)
+        for j in range(ni.numel()):
+            unions[ni[j]] |= masks[j]
+        return paint(unions, fg)
+    for j in w[ni, ri].argsort(descending=True).tolist():
+        free = masks[j] & (out < 0)
+        out[free] = ni[j]
+    return out
+
+
+def paint_select(cands: dict, source: str, kappa: float, order: str = "small", fallback: bool = False) -> torch.Tensor:
+    """source = keep (ranker) | score (SAM3's own); keep every candidate with weight >= kappa; fallback also
+    keeps each prompt's single best so no prompt vanishes. `--select score --kappa 0.4 small` is v3 exactly."""
+    n, k = cands["idx"].shape
+    w = cands["keep"] if source == "keep" else cands["scores"].gather(1, cands["idx"])
+    sel = w >= kappa
+    if fallback:
+        sel[torch.arange(n, device=w.device), w.argmax(1)] = True
+    return paint_masks(cands, sel, w, order)
+
+
+def paint_hybrid(cands: dict, score_k: float = 0.4, drop_below: float = 0.1, add_above: float = 0.9,
+                 order: str = "small") -> torch.Tensor:
+    """Venice-H1's failure gate applied to v3's set: start from what v3 overlays (score >= score_k), drop the
+    members the ranker is confident are bad (keep < drop_below), add what it is confident is good
+    (keep >= add_above). Where the ranker is unsure v3's choice stands."""
+    sc = cands["scores"].gather(1, cands["idx"])
+    keep = cands["keep"]
+    sel = ((sc >= score_k) & (keep >= drop_below)) | (keep >= add_above)
+    return paint_masks(cands, sel, keep if order == "keep" else sc, order)
 
 
 def instance_scores(outputs) -> torch.Tensor:

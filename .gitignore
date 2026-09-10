@@ -45,3 +45,6 @@ wandb/
 # Reference material pulled from the HF demo Space (not part of this repo)
 demo_space/
 demo_examples/
+
+# SAM3 / HF weights fetched by download_weights.sh (4.8 GB)
+weights/

@@ -25,6 +25,12 @@ v4 options (PLAN_concept_bank_v4.md; every one is off by default so the defaults
     H  --decoder_lora r          LoRA on SAM3 mask-decoder (and optional DETR text) cross-attention;
                                  vision encoder stays frozen. Writes decoder_lora.pt next to bank.pt
 
+v5 (PLAN_concept_bank_v5.md): --assign_ce W replaces the per-prompt objective by a per-pixel assignment
+    CE over the name-level mask logits (logsumexp over queries of mask_logit + log score) plus a learnable
+    background logit `bg`; BCE+Dice and the negatives' BCE default to 0, presence BCE stays. Every eval
+    also reports the "argmax" block: the same pass painted by per-pixel argmax (sam3_bank.paint_argmax),
+    which is the v5 deployment operator. --lora_scope embed,proj put LoRA on both ends of the mask dot product.
+
 Writes <out>/bank.pt (loadable by sam3_bank.ConceptBank), <out>/split.json, <out>/log.jsonl,
 and <out>/text_cache.pt: one pooled 256-d vector per vocabulary name and object name, with the
 bank offsets applied, for the SegviGen legend tokens (Stage D).
@@ -181,6 +187,42 @@ def competition_losses(union: torch.Tensor, label: torch.Tensor, n_pos: int, tem
     return ce, margin
 
 
+def assign_loss(maps: torch.Tensor, bg: torch.Tensor, label: torch.Tensor, n_pos: int, temp: float,
+                syn: torch.Tensor | None, balance: str = "sqrt") -> torch.Tensor:
+    """v5: per-pixel assignment cross-entropy over [prompted names..., background] using the name-level
+    mask logits (sam3_bank.name_logit_maps) directly, no union in between.
+
+    `label` from pixel_labels: k = pos_names[k], n_pos = background / unprompted part, -1 = ignored.
+    Negatives (rows >= n_pos) are never a label, so the softmax pushes them down on every pixel: that is
+    the direct penalty for "painting body onto torso" which BCE per prompt never sees.
+    `syn` [N, N] bool: names that are near-synonyms of each other (text cosine > --syn_cos). Pixels of
+    name k credit the logsumexp of k and its synonyms, so a body/torso labelling disagreement is not
+    trained as an error. Classes are balanced by 1/sqrt(count) (or 1/count with balance="inv")."""
+    n = maps.shape[0]
+    L = torch.cat([maps, bg.to(maps.dtype).view(1, 1, 1).expand(1, *maps.shape[-2:])], 0) / temp   # [N + 1, h, w]
+    lse = torch.logsumexp(L, dim=0)                                                             # [h, w]
+    lab = torch.where(label == n_pos, torch.full_like(label, n), label)
+    valid = lab >= 0
+    if not bool(valid.any()):
+        return maps.new_zeros(())
+    if syn is not None and n_pos > 0 and bool(syn.any()):
+        # target logit of name k = logsumexp over k and its synonyms (among all prompts)
+        grp = syn.clone()
+        grp.fill_diagonal_(True)
+        masked = L[:n][None].expand(n, n, *L.shape[-2:]).masked_fill(~grp[:, :, None, None], float("-inf"))
+        tgt_pos = torch.logsumexp(masked, dim=1)                                                # [N, h, w]
+        Lt = torch.cat([tgt_pos, L[n:]], 0)
+    else:
+        Lt = L
+    nll = lse - Lt.gather(0, lab.clamp(min=0)[None])[0]
+    counts = torch.bincount(lab[valid], minlength=n + 1).float()
+    if balance == "sqrt":
+        counts = counts.sqrt()
+    w = torch.zeros_like(nll)
+    w[valid] = 1.0 / counts[lab[valid]]
+    return (w * nll).sum() / w.sum().clamp(min=1e-6)
+
+
 # --------------------------------------------------------------------------- eval
 
 def _new_acc() -> dict:
@@ -203,13 +245,28 @@ def _summary(a: dict) -> dict:
             "painted_part_rate": float(np.mean(a["cpart"])) if a["cpart"] else 0.0}
 
 
+def _new_aacc() -> dict:
+    return {"cpx": 0, "cacc": 0, "cwrong": 0, "cpart": [], "fp": [], "hfp": [], "images": 0}
+
+
+def _asummary(a: dict) -> dict:
+    cpx = max(1, a["cpx"])
+    return {"images": a["images"], "pixel_acc": a["cacc"] / cpx, "pixel_wrong": a["cwrong"] / cpx,
+            "pixel_unassigned": 1.0 - (a["cacc"] + a["cwrong"]) / cpx,
+            "painted_part_rate": float(np.mean(a["cpart"])) if a["cpart"] else 0.0,
+            "false_positive_rate": float(np.mean(a["fp"])) if a["fp"] else 0.0,
+            "false_positive_rate_hard": float(np.mean(a["hfp"])) if a["hfp"] else None}
+
+
 @torch.no_grad()
 def evaluate(processor, model, samples: list[ImageSample], template: str, bank, device: str,
              threshold: float, negatives: dict[str, list[str]], max_images: int | None = None,
              chunk: int = 12, hard_negatives: dict[str, list[str]] | None = None,
              thresholds: list[float] | None = None, slices: dict[str, set[str]] | None = None,
              fired: list | None = None, fired_t: float = 0.5,
-             templates: list[str] | None = None) -> dict:
+             templates: list[str] | None = None,
+             assign_taus: list[float] | None = None, assign_temp: float = 1.0,
+             gate_rel: float = 0.0, gate_topk: int = 0, min_comp: float = 0.0) -> dict:
     """`negatives` (random names) give the comparable false_positive_rate; `hard_negatives`, when
     given, add false_positive_rate_hard on co-occurring / similar names.
 
@@ -221,11 +278,23 @@ def evaluate(processor, model, samples: list[ImageSample], template: str, bank, 
     (smallest first, no overwriting, clipped to the silhouette) and compared per pixel with ids.npy:
     pixel_acc (right name), pixel_wrong (another prompt's name - the "mistaken identity" error),
     pixel_unassigned (grey), painted_part_rate (visible parts whose own name covers >= 50 % after the
-    overlay). `slices` (name -> object ids) repeat everything on subsets, e.g. the hard list."""
+    overlay). `slices` (name -> object ids) repeat everything on subsets, e.g. the hard list.
+
+    v5 ("argmax" block, per tau in `assign_taus`): the same forward pass painted with sam3_bank.paint_argmax
+    (per-pixel softmax over the positive prompts + background, PLAN_concept_bank_v5.md section 3); the
+    false-positive rates there mean "the negative won at least one silhouette pixel" in a softmax that
+    also contains the negatives. Independent of the score threshold.
+
+    `gate_rel` / `gate_topk` (sam3_bank.query_gate) drop each prompt's weak queries before the logsumexp and
+    `min_comp` (sam3_bank.clean_components) re-labels fragments under that share of the silhouette: the
+    deployment painter's de-speckling, applied here so the numbers describe what is actually shipped."""
     ths = [threshold] + [t for t in (thresholds or []) if t != threshold]
+    taus = list(assign_taus) if assign_taus else [0.0]
     slices = slices or {}
     tmpls = templates or [template]
     acc = {(sl, t): _new_acc() for sl in ["all", *slices] for t in ths}
+    aacc = {(sl, tau): _new_aacc() for sl in ["all", *slices] for tau in taus}
+    bg_logit = bank.bg_logit() if bank is not None else 0.0
     use_qv = bank is not None and bank.nn_cos > 0 and bank.tvec is not None
     for k, s in enumerate(samples):
         if max_images and k >= max_images:
@@ -239,8 +308,10 @@ def evaluate(processor, model, samples: list[ImageSample], template: str, bank, 
         hards = (hard_negatives or {}).get(s.obj, [])
         allp = names + negs + hards
         votes = {t: None for t in ths}
+        maps_sum = None
         for tmpl in tmpls:
             chunks = {t: [] for t in ths}
+            mchunks = []
             for k0 in range(0, len(allp), chunk):              # bounded memory: mask logits are [N, Q, h, w]
                 part = allp[k0:k0 + chunk]
                 prompts = [sb.fill_template(tmpl, n, s.obj_name) for n in part]
@@ -250,10 +321,15 @@ def evaluate(processor, model, samples: list[ImageSample], template: str, bank, 
                     out, bias = sb.bank_forward(model, vis, tf, am, bank, part, qv)
                 for t in ths:
                     chunks[t].append(sb.batch_union_masks(out, (h, w), t, bias=bias))
+                gate = sb.query_gate(sb.batch_scores(out, bias).float(), gate_rel, gate_topk)
+                mchunks.append(sb.name_logit_maps(out, bias, gate))
                 del out
             for t in ths:
                 u = torch.cat(chunks[t], 0).float()
                 votes[t] = u if votes[t] is None else votes[t] + u
+            m = torch.cat(mchunks, 0)
+            maps_sum = m if maps_sum is None else maps_sum + m
+        maps = maps_sum / len(tmpls)                                        # [N, h, w] name-level logits
         gts = {n: torch.from_numpy(s.gts[n]).to(device) for n in names}
         ids_t = torch.from_numpy(s.ids.astype(np.int64)).to(device)
         fg = ids_t >= 0
@@ -311,12 +387,36 @@ def evaluate(processor, model, samples: list[ImageSample], template: str, bank, 
                 a["cacc"] += n_right
                 a["cwrong"] += n_wrong
                 a["images"] += 1
+        # v5 argmax painting: positives-only softmax for what colorize would hand downstream; the full
+        # softmax (with the negatives) for whether an absent name can still win pixels
+        for tau in taus:
+            pa = sb.paint_argmax(maps[:len(names)], fg, bg_logit, tau, assign_temp)
+            if min_comp > 0:
+                pa = sb.clean_components(pa, fg, min_comp)
+            full = sb.paint_argmax(maps, fg, bg_logit, tau, assign_temp)
+            won = torch.bincount(full[fg].clamp(min=0), minlength=len(allp) + 1)
+            arow = {"cpx": n_valid,
+                    "cacc": int((valid & (pa == gt_lab)).sum().item()),
+                    "cwrong": int((valid & (pa >= 0) & (pa != gt_lab)).sum().item()),
+                    "cpart": [((pa == names.index(nm)) & pm).sum().item() / px >= 0.5 for nm, pm, px in pms.values()],
+                    "fp": [bool(won[len(names) + j] > 0) for j in range(len(negs))],
+                    "hfp": [bool(won[len(names) + len(negs) + j] > 0) for j in range(len(hards))]}
+            for sl in sls:
+                a = aacc[(sl, tau)]
+                for key in ("cpx", "cacc", "cwrong"):
+                    a[key] += arow[key]
+                for key in ("cpart", "fp", "hfp"):
+                    a[key].extend(arow[key])
+                a["images"] += 1
 
     res = _summary(acc[("all", threshold)])
     if len(ths) > 1:
         res["sweep"] = {f"{t:g}": _summary(acc[("all", t)]) for t in ths[1:]}
+    res["argmax"] = {f"{tau:g}": _asummary(aacc[("all", tau)]) for tau in taus}
     if slices:
         res["slices"] = {sl: {f"{t:g}": _summary(acc[(sl, t)]) for t in ths} for sl in slices}
+        for sl in slices:
+            res["slices"][sl]["argmax"] = {f"{tau:g}": _asummary(aacc[(sl, tau)]) for tau in taus}
     return res
 
 
@@ -349,9 +449,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr_name", type=float, default=1e-2)
     ap.add_argument("--lr_e0", type=float, default=1e-3)
-    ap.add_argument("--neg_weight", type=float, default=0.5)
+    ap.add_argument("--neg_weight", type=float, default=None,
+                    help="weight of the negatives' BCE(union, 0); default 0.5, or 0 when --assign_ce is on")
     ap.add_argument("--presence_weight", type=float, default=0.5)
-    ap.add_argument("--bce_weight", type=float, default=1.0, help="weight of the per-prompt BCE+Dice (v3 main term)")
+    ap.add_argument("--bce_weight", type=float, default=None,
+                    help="weight of the per-prompt BCE+Dice (v3 main term); default 1, or 0 when --assign_ce is on")
     ap.add_argument("--l2", type=float, default=1e-3, help="pull E[name] toward 0 (keeps rare names near E_0)")
     ap.add_argument("--threshold", type=float, default=0.3)
     ap.add_argument("--eval_thresholds", default="0.4,0.5,0.6",
@@ -400,9 +502,26 @@ def main():
                    help="LoRA rank on decoder cross-attention (0 = off). Vision encoder stays frozen.")
     g.add_argument("--lora_alpha", type=float, default=None, help="LoRA alpha (default 2 * rank)")
     g.add_argument("--lora_scope", default="mask,text",
-                   help="mask = mask_decoder.prompt_cross_attn; text = detr_decoder text_cross_attn; comma both")
+                   help="comma list: mask = mask_decoder.prompt_cross_attn; text = detr_decoder text_cross_attn; "
+                        "embed = mask_embedder MLP; proj = instance_projection (v5: both ends of the mask dot product)")
     g.add_argument("--lr_lora", type=float, default=1e-4)
     g.add_argument("--lora_file", default=None, help="decoder_lora.pt to load after inject (eval_only / resume)")
+    g = ap.add_argument_group("v5: per-pixel assignment (PLAN_concept_bank_v5.md)")
+    g.add_argument("--assign_ce", type=float, default=0.0,
+                   help="weight of the per-pixel assignment CE over name-level mask logits + learnable bg (0 = off). "
+                        "Turns --bce_weight / --neg_weight default to 0; presence BCE stays.")
+    g.add_argument("--assign_temp", type=float, default=1.0, help="softmax temperature (train and argmax eval)")
+    g.add_argument("--assign_balance", choices=["sqrt", "inv"], default="sqrt")
+    g.add_argument("--assign_syn", type=float, default=None,
+                   help="positives closer than this (text cosine) share credit in the CE; default = --syn_cos, 0 = off")
+    g.add_argument("--lr_bg", type=float, default=1e-2)
+    g.add_argument("--assign_taus", default="0,0.3,0.5",
+                   help="eval: min winner probability for a pixel to be painted under the argmax painter (always reported)")
+    g.add_argument("--gate_rel", type=float, default=0.0,
+                   help="eval: drop a prompt's queries scoring under this x its best before the pixel competition (0 = off)")
+    g.add_argument("--gate_topk", type=int, default=0, help="eval: keep only each prompt's k best queries (0 = off)")
+    g.add_argument("--min_comp", type=float, default=0.0,
+                   help="eval: re-label painted fragments smaller than this share of the silhouette (0 = off)")
     ap.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
     ap.add_argument("--wandb_project", default="segvigen-sam3")
     ap.add_argument("--wandb_entity", default=None)
@@ -410,6 +529,12 @@ def main():
     ap.add_argument("--wandb_id", default=None, help="Run id to resume (default: out dir basename)")
     ap.add_argument("--wandb_mode", default="online", choices=["online", "offline"])
     args = ap.parse_args()
+    if args.bce_weight is None:
+        args.bce_weight = 0.0 if args.assign_ce > 0 else 1.0
+    if args.neg_weight is None:
+        args.neg_weight = 0.0 if args.assign_ce > 0 else 0.5
+    if args.assign_syn is None:
+        args.assign_syn = args.syn_cos
 
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(args.seed)
@@ -509,9 +634,14 @@ def main():
         lr_down, lr_up = torch.randn(D, args.lowrank) * 0.02, torch.zeros(args.lowrank, D)
         if prev is not None and prev.lr_down is not None and prev.lr_down.shape[1] == args.lowrank:
             lr_down, lr_up = prev.lr_down.float().cpu(), prev.lr_up.float().cpu()
+    bg = None
+    if args.assign_ce > 0:
+        bg = prev.bg.float().cpu() if prev is not None and prev.bg is not None else torch.zeros(())
     bank = sb.ConceptBank(E_0=E_0, names=bank_names, E=leaf(E), template=template, base=args.model,
                           meta={"templates": templates, "decoder_lora": args.decoder_lora,
-                                "lora_scope": args.lora_scope if args.decoder_lora else ""},
+                                "lora_scope": args.lora_scope if args.decoder_lora else "",
+                                "assign": args.assign_ce > 0, "assign_temp": args.assign_temp},
+                          bg=None if bg is None else leaf(bg),
                           b=None if b is None else leaf(b), words=words,
                           E_word=None if E_word is None else leaf(E_word), tvec=tvec.to(device),
                           nn_cos=args.nn_cos, nn_temp=args.nn_temp,
@@ -531,6 +661,8 @@ def main():
         groups.append({"params": [bank.ctx], "lr": args.lr_ctx})
     if bank.lr_down is not None:
         groups.append({"params": [bank.lr_down, bank.lr_up], "lr": args.lr_lowrank})
+    if bank.bg is not None:
+        groups.append({"params": [bank.bg], "lr": args.lr_bg})
     if lora_params:
         groups.append({"params": lora_params, "lr": args.lr_lora})
     for g_ in groups:
@@ -688,6 +820,8 @@ def main():
                 row = {f"{pre}/{k}": v for k, v in kw.items() if k in METRIC_KEYS and v is not None}
                 for t, sub in (kw.get("sweep") or {}).items():
                     row.update({f"{pre}_t{t}/{k}": v for k, v in sub.items() if k in METRIC_KEYS and v is not None})
+                for tau, sub in (kw.get("argmax") or {}).items():
+                    row.update({f"{pre}_argmax{tau}/{k}": v for k, v in sub.items() if k in METRIC_KEYS and v is not None})
                 run.log(row, step=step)
 
     def fmt(d: dict) -> str:
@@ -701,8 +835,16 @@ def main():
                 f"| paint acc {d['pixel_acc']:.3f} wrong {d['pixel_wrong']:.3f} unassigned {d['pixel_unassigned']:.3f} "
                 f"parts {d['painted_part_rate']:.3f}")
 
+    def brief_argmax(ev: dict) -> str:
+        return " | ".join(
+            f"tau{tau}: acc {d['pixel_acc']:.3f} wrong {d['pixel_wrong']:.3f} unassigned {d['pixel_unassigned']:.3f} "
+            f"parts {d['painted_part_rate']:.3f} hardFP {d['false_positive_rate_hard'] if d['false_positive_rate_hard'] is None else round(d['false_positive_rate_hard'], 3)}"
+            for tau, d in ev.get("argmax", {}).items())
+
     sweep = [float(t) for t in args.eval_thresholds.split(",") if t.strip()]
-    eval_kw = dict(chunk=args.max_prompts, thresholds=sweep)
+    taus = [float(t) for t in args.assign_taus.split(",") if t.strip()]
+    eval_kw = dict(chunk=args.max_prompts, thresholds=sweep, assign_taus=taus, assign_temp=args.assign_temp,
+                   gate_rel=args.gate_rel, gate_topk=args.gate_topk, min_comp=args.min_comp)
 
     def run_evals(bk, epoch: int, step: int, tag) -> dict:
         fired: list = []
@@ -712,10 +854,16 @@ def main():
             json.dump(fired, f, ensure_ascii=False, indent=0)
         print(f"holdout [{tag}]:", fmt(ev), flush=True)
         print("   ", brief(ev), flush=True)
+        print("    argmax", brief_argmax(ev), flush=True)
         if "slices" in ev and "hard" in ev["slices"]:
             hd = ev["slices"]["hard"].get("0.5") or next(iter(ev["slices"]["hard"].values()))
             print(f"    hard slice t0.5: miou {hd['miou']:.3f} grey {hd['grey_pixel_ratio']:.3f} "
                   f"paint acc {hd['pixel_acc']:.3f} wrong {hd['pixel_wrong']:.3f}", flush=True)
+            ha = ev["slices"]["hard"].get("argmax", {})
+            if ha:
+                tau0, hd0 = next(iter(ha.items()))
+                print(f"    hard slice argmax tau{tau0}: acc {hd0['pixel_acc']:.3f} wrong {hd0['pixel_wrong']:.3f} "
+                      f"unassigned {hd0['pixel_unassigned']:.3f}", flush=True)
         log_row(kind="eval", set="holdout", epoch=epoch, step=step, bank=tag, **ev)
         for nm, (root, objs, samples) in extra_sets.items():
             rnd, hrd = extra_negs[nm]
@@ -723,6 +871,7 @@ def main():
                              hard_negatives=hrd, templates=templates, **eval_kw)
             print(f"{nm} [{tag}]:", fmt(ex_ev), flush=True)
             print("   ", brief(ex_ev), flush=True)
+            print("    argmax", brief_argmax(ex_ev), flush=True)
             log_row(kind="eval", set=nm, epoch=epoch, step=step, bank=tag, **ex_ev)
             ev[f"extra:{nm}"] = ex_ev
         return ev
@@ -810,7 +959,7 @@ def main():
             pos = list(s.pos_names)
             # A (pixel CE / margin) ranks names against each other: every visible name must stay in
             # the same softmax. Drop negatives first; only then subsample positives.
-            if args.pixel_ce > 0 or args.margin > 0:
+            if args.pixel_ce > 0 or args.margin > 0 or args.assign_ce > 0:
                 room = max(0, args.max_prompts - len(pos))
                 if len(negs) > room:
                     negs = list(negs[:room])
@@ -832,13 +981,24 @@ def main():
             hw = union.shape[-2:]
             n_pos = len(s.pos_names)
             terms = {}
-            terms["bce"] = args.bce_weight * torch.stack(
-                [bce_dice(union[i], soft_gt(torch.from_numpy(s.gts[n]).to(device), hw)) for i, n in enumerate(s.pos_names)]).mean()
-            if negs:
+            if args.bce_weight > 0:
+                terms["bce"] = args.bce_weight * torch.stack(
+                    [bce_dice(union[i], soft_gt(torch.from_numpy(s.gts[n]).to(device), hw)) for i, n in enumerate(s.pos_names)]).mean()
+            if negs and args.neg_weight > 0:
                 per_neg = F.binary_cross_entropy(union[n_pos:].clamp(1e-6, 1 - 1e-6), torch.zeros_like(union[n_pos:]),
                                                  reduction="none").flatten(1).mean(1)
                 wneg = torch.tensor([args.online_weight if n in online_negs.get(o, ()) else 1.0 for n in negs], device=device)
                 terms["neg"] = args.neg_weight * (per_neg * wneg).sum() / wneg.sum()
+            if args.assign_ce > 0:
+                maps = sb.name_logit_maps(out, bias)                      # [N, h, w]
+                label = pixel_labels(s, s.pos_names, hw, device)
+                syn = None
+                if args.assign_syn > 0:
+                    qv = F.normalize(sb.text_query_vecs(tf, am), dim=1)
+                    syn = (qv @ qv.T) > args.assign_syn
+                    syn.fill_diagonal_(False)
+                terms["assign"] = args.assign_ce * assign_loss(maps, bank.bg, label, n_pos, args.assign_temp,
+                                                               syn, args.assign_balance)
             if out.presence_logits is not None:
                 tgt = torch.cat([torch.ones(n_pos), torch.zeros(len(negs))]).to(device)
                 terms["pres"] = args.presence_weight * F.binary_cross_entropy_with_logits(out.presence_logits.float().view(-1), tgt)

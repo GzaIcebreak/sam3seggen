@@ -21,8 +21,9 @@ def main():
             continue
         url = f"{BASE}/{name}"
         print(f"downloading {name} -> {dest}")
+        curl = "curl.exe" if os.name == "nt" else "curl"
         cmd = [
-            "curl.exe", "-L",
+            curl, "-L",
             "--retry", "40",
             "--retry-delay", "5",
             "--retry-all-errors",

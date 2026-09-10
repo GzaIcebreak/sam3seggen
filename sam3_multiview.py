@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 
 from prompt_specs import normalize_part_specs, part_names, validate_target_name
-from sam3_to_2dmap import foreground_mask, load_sam3, segment_prompts
+from sam3_to_2dmap import DEFAULT_SAM3, foreground_mask, load_sam3, segment_prompts
 
 
 def concept_table(specs):
@@ -45,7 +45,7 @@ def main():
                              "e.g. 'armor staff base body=head+face+hand+boot'.")
     parser.add_argument("--unassigned_to", default=None,
                         help="Recorded for the 3D stage, which assigns faces no concept claimed.")
-    parser.add_argument("--model", default="facebook/sam3")
+    parser.add_argument("--model", default=DEFAULT_SAM3)
     parser.add_argument("--threshold", type=float, default=0.3)
     args = parser.parse_args()
 

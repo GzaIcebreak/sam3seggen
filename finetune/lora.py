@@ -35,6 +35,30 @@ class LoRALinear(nn.Module):
         return self.base
 
 
+class LoRAConv1x1(nn.Module):
+    """LoRA on a 1x1 Conv2d (a per-pixel Linear). Same parameter names as LoRALinear so
+    lora_state_dict / load_lora_state_dict see it."""
+
+    def __init__(self, base: nn.Conv2d, r: int, alpha: float):
+        super().__init__()
+        assert base.kernel_size == (1, 1)
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.r = r
+        self.scale = alpha / r
+        dev = base.weight.device
+        self.lora_A = nn.Parameter(torch.empty(r, base.in_channels, dtype=torch.float32, device=dev))
+        self.lora_B = nn.Parameter(torch.zeros(base.out_channels, r, dtype=torch.float32, device=dev))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.base(x)
+        w = (self.lora_B @ self.lora_A) * self.scale                       # [out, in]
+        delta = torch.nn.functional.conv2d(x.float(), w[:, :, None, None])
+        return y + delta.to(y.dtype)
+
+
 def _attn_modules(flow_model, targets: set[str]):
     for block in flow_model.blocks:
         if "self" in targets and hasattr(block, "self_attn"):

@@ -41,14 +41,30 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DS = r"E:\AI_New\ModelGen\datasets"
+if os.name == "nt":
+    DS = r"E:\AI_New\ModelGen\datasets"
+    PY = r"E:\AI_New\ModelGen\.venv\Scripts\python.exe"
+    PY_SAM3 = r"E:\AI_New\ModelGen\.venv_holo\Scripts\python.exe"
+    PY_GEO = r"E:\AI_New\ModelGen\.venv_geosam2\Scripts\python.exe"
+    BAT = os.path.join(ROOT, "finetune", "run_ft.bat")
+else:
+    # AutoDL: bpy / trimesh / o_voxel in trellis2; SAM3 (transformers 5.x) in its own env.
+    # GeoSAM2 / P3-SAM / full_seg_v6.ckpt are not on this box. v5 maps lift through the
+    # base 2D-map ckpt (same path as "SegviGen base + SAM3"), then montage / Cycles.
+    ENVS = os.environ.get("SEGVIGEN_ENVS", "/root/autodl-tmp/envs")
+    DS = "/root/autodl-tmp/datasets"
+    PY = os.path.join(ENVS, "trellis2", "bin", "python")
+    PY_SAM3 = os.path.join(ENVS, "sam3", "bin", "python")
+    PY_GEO = os.path.join(ENVS, "geosam2", "bin", "python")
+    BAT = PY
+    os.environ.setdefault("SEGVIGEN_DINOV3", os.path.join(ROOT, "weights", "facebook", "dinov3-vitl16-pretrain-lvd1689m"))
+    os.environ.setdefault("SEGVIGEN_RMBG", os.path.join(ROOT, "weights", "ZhengPeng7", "BiRefNet"))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+DS = os.environ.get("SEGVIGEN_DATASETS", DS)
+INFERENCE = os.path.join(ROOT, "inference_full.py")
 SRC = os.path.join(DS, "ext_parts")
 OUT = os.path.join(DS, "ext_bench")
 BANK = os.path.join(DS, "concept_bank_v3", "bank.pt")
-PY = r"E:\AI_New\ModelGen\.venv\Scripts\python.exe"
-PY_SAM3 = r"E:\AI_New\ModelGen\.venv_holo\Scripts\python.exe"
-PY_GEO = r"E:\AI_New\ModelGen\.venv_geosam2\Scripts\python.exe"
-BAT = os.path.join(ROOT, "finetune", "run_ft.bat")
 TRANSFORMS = os.path.join(ROOT, "data_toolkit", "transforms.json")
 CKPT = {
     "native": os.path.join(ROOT, "ckpt", "full_seg.ckpt"),
@@ -166,19 +182,85 @@ def stage_mesh(keys, max_faces: int):
 
 
 # ----------------------------------------------------------------------------- sam3
-def stage_sam3(keys):
+# variant -> (montage label, bank.pt, extra sam3_to_2dmap args, argmax tau or None). "map" is the v3 overlay
+# every downstream stage consumes; the others are read-only comparison columns. v5 needs its decoder LoRA,
+# which sam3_to_2dmap picks up next to the bank, and paints by per-pixel argmax instead of the overlay.
+# "map_v5" is the raw per-pixel argmax (speckled on these assets); the other three are the de-speckled
+# painters of REPORT_concept_bank_v5_eval.md section 6: fragment cleanup alone, and cleanup after gating each
+# prompt's weak queries. Each tau is the one that leaves v3's share of grey (0.20) on the holdout, so the
+# columns compare at equal coverage.
+V5_BANK = "/root/autodl-tmp/runs/v5_ce_lora/bank_epoch3.pt"
+MAPS: dict[str, tuple[str, str, list[str], float | None]] = {
+    "map": ("SAM3 map (v3 overlay)", BANK, ["--threshold", "0.4"], None),
+    "map_v5": ("SegviGen + v5 t=0.5", V5_BANK, ["--assign", "argmax"], 0.5),
+    "map_v5_clean": ("v5 + fragment cleanup t=0.5", V5_BANK, ["--assign", "argmax", "--min_comp", "0.005"], 0.5),
+    "map_v5_rel5": ("v5 + gate rel0.5 + cleanup t=0.45", V5_BANK,
+                    ["--assign", "argmax", "--gate_rel", "0.5", "--min_comp", "0.005"], 0.45),
+    "map_v5_rel7": ("v5 + gate rel0.7 + cleanup t=0.45", V5_BANK,
+                    ["--assign", "argmax", "--gate_rel", "0.7", "--min_comp", "0.005"], 0.45),
+    "map_v5_t6": ("SegviGen + v5 t=0.6", V5_BANK, ["--assign", "argmax"], 0.6),
+    "map_v5_t7": ("SegviGen + v5 t=0.7", V5_BANK, ["--assign", "argmax"], 0.7),
+    # REPORT_mask_rank_v3.md: v3's overlay set edited by the Mask RankGNN (drop keep<0.1, add keep>=0.9), the
+    # setting that matched v3's coverage on the holdout at +3.0 / -3.0 (and lost on makerworld).
+    "map_rank": ("SegviGen + RankGNN", BANK,
+                 ["--threshold", "0.4", "--assign", "rank", "--rank_drop", "0.1", "--rank_add", "0.9",
+                  "--rank_model", "/root/autodl-tmp/runs/mask_rank_v3/grid_name_lr/rank_epoch11.pt"], None),
+    # REPORT_mask_rank_v3.md section 4.1: same hybrid with the EASE-DETR edge ranker (better on makerworld), and
+    # Venice-H1's protocol: one gated top-1 mask per prompt. Venice's keep is one-hot on its pick, so drop 0.1 /
+    # add 0.9 through the same painter reduces to exactly that pick.
+    "map_ease": ("v3 + RankGNN + EASE", BANK,
+                 ["--threshold", "0.4", "--assign", "rank", "--rank_drop", "0.1", "--rank_add", "0.9",
+                  "--rank_model", "/root/autodl-tmp/runs/mask_rank_v3/ease/rank_epoch8.pt"], None),
+    "map_venice": ("Venice-H1 gated top-1 (2D map)", BANK,
+                   ["--threshold", "0.4", "--assign", "rank", "--rank_drop", "0.1", "--rank_add", "0.9",
+                    "--rank_model", "/root/autodl-tmp/runs/mask_rank_v3/venice_s/rank_epoch16.pt"], None),
+}
+# These columns are SegviGen lifts of the 2D map (base 2D-map ckpt → baked-texture GLB → Cycles).
+SEGVIGEN_MAP_TAG = {"map_v5": "v5", "map_v5_t6": "v5_t6", "map_v5_t7": "v5_t7", "map_rank": "rank"}
+
+
+def map_paths(k: str, variant: str, side: str) -> tuple[str, str]:
+    """(map png, legend json). The v3 front map keeps the flat names the other stages already read."""
+    d = wd(k)
+    if variant == "map" and side == "front":
+        return os.path.join(d, "map.png"), os.path.join(d, "legend.json")
+    stem = variant if side == "front" else f"{variant}_back"
+    return os.path.join(d, f"{stem}.png"), os.path.join(d, f"{stem}_legend.json")
+
+
+def stage_sam3(keys, variants=None, sides=("front", "back")):
+    """Variants that share a bank and differ only in the argmax tau ride on one SAM3 forward pass, which
+    matters here because loading the model costs far more than segmenting one 512px render."""
+    want = list(variants or MAPS)
     for k in keys:
         d = wd(k)
-        if os.path.exists(os.path.join(d, "legend.json")):
-            continue
-        say(f"sam3 {k}")
-        run([PY_SAM3, os.path.join(ROOT, "sam3_to_2dmap.py"), "--image", os.path.join(d, "render.png"),
-             "--out", os.path.join(d, "map.png"), "--legend", os.path.join(d, "legend.json"), "--allow_missing",
-             "--threshold", "0.4", "--concept_bank", BANK, "--prompts", *ASSETS[k][1]], os.path.join(d, "log.txt"))
-        if os.path.exists(os.path.join(d, "legend.json")):
-            leg = read_json(os.path.join(d, "legend.json"))
-            say("  " + ", ".join(f"{p['prompt']}:{'-' if p['score'] is None else round(float(p['score']), 2)}"
-                                 for p in leg))
+        for side in sides:
+            render = os.path.join(d, "render.png" if side == "front" else "render_back.png")
+            if not os.path.exists(render):
+                continue
+            groups: dict[tuple, list[str]] = {}
+            for v in want:
+                if os.path.exists(map_paths(k, v, side)[1]):
+                    continue
+                _, bank, extra, _ = MAPS[v]
+                groups.setdefault((bank, tuple(extra)), []).append(v)
+            for (bank, extra), vs in groups.items():
+                outs = [map_paths(k, v, side) for v in vs]
+                taus = [MAPS[v][3] for v in vs]
+                say(f"sam3 {k} {side}: {', '.join(vs)}")
+                cmd = [PY_SAM3, os.path.join(ROOT, "sam3_to_2dmap.py"), "--image", render,
+                       "--out", *[p for p, _ in outs], "--legend", *[l for _, l in outs],
+                       "--allow_missing", "--concept_bank", bank, *extra]
+                if taus[0] is not None:
+                    cmd += ["--tau", *[f"{t:g}" for t in taus]]
+                run([*cmd, "--prompts", *ASSETS[k][1]], os.path.join(d, "log.txt"))
+                for v, (_, legend) in zip(vs, outs):
+                    if not os.path.exists(legend):
+                        say(f"  {k} {v} {side}: FAILED")
+                        continue
+                    leg = read_json(legend)
+                    say(f"  {v}: " + ", ".join(
+                        f"{p['prompt']}:{'-' if p['score'] is None else round(float(p['score']), 2)}" for p in leg))
 
 
 # ----------------------------------------------------------------------------- segvigen
@@ -214,24 +296,16 @@ def stage_segvigen(keys):
         }
         for tag, (ckpt, *extra) in jobs.items():
             seg = os.path.join(d, f"seg_{tag}.glb")
-            if not os.path.exists(seg):
-                if tag != "native" and not os.path.exists(os.path.join(d, "map.png")):
-                    say(f"segvigen {k} {tag}: no map.png, skipping")
-                    continue
-                say(f"segvigen {k} {tag}")
-                t0 = time.time()
-                rc = run([BAT, r"..\inference_full.py", "--ckpt_path", ckpt, "--glb", glb, "--input_vxz",
-                          os.path.join(d, "input.vxz"), "--export_glb", seg, *extra], os.path.join(d, "log.txt"))
-                times = read_json(os.path.join(d, "times.json")) if os.path.exists(os.path.join(d, "times.json")) else {}
-                times[f"segvigen_{tag}"] = round(time.time() - t0, 1)
-                write_json(os.path.join(d, "times.json"), times)
-                if rc != 0 or not os.path.exists(seg):
-                    say(f"  {k} {tag}: FAILED (exit {rc})")
-                    continue
             up = os.path.join(d, f"seg_{tag}_upright.glb")
-            if not os.path.exists(up):
+            if os.path.exists(seg) and not os.path.exists(up):
                 frame, cov = upright(seg, glb, up)
                 say(f"  {k} {tag}: upright frame={frame} coverage={cov:.3f}")
+    lift = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lift_maps_segvigen.py")
+    tags = [t for t in SEGVIGEN_MAP_TAG.values()
+            if any(not os.path.exists(os.path.join(wd(k), f"seg_{t}_upright.glb")) for k in keys)]
+    if tags:
+        run([PY, lift, "--keys", *keys, "--tags", ",".join(dict.fromkeys(tags))],
+            os.path.join(OUT, "lift_v5.log"))
 
 
 # ----------------------------------------------------------------------------- geosam2
@@ -587,7 +661,7 @@ def stage_score(keys):
 # ----------------------------------------------------------------------------- montage
 COLUMNS = [
     ("input", "Input"),
-    ("map", "SAM3 map (bank)"),
+    ("map", MAPS["map"][0]),
     ("segvigen_native", "SegviGen native"),
     # original P3-SAM auto-mask (finetune/p3sam_run.py in its conda env): class-agnostic, never sees SAM3
     ("p3sam", "P3-SAM (auto, no SAM3)"),
@@ -599,6 +673,14 @@ COLUMNS = [
     # predates the transform-order fix, geo_p2 is the corrected two-view GeoSAM2 propagation
     ("abl_geo_p2", "GeoSAM2 p2 (fixed)"),
     ("abl_lift_sam3track_p2_match", "SAM3 tracker p2 (best)"),
+    *((v, MAPS[v][0]) for v in SEGVIGEN_MAP_TAG),
+    # REPORT_mask_rank_v3.md section 4.1 rankers: the 2D map and its SegviGen lift (lift_maps_segvigen.py --tags ease,venice)
+    ("map_ease", MAPS["map_ease"][0]),
+    ("lift_ease", "SegviGen + RankGNN + EASE"),
+    ("map_venice", MAPS["map_venice"][0]),
+    ("lift_venice", "SegviGen + Venice-H1"),
+    # same map_ease 2D map, lifted through the v6 LoRA merged into the base ckpt (--tags ease_v6)
+    ("lift_ease_v6", "SegviGen v6 + RankGNN + EASE"),
 ]
 
 
@@ -613,23 +695,48 @@ def render_view(glb: str, out_png: str, az: float, log: str) -> str | None:
     return target if os.path.exists(target) else None
 
 
-def stage_montage(keys):
-    from PIL import Image, ImageDraw, ImageFont
-    try:
-        font = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 16)
-    except OSError:
-        font = ImageFont.load_default()
+CJK_FONTS = ["C:/Windows/Fonts/msyh.ttc", "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"]
+ASCII_FONT = "/root/autodl-tmp/GeoSAM2-SegviGen/.venv/lib/python3.12/site-packages/cv2/qt/fonts/DejaVuSans.ttf"
+
+
+def load_font(size: int = 16):
+    """(font, draws CJK). Row labels carry the asset's Chinese name; without a CJK face it is dropped
+    rather than rendered as boxes."""
+    from PIL import ImageFont
+    for path in CJK_FONTS:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size), True
+    if os.path.exists(ASCII_FONT):
+        return ImageFont.truetype(ASCII_FONT, size), False
+    return ImageFont.load_default(), False
+
+
+def stage_montage(keys, columns=None, extend: str | None = None, replace_last: bool = False):
+    """`extend` = directory holding an earlier compare_front.png / compare_back.png (e.g. the repo's
+    assets/ext_bench): the selected columns are appended to the right of those sheets instead of drawing
+    new ones, so columns produced on another machine (SegviGen, GeoSAM2, P3-SAM) survive. Rows must be the
+    same assets in the same order at tile size 300. `replace_last` overwrites the rightmost
+    len(columns) tiles of that sheet (used when the last columns were 2D maps and are now 3D)."""
+    from PIL import Image, ImageDraw
+    font, cjk = load_font(16)
+    cols = [c for c in COLUMNS if columns is None or c[0] in columns]
     def tiles_for(k, side):
         d = wd(k)
         az = front_json(k)["azimuth"]
         if side == "back":
             az = (az + 180) % 360
         tiles = []
-        for col, _ in COLUMNS:
+        for col, _ in cols:
             if col == "input":
                 tiles.append(os.path.join(d, "render.png" if side == "front" else "render_back.png"))
-            elif col == "map":
-                tiles.append(os.path.join(d, "map.png") if side == "front" else None)
+            elif col in SEGVIGEN_MAP_TAG or col.startswith("lift_"):
+                tag = SEGVIGEN_MAP_TAG.get(col, col[5:])
+                glb = os.path.join(d, f"seg_{tag}_upright.glb")
+                tiles.append(render_view(glb, os.path.join(d, "vis", f"{col}.png"), az, os.path.join(d, "log.txt"))
+                             if os.path.exists(glb) else None)
+            elif col in MAPS:
+                tiles.append(map_paths(k, col, side)[0])
             else:
                 glb = os.path.join(d, f"seg_{col.split('_')[1]}_upright.glb" if col.startswith("segvigen")
                                    else f"{col}_parts.glb")
@@ -638,10 +745,10 @@ def stage_montage(keys):
         return tiles
 
     def grid(rows, S, out, row_label):
-        W, H = len(COLUMNS) * S, len(rows) * (S + 22) + 22
+        W, H = len(cols) * S, len(rows) * (S + 22) + 22
         canvas = Image.new("RGB", (W, H), "white")
         draw = ImageDraw.Draw(canvas)
-        for c, (_, label) in enumerate(COLUMNS):
+        for c, (_, label) in enumerate(cols):
             draw.text((c * S + 6, 3), label, fill="black", font=font)
         for r, (name, tiles) in enumerate(rows):
             y = 22 + r * (S + 22)
@@ -657,15 +764,74 @@ def stage_montage(keys):
         canvas.save(out)
         say(f"saved {out}")
 
+    def append(rows, S, base_png, out):
+        base = Image.open(base_png).convert("RGB")
+        if base.height != len(rows) * (S + 22) + 22:
+            raise SystemExit(f"{base_png}: {base.height}px tall, expected {len(rows)} rows of {S}px tiles")
+        canvas = Image.new("RGB", (base.width + len(cols) * S, base.height), "white")
+        canvas.paste(base, (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        for c, (_, label) in enumerate(cols):
+            draw.text((base.width + c * S + 6, 3), label, fill="black", font=font)
+        for r, (_, tiles) in enumerate(rows):
+            y = 22 + r * (S + 22) + 22
+            for c, t in enumerate(tiles):
+                x = base.width + c * S
+                if t and os.path.exists(t):
+                    im = Image.open(t).convert("RGBA")
+                    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                    canvas.paste(Image.alpha_composite(bg, im).convert("RGB").resize((S, S)), (x, y))
+                else:
+                    draw.text((x + S // 2 - 20, y + S // 2), "n/a", fill="grey", font=font)
+        canvas.save(out, optimize=True)
+        say(f"saved {out} ({canvas.width}x{canvas.height})")
+
+    def overwrite_right(rows, S, base_png, out):
+        base = Image.open(base_png).convert("RGB")
+        n = len(cols)
+        keep_w = base.width - n * S
+        if keep_w < 0:
+            raise SystemExit(f"{base_png}: {base.width}px wide, cannot replace {n} x {S}px columns")
+        if base.height != len(rows) * (S + 22) + 22:
+            raise SystemExit(f"{base_png}: {base.height}px tall, expected {len(rows)} rows of {S}px tiles")
+        canvas = Image.new("RGB", (base.width, base.height), "white")
+        canvas.paste(base.crop((0, 0, keep_w, base.height)), (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle((keep_w, 0, base.width, 22), fill="white")
+        for c, (_, label) in enumerate(cols):
+            draw.text((keep_w + c * S + 6, 3), label, fill="black", font=font)
+        for r, (_, tiles) in enumerate(rows):
+            y = 22 + r * (S + 22) + 22
+            for c, t in enumerate(tiles):
+                x = keep_w + c * S
+                if t and os.path.exists(t):
+                    im = Image.open(t).convert("RGBA")
+                    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                    canvas.paste(Image.alpha_composite(bg, im).convert("RGB").resize((S, S)), (x, y))
+                else:
+                    draw.rectangle((x, y, x + S, y + S), fill="white")
+                    draw.text((x + S // 2 - 20, y + S // 2), "n/a", fill="grey", font=font)
+        canvas.save(out, optimize=True)
+        say(f"saved {out} (replaced last {n} cols, {canvas.width}x{canvas.height})")
+
+    def zh(k):
+        return f" ({ASSETS[k][0]})" if cjk else ""
     # overview: one row per asset, front and back sheets
     for side in ("front", "back"):
-        grid([(k, tiles_for(k, side)) for k in keys], 300, os.path.join(OUT, f"compare_{side}.png"),
-             lambda k: f"{k} ({ASSETS[k][0]})  az={front_json(k)['azimuth']:g}")
+        rows = [(k, tiles_for(k, side)) for k in keys]
+        if extend and replace_last:
+            overwrite_right(rows, 300, os.path.join(extend, f"compare_{side}.png"),
+                            os.path.join(OUT, f"compare_{side}.png"))
+        elif extend:
+            append(rows, 300, os.path.join(extend, f"compare_{side}.png"), os.path.join(OUT, f"compare_{side}.png"))
+        else:
+            grid(rows, 300, os.path.join(OUT, f"compare_{side}.png"),
+                 lambda k: f"{k}{zh(k)}  az={front_json(k)['azimuth']:g}")
     # detail: one sheet per asset at render resolution, front row + back row
     os.makedirs(os.path.join(OUT, "detail"), exist_ok=True)
     for k in keys:
         grid([("front", tiles_for(k, "front")), ("back", tiles_for(k, "back"))], 512,
-             os.path.join(OUT, "detail", f"{k}.png"), lambda side: f"{k} ({ASSETS[k][0]}) {side}")
+             os.path.join(OUT, "detail", f"{k}.png"), lambda side, k=k: f"{k}{zh(k)} {side}")
 
 
 # ----------------------------------------------------------------------------- report
@@ -803,6 +969,14 @@ def main():
                              "report", "all"])
     ap.add_argument("--assets", nargs="*", default=None)
     ap.add_argument("--max_faces", type=int, default=200000)
+    ap.add_argument("--maps", nargs="*", default=None, choices=list(MAPS),
+                    help="sam3 stage: which map variants to build (default all)")
+    ap.add_argument("--columns", nargs="*", default=None, choices=[c for c, _ in COLUMNS],
+                    help="montage stage: which columns to draw (default all)")
+    ap.add_argument("--extend", default=None,
+                    help="montage stage: append --columns to the compare_{front,back}.png found in this directory")
+    ap.add_argument("--replace-last", action="store_true",
+                    help="with --extend, overwrite the rightmost len(--columns) tiles instead of appending")
     args = ap.parse_args()
     keys = args.assets or list(ASSETS)
     stages = (["front", "mesh", "sam3", "segvigen", "geosam2", "p3sam", "score", "montage", "report"] if "all" in args.stages
@@ -810,9 +984,11 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     for st in stages:
         say(f"=== stage {st}")
-        {"front": stage_front, "mesh": lambda ks: stage_mesh(ks, args.max_faces), "sam3": stage_sam3,
+        {"front": stage_front, "mesh": lambda ks: stage_mesh(ks, args.max_faces),
+         "sam3": lambda ks: stage_sam3(ks, args.maps),
          "segvigen": stage_segvigen, "geo_prep": stage_geo_prep, "geosam2": stage_geosam2, "p3sam": stage_p3sam,
-         "score": stage_score, "montage": stage_montage, "report": stage_report}[st](keys)
+         "score": stage_score, "montage": lambda ks: stage_montage(ks, args.columns, args.extend, args.replace_last),
+         "report": stage_report}[st](keys)
     say("EXT BENCH DONE")
 
 

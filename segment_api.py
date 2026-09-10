@@ -43,6 +43,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 DEFAULT_PY_SAM3 = os.environ.get("SEGVIGEN_PY_SAM3", r"E:\AI_New\ModelGen\.venv_holo\Scripts\python.exe")
+DEFAULT_SAM3 = os.environ.get("SEGVIGEN_SAM3", os.path.join(ROOT, "weights", "facebook", "sam3"))
 DEFAULT_CKPT = os.path.join(ROOT, "ckpt", "full_seg_w_2d_map.ckpt")
 DEFAULT_CKPT_NO_SAM = os.path.join(ROOT, "ckpt", "full_seg.ckpt")
 DEFAULT_TRANSFORMS = os.path.join(ROOT, "data_toolkit", "transforms.json")
@@ -152,7 +153,7 @@ def segment(
     ckpt=None,
     transforms=None,
     py_sam3=None,
-    sam3_model="facebook/sam3",
+    sam3_model=DEFAULT_SAM3,
     sam3_threshold=0.3,
     texture_size=2048,
     azimuth=0.0,
@@ -391,7 +392,7 @@ def main():
     parser.add_argument("--ckpt", default=None, help=f"default: {DEFAULT_CKPT}")
     parser.add_argument("--transforms", default=None, help=f"default: {DEFAULT_TRANSFORMS}")
     parser.add_argument("--py_sam3", default=None, help=f"default: {DEFAULT_PY_SAM3}")
-    parser.add_argument("--sam3_model", default="facebook/sam3")
+    parser.add_argument("--sam3_model", default=DEFAULT_SAM3)
     parser.add_argument("--sam3_threshold", type=float, default=0.3)
     parser.add_argument(
         "--allow_partial",

@@ -33,8 +33,18 @@ if ROOT not in sys.path:
 import sam3_bank as sb
 from concept_bank import ImageSample, list_images, list_objects
 from mask_rank import candidate_features, select_topk
-from oracle_candidates import low_res_labels
 from sam3_to_2dmap import load_sam3
+
+
+def low_res_labels(ids: torch.Tensor, names: list[str], sample_names: list[str], size) -> torch.Tensor:
+    """Mask-resolution GT: index into `names`, -1 where the pixel belongs to no prompted name."""
+    lut = torch.full((max(1, len(sample_names)),), -1, dtype=torch.long, device=ids.device)
+    for p, nm in enumerate(sample_names):
+        nm = (nm or "").strip()
+        if nm in names:
+            lut[p] = names.index(nm)
+    small = torch.nn.functional.interpolate(ids[None, None].float(), size=size, mode="nearest")[0, 0].long()
+    return torch.where(small < 0, torch.full_like(small, -1), lut[small.clamp(min=0, max=len(lut) - 1)])
 
 
 @torch.no_grad()

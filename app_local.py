@@ -15,13 +15,14 @@ os.environ.setdefault("PYTHONUNBUFFERED", "1")
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
 os.environ.setdefault("FLEX_GEMM_ALGO", "explicit_gemm")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault(
     "SEGVIGEN_DINOV3",
-    r"E:\AI_New\ModelGen\weights\facebook\dinov3-vitl16-pretrain-lvd1689m",
+    os.path.join(_ROOT, "weights", "facebook", "dinov3-vitl16-pretrain-lvd1689m"),
 )
 os.environ.setdefault(
     "SEGVIGEN_RMBG",
-    r"E:\AI_New\ModelGen\weights\briaai\RMBG-2.0",
+    os.path.join(_ROOT, "weights", "briaai", "RMBG-2.0"),
 )
 
 import shutil
@@ -43,7 +44,12 @@ CKPT_FULL_SEG = os.path.join(ROOT_DIR, "ckpt", "full_seg.ckpt")
 CKPT_W_2D_MAP = os.path.join(ROOT_DIR, "ckpt", "full_seg_w_2d_map.ckpt")
 TRANSFORMS_JSON = os.path.join(ROOT_DIR, "data_toolkit", "transforms.json")
 SAM3_SCRIPT = os.path.join(ROOT_DIR, "sam3_to_2dmap.py")
-PY_SAM3 = r"E:\AI_New\ModelGen\.venv_holo\Scripts\python.exe"
+PY_SAM3 = os.environ.get(
+    "SEGVIGEN_PY_SAM3",
+    os.path.join(_ROOT, "..", "envs", "sam3", "bin", "python")
+    if os.name != "nt"
+    else r"E:\AI_New\ModelGen\.venv_holo\Scripts\python.exe",
+)
 
 TMP_DIR = os.path.join(ROOT_DIR, "_tmp_gradio_seg")
 EXAMPLES_DIR = os.path.join(ROOT_DIR, "demo_examples")
