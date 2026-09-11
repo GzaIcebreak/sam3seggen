@@ -78,20 +78,49 @@ conventions verified against the renderer (IoU 0.987).
 
 ## 📷 Results
 
-Auto-selected front view → SAM3 semantic 2D map → final textured split (mushroom + chair,
-exactly two meshes):
+Over-segment then name. Each row is **original / stain / explode**: the stain is one colour
+per named part, the explode pulls those parts apart.
+
+Mickey (coarse, `head` / `torso` / `base`; the moustache hangs on the head):
 
 <p>
-  <img src="docs/images/front_render.png" width="30%"/>
-  <img src="docs/images/sam3_2d_map.png" width="30%"/>
-  <img src="docs/images/vote_result_0.png" width="30%"/>
+  <img src="docs/images/mickey_compare.png" width="100%"/>
 </p>
-The two extracted parts — the mushroom alone / the chair with the mushroom removed:
+
+Pineapple (coarse, `leaves` / `fruit`):
 
 <p>
-  <img src="docs/images/extracted_mushroom.png" width="30%"/>
-  <img src="docs/images/chair_only.png" width="30%"/>
-  <img src="docs/images/vote_result_90.png" width="30%"/>
+  <img src="docs/images/pineapple_compare.png" width="100%"/>
+</p>
+
+Robot (`head` / `torso` / `arm` / `hand` / `leg` / `foot`; the source is untextured):
+
+<p>
+  <img src="docs/images/robot_compare.png" width="100%"/>
+</p>
+
+Dog (coarse, `head` / `body` / `leg` / `tail`):
+
+<p>
+  <img src="docs/images/dog_compare.png" width="100%"/>
+</p>
+
+Chair (coarse, `seat` / `backrest` / `leg`; `armrest` dropped — SAM3 never found it):
+
+<p>
+  <img src="docs/images/chair_compare.png" width="100%"/>
+</p>
+
+Sword (coarse, `blade` / `guard`; the grip had no mask and stayed on the blade):
+
+<p>
+  <img src="docs/images/sword_compare.png" width="100%"/>
+</p>
+
+Shelf (coarse, `shelf board` / `frame`):
+
+<p>
+  <img src="docs/images/shelf_compare.png" width="100%"/>
 </p>
 
 ## 🔨 Deployment

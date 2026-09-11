@@ -73,19 +73,48 @@ metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
 
 ## 📷 效果
 
-自动选出的正面 → SAM3 语义 2D 图 → 最终带贴图拆分结果（蘑菇 + 椅子，恰好两个 mesh）：
+过分割再命名的测试图：每行都是 **原模型 / 染色 / 爆照**。染色按命名后的部件上色，爆照把各件拉开。
+
+米奇（粗粒度，`head` / `torso` / `base`，胡子挂在头上）：
 
 <p>
-  <img src="docs/images/front_render.png" width="30%"/>
-  <img src="docs/images/sam3_2d_map.png" width="30%"/>
-  <img src="docs/images/vote_result_0.png" width="30%"/>
+  <img src="docs/images/mickey_compare.png" width="100%"/>
 </p>
-拆出的两个独立部件——提取的蘑菇 / 移除蘑菇后的椅子：
+
+菠萝（粗粒度，`leaves` / `fruit`）：
 
 <p>
-  <img src="docs/images/extracted_mushroom.png" width="30%"/>
-  <img src="docs/images/chair_only.png" width="30%"/>
-  <img src="docs/images/vote_result_90.png" width="30%"/>
+  <img src="docs/images/pineapple_compare.png" width="100%"/>
+</p>
+
+机器人（`head` / `torso` / `arm` / `hand` / `leg` / `foot`；白模所以原模型没有贴图）：
+
+<p>
+  <img src="docs/images/robot_compare.png" width="100%"/>
+</p>
+
+小狗（粗粒度，`head` / `body` / `leg` / `tail`）：
+
+<p>
+  <img src="docs/images/dog_compare.png" width="100%"/>
+</p>
+
+椅子（粗粒度，`seat` / `backrest` / `leg`；扶手 SAM3 找不到就去掉了）：
+
+<p>
+  <img src="docs/images/chair_compare.png" width="100%"/>
+</p>
+
+长剑（粗粒度，`blade` / `guard`；握把 SAM3 找不到，并进刀身）：
+
+<p>
+  <img src="docs/images/sword_compare.png" width="100%"/>
+</p>
+
+置物架（粗粒度，`shelf board` / `frame`）：
+
+<p>
+  <img src="docs/images/shelf_compare.png" width="100%"/>
 </p>
 
 ## 🔨 部署
