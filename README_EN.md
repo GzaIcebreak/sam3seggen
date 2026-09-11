@@ -213,11 +213,50 @@ Measured as how far a point on the generated solid strays from that part's own s
 | robot legs | 9.2% / 13.2% | **2.3% / 2.3%** |
 | Mickey, mean over 11 parts | 24.1% | **18.7%** |
 
-It comes with one new failure mode: on each model exactly one very small part blew up
-instead, 15 to 59 times its volume. The box crop incidentally gave a small part some
-surrounding context to anchor its scale against, and its own surface alone does not. A
-solid that overruns its prompt box by half the box's width is therefore reported, so the
-failure is at least visible. `--condition box` keeps the old behaviour to compare against.
+`--condition box` keeps the old behaviour to compare against.
+
+### X-Part is not a function of its prompt
+
+`partformer_dit` draws a part-identity embedding with `torch.randperm` on every forward
+pass, so the same part from the same prompt does not come back the same. Mickey's small
+foot overran its own box by 675%, 174%, 7%, 112%, 1615% and 882% across six runs. **A part
+that occasionally comes back many times its own size is a bad draw, not a bad prompt.**
+
+The box is what makes that checkable: it says how big the part was, and nothing whose job
+is to close a cut should need half the box again. Anything past that is drawn again from
+the same conditioning (`--redraws`, default 2), and a redraw is **kept only if it really
+does sit closer to the box** -- that foot's two redraws came back at 1615% and 882% and
+were both refused.
+
+### Fold a component too small to generate, rather than separating it (`--min_area_share`)
+
+X-Part is not reliable on a sliver, and a sliver is usually not a part anyway but a
+leftover of where the split cut. A connected component below this share of the surface is
+merged into the nearest bigger one by surface distance, taking its host's name.
+
+This also closes a hole in the old behaviour: such components used to be **dropped**, so
+their surface went into no prompt at all and nothing X-Part returned covered it. Folding
+is what dropping should always have been.
+
+The share is measured after the remesh's inner walls are removed -- those are dropped
+rather than folded, since their normals face inward and conditioning on them would
+describe a shape that is inside out in half its points -- so the numbers are about twice
+the raw share on a double-shelled mesh.
+
+Mickey's three feet sit at 1.24-1.30%, right at the edge of what X-Part can do, and
+neither conditioning is stable on them. That is the call this knob leaves to you: the
+default `0.005` keeps them and you get a foot that sometimes overruns, while `0.015` folds
+them into the base for eight clean solids with no overruns and no separate feet.
+
+### Split granularity (`--granularity`)
+
+The two size floors only make sense together -- a floor on the atoms that the units then
+undo is no floor at all -- so they share one name: `fine` 150/300, `medium` 300/600
+(default), `coarse` 800/1600. Passing `--min_atom_faces` or `--min_unit_faces` overrides
+the corresponding half.
+
+Go finer to keep a part the size of a bolt head or a button; go coarser when the parts are
+large and the split is shattering flat surfaces into panels.
 
 The default grid is `45,225 × 10`, a barely-raised 3/4 pair. A level azimuth-90 misses
 `torso` on the chest, but height costs more than it buys: at 35 degrees the camera looks

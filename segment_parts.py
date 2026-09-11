@@ -64,6 +64,25 @@ DEFAULT_CKPT = os.path.join(ROOT, "ckpt", "full_seg.ckpt")
 DEFAULT_SAMPLES = 7
 DEFAULT_AZIMUTH_JITTER = 30.0
 
+# (min_atom_faces, min_unit_faces) under one name, because the two only make sense
+# together -- a floor on the atoms that the units then undo is no floor at all.
+#
+# Sweeping both against naming quality on the robot and Mickey, the named part count came
+# out the same at every setting from 150/300 to 800/1600: over-segmenting costs the merge
+# nothing, it only fuses. What the floors do change is how much surface gets named by an
+# actual vote instead of by the nearest-neighbour fallback, since a unit too small for any
+# camera to see well casts no vote, and that peaks in the middle (robot 75.0% at fine,
+# 76.1% at medium, 73.3% at coarse). Hence the default.
+#
+# Go finer to keep a part the size of a bolt head or a button; go coarser when the parts
+# are large and the split is shattering flat surfaces into panels.
+GRANULARITY = {
+    "fine": (150, 300),
+    "medium": (300, 600),
+    "coarse": (800, 1600),
+}
+DEFAULT_GRANULARITY = "medium"
+
 
 def sample_azimuths(count, azimuth, jitter):
     """Conditioning views for the full_seg samples: the base view first, then jittered.
@@ -102,6 +121,7 @@ def segment_parts(
     ckpt=None,
     transforms=None,
     color_tol=None,
+    granularity=DEFAULT_GRANULARITY,
     min_atom_faces=None,
     mirror="auto",
     min_unit_faces=None,
@@ -153,6 +173,11 @@ def segment_parts(
             Mickey's samples came back with 2-6 labels, and those near-blank partitions
             fragment the meet along boundaries that are not real. 9 samples at 60 gave
             more atoms than at 30 and two fewer named parts.
+        granularity: how fine the split may get, as a name for both size floors at once
+            (see GRANULARITY). Passing `min_atom_faces` or `min_unit_faces` overrides the
+            corresponding half. Over-segmenting is close to free -- the merge only ever
+            fuses -- so this is less about the part count than about whether the units
+            stay big enough for a camera to vote on.
         mirror: "auto" also intersects each sample reflected across the model's symmetry
             plane, if it has one -- full_seg often cuts a joint on one side only.
         merge: "off" stops after the units and writes one node per unit; "name" and "unit"
@@ -190,8 +215,12 @@ def segment_parts(
     py_sam3 = py_sam3 or DEFAULT_PY_SAM3
     py_self = sys.executable
     color_tol = DEFAULT_COLOR_TOL if color_tol is None else color_tol
-    min_atom_faces = DEFAULT_MIN_FACES if min_atom_faces is None else min_atom_faces
-    min_unit_faces = DEFAULT_MIN_UNIT_FACES if min_unit_faces is None else min_unit_faces
+    if granularity not in GRANULARITY:
+        raise ValueError(f"granularity must be one of {tuple(GRANULARITY)}, "
+                         f"got {granularity!r}")
+    atom_floor, unit_floor = GRANULARITY[granularity]
+    min_atom_faces = atom_floor if min_atom_faces is None else min_atom_faces
+    min_unit_faces = unit_floor if min_unit_faces is None else min_unit_faces
 
     work_dir = os.path.abspath(work_dir or os.path.join(out_dir, "work_parts"))
     atoms_npy = os.path.join(work_dir, "atoms.npy")
@@ -304,6 +333,12 @@ def main():
     parser.add_argument("--transforms", default=None, help=f"default: {DEFAULT_TRANSFORMS}")
     parser.add_argument("--color_tol", type=float, default=None,
                         help="RGB distance separating two colours within one sample")
+    parser.add_argument("--granularity", default=DEFAULT_GRANULARITY,
+                        choices=tuple(GRANULARITY),
+                        help="How fine the split is allowed to get: sets both size floors "
+                             "at once (%s). Either floor given explicitly wins."
+                             % ", ".join(f"{k} {v[0]}/{v[1]}"
+                                         for k, v in GRANULARITY.items()))
     parser.add_argument("--min_atom_faces", type=int, default=None,
                         help="Slivers under this many faces join their majority neighbour")
     parser.add_argument("--mirror", default="auto", choices=("auto", "none", "x", "y", "z"),
@@ -366,6 +401,7 @@ def main():
         ckpt=args.ckpt,
         transforms=args.transforms,
         color_tol=args.color_tol,
+        granularity=args.granularity,
         min_atom_faces=args.min_atom_faces,
         mirror=args.mirror,
         min_unit_faces=args.min_unit_faces,
