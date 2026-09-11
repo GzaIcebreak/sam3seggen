@@ -116,7 +116,7 @@ class PipelineOptions:
     with_texture: bool = True
     texture_size: int = DEFAULT_TEXTURE_SIZE
     reuse: bool = True
-    strict_parts: bool = True
+    strict_parts: bool = False
     sam3_threshold: float = DEFAULT_SAM3_THRESHOLD
     concept_bank: str = DEFAULT_CONCEPT_BANK
     py_xpart: str | None = None
@@ -202,7 +202,9 @@ class PipelineOptions:
         kwargs = {}
         if payload.pop("no_concept_bank", False):
             kwargs["concept_bank"] = ""
-        if "allow_partial" in payload:
+        if payload.get("strict_parts") is not None:
+            kwargs["strict_parts"] = bool(payload.pop("strict_parts"))
+        elif "allow_partial" in payload:
             kwargs["strict_parts"] = not bool(payload.pop("allow_partial"))
         if payload.get("unassigned_to") == "":
             payload["unassigned_to"] = None
@@ -242,7 +244,8 @@ class PipelineOptions:
             with_texture=not getattr(args, "no_texture", False),
             texture_size=getattr(args, "texture_size", DEFAULT_TEXTURE_SIZE),
             reuse=not getattr(args, "no_reuse", False),
-            strict_parts=not getattr(args, "allow_partial", False),
+            strict_parts=bool(getattr(args, "strict_parts", False))
+            and not getattr(args, "allow_partial", False),
             sam3_threshold=getattr(args, "sam3_threshold", DEFAULT_SAM3_THRESHOLD),
             concept_bank=concept_bank,
             py_xpart=getattr(args, "py_xpart", None),
@@ -298,7 +301,11 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--no_reuse", action="store_true",
                         help="Re-run every stage instead of reusing cached intermediates")
     parser.add_argument("--allow_partial", action="store_true",
-                        help="Accept requested names that ended up with no faces")
+                        help="Default: a prompt SAM3 never sees is skipped. Kept for "
+                             "compatibility; the run already continues without it.")
+    parser.add_argument("--strict_parts", action="store_true",
+                        help="Fail if a requested name got no mask or no faces, instead "
+                             "of skipping that prompt and finishing the rest")
     parser.add_argument("--no_texture", action="store_true",
                         help="Skip the Blender bake; parts get a flat placeholder colour")
     parser.add_argument("--texture_size", type=int, default=DEFAULT_TEXTURE_SIZE)

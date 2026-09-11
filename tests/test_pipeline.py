@@ -51,6 +51,7 @@ class PipelineDefaultsTest(unittest.TestCase):
         self.assertEqual(options.flat_paint, DEFAULT_FLAT_PAINT)
         self.assertEqual(options.view_azimuths, "45,225")
         self.assertEqual(options.view_elevations, "10")
+        self.assertFalse(options.strict_parts)
         snapshot = options.public()["defaults"]
         self.assertEqual(snapshot["sam3_threshold"], 0.4)
         self.assertEqual(snapshot["color_tol"], MEET_COLOR_TOL)
@@ -97,6 +98,12 @@ class PipelineKwargsTest(unittest.TestCase):
         self.assertFalse(options.strict_parts)
         self.assertEqual(options.concept_bank, "")
         self.assertIsNone(options.unassigned_to)
+
+    def test_strict_parts_wins_over_allow_partial_in_a_mapping(self):
+        options = PipelineOptions.from_mapping({
+            "allow_partial": True, "strict_parts": True,
+        })
+        self.assertTrue(options.strict_parts)
 
 
 class PipelineReexportTest(unittest.TestCase):

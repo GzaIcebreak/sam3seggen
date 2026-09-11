@@ -6,8 +6,10 @@ Default is concept-bank v3 + the same smallest-first overlay maps.png used: a pi
 belongs to at most one prompt, the more specific mask winning. `--raw` keeps the
 overlapping unions instead, which is what used to hand the backpack to `arm`.
 
-A concept that no view detects is an error; a concept missing from *some* views is
-normal and expected (a hand is hidden from behind).
+A concept missing from *some* views is normal (a hand is hidden from behind). A
+concept no view detects is skipped by default -- the rest of the prompts still
+vote -- so a leftover word does not abort the run. `--require_masks` restores
+the old fail.
 """
 from __future__ import annotations
 
@@ -39,6 +41,15 @@ def concept_table(specs):
                 concepts.append(prompt)
                 owners.append(name)
     return concepts, owners
+
+
+def unseen_concepts(detections, concepts, owners, unassigned_to=None):
+    """Concepts no view detected, ignoring the catch-all part (it is allowed to be empty)."""
+    return [
+        concept
+        for concept, count in detections.items()
+        if count == 0 and owners[concepts.index(concept)] != unassigned_to
+    ]
 
 
 def overlay_v3(masks, foreground):
@@ -75,6 +86,8 @@ def main():
                         help="v3 bank.pt; the maps.png stain. Empty string = raw SAM3.")
     parser.add_argument("--raw", action="store_true",
                         help="Keep overlapping unions instead of the v3 smallest-first overlay")
+    parser.add_argument("--require_masks", action="store_true",
+                        help="Exit if a prompt (other than --unassigned_to) is unseen in every view")
     args = parser.parse_args()
 
     views_dir = os.path.abspath(args.views_dir)
@@ -130,13 +143,11 @@ def main():
 
     # Concepts feeding the --unassigned_to part may legitimately see nothing: that
     # part's job is to absorb whatever no mask claimed, so it needs no detections.
-    never_seen = [
-        concept
-        for concept, count in detections.items()
-        if count == 0 and owners[concepts.index(concept)] != args.unassigned_to
-    ]
-    if never_seen:
+    never_seen = unseen_concepts(detections, concepts, owners, args.unassigned_to)
+    if never_seen and args.require_masks:
         raise SystemExit(f"SAM3 found no mask in any view for: {never_seen}")
+    if never_seen:
+        print(f"skipping unused prompts (no mask in any view): {never_seen}")
 
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

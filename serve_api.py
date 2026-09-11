@@ -210,7 +210,11 @@ async def segment(
     sam3_threshold: float = Form(_DEFAULTS.sam3_threshold),
     concept_bank: str | None = Form(None),
     no_concept_bank: bool = Form(False),
-    allow_partial: bool = Form(False, description="Accept requested parts with no faces."),
+    allow_partial: bool = Form(
+        True, description="Skip a prompt SAM3 never saw and finish the rest (default). "
+                          "Set false (or pass strict_parts) to fail the job instead."),
+    strict_parts: bool = Form(
+        False, description="Fail if a requested name got no mask or no faces."),
 ) -> dict:
     if granularity not in GRANULARITY:
         raise HTTPException(400, f"granularity must be one of {tuple(GRANULARITY)}")
@@ -256,6 +260,7 @@ async def segment(
         "concept_bank": concept_bank,
         "no_concept_bank": no_concept_bank,
         "allow_partial": allow_partial,
+        "strict_parts": strict_parts,
     })
     if not _gpu.acquire(blocking=False):
         raise HTTPException(409, "another segmentation is already running on this GPU")

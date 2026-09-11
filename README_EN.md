@@ -281,7 +281,8 @@ Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached
 | `--redraws` | int | `2` | redraw a solid that overruns its box |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part reconstruction |
 | `--texture_size` | int | `2048` | bake resolution |
-| `--no_texture` / `--no_reuse` / `--allow_partial` | flag | off | skip bake / ignore cache / allow empty parts |
+| `--no_texture` / `--no_reuse` | flag | off | skip bake / ignore cache |
+| `--strict_parts` | flag | off | fail if a prompt got no mask or no faces; default skips that word and continues |
 | `--unassigned_to` | part name | none | absorb unclaimed units; else they are dropped |
 
 ### What more samples buy is a less lucky split, not a finer one
@@ -474,8 +475,10 @@ overlay.
 - `--sam3_threshold`: defaults to the calibrated value for the painter in use — 0.4 with the
   concept bank, 0.3 without.
 
-When any prompt ends up with no mask, strict validation (the default) reports `SAM3 produced
-no mask for requested component(s)`; relax it with `--allow_partial`.
+When any prompt ends up with no mask, the current pipeline skips that word and
+continues. The old 2D route still reports `SAM3 produced no mask for requested
+component(s)` unless you pass `--allow_partial`. Pass `--strict_parts` to make
+the current pipeline fail the same way.
 
 Python:
 

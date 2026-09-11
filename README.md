@@ -262,7 +262,8 @@ python segment_parts.py \
 | `--redraws` | int | `2` | 超框实体重抽次数 |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part 重建 |
 | `--texture_size` | int | `2048` | 烘焙分辨率 |
-| `--no_texture` / `--no_reuse` / `--allow_partial` | flag | 关 | 跳过烘焙 / 不复用缓存 / 允许缺件 |
+| `--no_texture` / `--no_reuse` | flag | 关 | 跳过烘焙 / 不复用缓存 |
+| `--strict_parts` | flag | 关 | 某个提示词完全没有掩码或面时失败；默认跳过该词继续跑 |
 | `--unassigned_to` | 部件名 | 无 | 无票单元并入该部件；否则丢弃 |
 
 ### 采样数买到的不是更细，是更少靠运气
@@ -413,7 +414,8 @@ python segment_api.py \
 - `--sam3_threshold`：默认按画笔取标定值——带概念库 0.4，不带 0.3。
 
 任一提示词没有掩码时，严格校验（默认）会报
-`SAM3 produced no mask for requested component(s)`；放宽用 `--allow_partial`。
+`SAM3 produced no mask for requested component(s)`。当前主线默认跳过没有掩码的词并继续；
+旧的 2D 路线仍用 `--allow_partial` 放宽。要主线也失败，加 `--strict_parts`。
 
 Python 调用：
 

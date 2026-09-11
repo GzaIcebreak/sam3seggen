@@ -130,7 +130,7 @@ def segment_parts(
     min_area_share=DEFAULT_MIN_AREA_SHARE,
     redraws=DEFAULT_REDRAWS,
     reuse=True,
-    strict_parts=True,
+    strict_parts=False,
     with_texture=True,
     texture_size=DEFAULT_TEXTURE_SIZE,
 ):
@@ -242,7 +242,8 @@ def segment_parts(
         guidance(
             glb, work_dir, sample_glbs[0], canonical_prompts(normalize_part_specs(prompts)),
             unassigned_to, view_azimuths, view_elevations, radius, resolution,
-            py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse)
+            py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
+            require_masks=strict_parts)
     sample_glbs += [full_seg(index) for index in range(1, samples)]
 
     print(f"[split] intersecting {samples} partitions into atoms ...")

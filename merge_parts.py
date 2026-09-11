@@ -152,7 +152,7 @@ def render_views(glb, views_dir, azimuths=DEFAULT_VIEW_AZIMUTHS,
 
 def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
                model=DEFAULT_SAM3, threshold=DEFAULT_SAM3_THRESHOLD, reuse=True,
-               concept_bank=DEFAULT_CONCEPT_BANK, raw=False):
+               concept_bank=DEFAULT_CONCEPT_BANK, raw=False, require_masks=False):
     if reuse and os.path.isfile(out_npz):
         print(f"[guidance] reusing masks for {prompts} ({os.path.basename(out_npz)})")
         return out_npz
@@ -165,6 +165,8 @@ def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
     ]
     if raw:
         command.append("--raw")
+    if require_masks:
+        command.append("--require_masks")
     if unassigned_to:
         command += ["--unassigned_to", unassigned_to]
     # --prompts is nargs="+" and would otherwise swallow the flags after it.
@@ -207,7 +209,8 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
              view_azimuths=DEFAULT_VIEW_AZIMUTHS, view_elevations=DEFAULT_VIEW_ELEVATIONS,
              radius=DEFAULT_RADIUS, resolution=DEFAULT_RESOLUTION, py_sam3=None,
              sam3_model=DEFAULT_SAM3, sam3_threshold=DEFAULT_SAM3_THRESHOLD,
-             concept_bank=DEFAULT_CONCEPT_BANK, flat_paint="auto", reuse=True):
+             concept_bank=DEFAULT_CONCEPT_BANK, flat_paint="auto", reuse=True,
+             require_masks=False):
     """Render, flat-paint if needed, run SAM3, and draw the overlays a human reviews.
 
     Returns (views_dir, masks_npz). Cheap to call twice: everything downstream of the
@@ -225,7 +228,8 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
         os.path.join(work_dir, masks_name(
             prompts, unassigned_to, sam3_threshold, sam3_model,
             view_azimuths, view_elevations, bank, "v3", painted)),
-        unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse, concept_bank=bank)
+        unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse, concept_bank=bank,
+        require_masks=require_masks)
     # Overlay on the real render even when SAM3 read the painted one: they are rasterised
     # through the same camera, and a reviewer needs to see the actual model under a mask.
     paint_guidance(views_dir, masks_npz, os.path.join(work_dir, "guidance"))
@@ -273,7 +277,7 @@ def merge_parts(
     min_area_share=DEFAULT_MIN_AREA_SHARE,
     redraws=DEFAULT_REDRAWS,
     reuse=True,
-    strict_parts=True,
+    strict_parts=False,
     with_texture=True,
     texture_size=DEFAULT_TEXTURE_SIZE,
 ):
@@ -324,7 +328,8 @@ def merge_parts(
     views_dir, masks_npz = guidance(
         glb, split_dir, mesh_path, prompt_list, unassigned_to,
         view_azimuths, view_elevations, radius, resolution,
-        py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse)
+        py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
+        require_masks=strict_parts)
 
     print("[merge] naming units by multi-view SAM3 voting ...")
     reference = load_single_mesh(mesh_path)
