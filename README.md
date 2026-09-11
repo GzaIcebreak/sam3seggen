@@ -87,18 +87,6 @@ metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
   <img src="docs/images/pineapple_compare.png" width="100%"/>
 </p>
 
-机器人（`head` / `torso` / `arm` / `hand` / `leg` / `foot`；白模所以原模型没有贴图）：
-
-<p>
-  <img src="docs/images/robot_compare.png" width="100%"/>
-</p>
-
-置物架（粗粒度，`shelf board` / `frame`）：
-
-<p>
-  <img src="docs/images/shelf_compare.png" width="100%"/>
-</p>
-
 粗粒度拆分（`--complete off`，每模型 7 次 `full_seg`）在 RTX 5090 上的墙钟曲线。每个锯齿是一次 `full_seg` 子进程：显存顶到 13–15 GB，进程退出立刻掉回接近 0。峰值显存 **15.24 GB**，管线 RSS 峰值 8.7 GB。
 
 <p>

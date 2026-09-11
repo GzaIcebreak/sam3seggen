@@ -93,18 +93,6 @@ Pineapple (coarse, `leaves` / `fruit`):
   <img src="docs/images/pineapple_compare.png" width="100%"/>
 </p>
 
-Robot (`head` / `torso` / `arm` / `hand` / `leg` / `foot`; the source is untextured):
-
-<p>
-  <img src="docs/images/robot_compare.png" width="100%"/>
-</p>
-
-Shelf (coarse, `shelf board` / `frame`):
-
-<p>
-  <img src="docs/images/shelf_compare.png" width="100%"/>
-</p>
-
 Wall-clock of a coarse split (`--complete off`, 7 `full_seg` samples per model) on
 an RTX 5090. Each tooth is one `full_seg` child: VRAM peaks at 13–15 GB, then
 drops to ~0 when the process exits. Peak VRAM **15.24 GB**, peak pipeline RSS 8.7 GB.
