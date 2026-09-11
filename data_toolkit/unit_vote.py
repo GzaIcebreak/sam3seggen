@@ -43,7 +43,10 @@ from data_toolkit.parts_rebake import load_single_mesh, welded_face_adjacency  #
 # about X. Measured by spike_align_check.py, reused by spike_lift.py.
 SEG_TO_CAMERA = np.diag([1.0, -1.0, -1.0])
 
-DEFAULT_MIN_UNIT_FACES = 300
+# Paired with meet_samples.DEFAULT_MIN_FACES; see the measurement there. Coarser still
+# does keep the parts -- the robot survives 1600 -- but the vote coverage falls away again
+# (76.1% at 600, 73.3% at 1000), because by then units span two parts.
+DEFAULT_MIN_UNIT_FACES = 600
 DEFAULT_MIN_RECALL = 0.5
 DEFAULT_MIN_VISIBLE_PIXELS = 50
 

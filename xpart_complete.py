@@ -17,6 +17,19 @@ completed. Two things have to happen first:
   therefore dropped. Containment across parts is left alone -- a hand sits inside the
   arm's box and is still its own prompt.
 
+A box on its own is a lossy way to describe a part, and it is where the quality goes.
+X-Part conditions each part on the source surface it finds *inside the box*, so anything
+else that passes through the box is handed over as part of the prompt: the robot's torso
+box also contains the tops of both legs, and what comes back is a torso with legs. The box
+cannot say otherwise, because a box is all it is.
+
+We are not limited to a box. The split already decided, per face, which part each triangle
+belongs to, so --condition surface samples the conditioning points from exactly those
+faces and passes them as `part_surface_inbbox` -- the same tensor X-Part would have built
+by cropping, only built from the assignment instead. The box still goes along; it is what
+sizes the token budget. This is the tight version of the handoff, and the box-cropped one
+is kept as --condition box to compare against.
+
 Run with the X-Part venv (see --xpart_root); nothing here imports SegviGen.
 """
 from __future__ import annotations
@@ -33,6 +46,25 @@ DEFAULT_XPART_ROOT = "/root/autodl-tmp/Hunyuan3D-Part/XPart"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_CONTAINMENT = 0.98
 DEFAULT_FIT_TOLERANCE = 0.05
+# What X-Part samples per part; the conditioner's positional encoding is fitted to it.
+XPART_CONDITION_POINTS = 81920
+CONDITION_MODES = ("surface", "box")
+# A completion is meant to close the cut, which grows the part a little. Half the box
+# again is far past that, and in practice separates the failures from the growth.
+BOX_ESCAPE_WARNING = 0.5
+
+
+def box_escape(generated_bounds, box):
+    """How far a generated solid reaches outside its prompt box, per the box's own size.
+
+    Zero if it stays inside; 1.0 if it overshoots by the full width of the box on some
+    axis. Measured per axis rather than by volume so that one runaway direction, which is
+    what the failures look like, is not averaged away by two well-behaved ones.
+    """
+    extent = np.maximum(box[1] - box[0], 1e-9)
+    over = np.maximum(box[0] - generated_bounds[0], 0) + \
+        np.maximum(generated_bounds[1] - box[1], 0)
+    return float((over / extent).max())
 
 
 def source_frame_transform(parts_bounds, source_bounds, tolerance=DEFAULT_FIT_TOLERANCE):
@@ -95,7 +127,7 @@ def welded_components(mesh):
 
 def component_boxes(nodes, min_area_share=DEFAULT_MIN_AREA_SHARE,
                     containment=DEFAULT_CONTAINMENT):
-    """One axis-aligned box per part instance: (boxes [K,2,3], rows of metadata)."""
+    """Per part instance: (boxes [K,2,3], rows of metadata, the surfaces they came from)."""
     total_area = sum(float(mesh.area) for _, mesh in nodes)
     candidates = []
     for name, mesh in nodes:
@@ -109,6 +141,7 @@ def component_boxes(nodes, min_area_share=DEFAULT_MIN_AREA_SHARE,
                 "faces": int(len(faces)),
                 "area_share": area / total_area,
                 "box": np.stack([corners.min(axis=0), corners.max(axis=0)]),
+                "surface": mesh.submesh([faces], append=True),
             })
 
     boxes = np.stack([c["box"] for c in candidates]) if candidates else np.zeros((0, 2, 3))
@@ -128,8 +161,41 @@ def component_boxes(nodes, min_area_share=DEFAULT_MIN_AREA_SHARE,
                 break
         if not inside:
             keep.append(index)
-    rows = [dict(candidates[i], box=candidates[i]["box"].tolist()) for i in keep]
-    return boxes[keep], rows
+    rows = [{k: v for k, v in candidates[i].items() if k != "surface"} | {
+        "box": candidates[i]["box"].tolist()} for i in keep]
+    return boxes[keep], rows, [candidates[i]["surface"] for i in keep]
+
+
+def xpart_normalization(bounds):
+    """The (centre, scale) X-Part's normalize_mesh derives from a mesh's bounding box.
+
+    Reproduced rather than called because the conditioning points have to land in the same
+    frame as the mesh the pipeline normalises internally, and by the time it has done so it
+    no longer accepts anything of ours.
+    """
+    centre = bounds.mean(axis=0)
+    return centre, float(np.max(bounds[1] - bounds[0]) / 2 / 0.8)
+
+
+def part_surface_condition(surfaces, centre, scale, num_points=XPART_CONDITION_POINTS,
+                           seed=42):
+    """[K, N, 7] of (point, normal, sharp-edge flag) sampled from each part's own faces.
+
+    The flag is the seventh channel X-Part's own sampler fills with zeros; it marks points
+    taken from sharp edges, which it never does for a box crop and we do not either.
+    """
+    samples = []
+    for surface in surfaces:
+        if surface.area <= 0:
+            raise SystemExit("a part component has no area; cannot sample its surface")
+        points, face_index = trimesh.sample.sample_surface(surface, num_points, seed=seed)
+        normals = surface.face_normals[face_index]
+        samples.append(np.hstack([
+            (np.asarray(points) - centre) / scale,
+            np.asarray(normals),
+            np.zeros((num_points, 1)),
+        ]))
+    return np.stack(samples).astype(np.float32)
 
 
 def load_pipeline(model_path):
@@ -185,6 +251,10 @@ def main():
     parser.add_argument("--num_chunks", type=int, default=50000,
                         help="Query points per marching-cubes block; X-Part's own 400000 "
                              "needs 3 GiB a block and runs out on a 32 GB card")
+    parser.add_argument("--condition", choices=CONDITION_MODES, default="surface",
+                        help="What describes a part to X-Part: the faces the split "
+                             "assigned to it, or (box) whatever of the source falls "
+                             "inside its bounding box, which is X-Part's own default")
     parser.add_argument("--boxes_only", action="store_true",
                         help="Write the box prompts and a preview, without loading X-Part")
     parser.add_argument("--no_source_frame", dest="source_frame", action="store_false",
@@ -201,7 +271,7 @@ def main():
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
     nodes = load_part_nodes(os.path.abspath(args.parts))
-    boxes, rows = component_boxes(nodes, args.min_area_share, args.containment)
+    boxes, rows, surfaces = component_boxes(nodes, args.min_area_share, args.containment)
     if not len(boxes):
         raise SystemExit("no part component survived the filters; lower --min_area_share")
 
@@ -218,6 +288,9 @@ def main():
         boxes = to_source_frame(boxes, scale, parts_centre, source_centre)
         for row, box in zip(rows, boxes):
             row["box"] = box.tolist()
+        for surface in surfaces:
+            surface.vertices = to_source_frame(
+                np.asarray(surface.vertices), scale, parts_centre, source_centre)
 
     print(f"{len(boxes)} box prompts:")
     for row in rows:
@@ -250,6 +323,14 @@ def main():
     pipeline = load_pipeline(args.model_path)
     pipeline.to(device="cuda", dtype=torch.float32)
 
+    condition = None
+    if args.condition == "surface":
+        centre, norm_scale = xpart_normalization(source.bounds)
+        print(f"sampling {XPART_CONDITION_POINTS} points from each part's own faces "
+              f"(normalisation centre {np.round(centre, 4)}, scale {norm_scale:.4f})")
+        condition = torch.from_numpy(part_surface_condition(
+            surfaces, centre, norm_scale, seed=args.seed))
+
     # Parts are the batch dimension -- attention never crosses them, and the part-id
     # embedding is re-randomised on every call anyway -- so generating them a few at a
     # time is not an approximation. It is also the only way twelve of them fit in memory.
@@ -258,11 +339,17 @@ def main():
         chunk = boxes[start:start + args.parts_per_batch]
         named = [rows[start + i]["name"] for i in range(len(chunk))]
         print(f"[{start + 1}-{start + len(chunk)}/{len(boxes)}] {', '.join(named)}")
+        # The two branches disagree on the boxes' shape on purpose. check_inputs adds the
+        # batch dimension itself, but only on the path where it also samples the
+        # conditioning; hand it the conditioning and that line is skipped, so the batch
+        # dimension becomes ours to add. The docstring's [B,K,2,3] is right for one and
+        # wrong for the other.
+        prompt = ({"aabb": chunk.astype(np.float32)} if condition is None else
+                  {"aabb": chunk.astype(np.float32)[None],
+                   "part_surface_inbbox": condition[start:start + len(chunk)][None]})
         parts, _ = pipeline(
             mesh_path=os.path.abspath(args.glb),
-            # [K, 2, 3], not the [B, K, 2, 3] the docstring claims: check_inputs indexes
-            # the boxes directly and adds the batch dimension itself.
-            aabb=chunk.astype(np.float32),
+            **prompt,
             octree_resolution=args.octree_resolution,
             # The decode queries the implicit function in blocks of this many points and
             # X-Part defaults to 400k, which alone wants 3 GiB on top of everything the
@@ -281,6 +368,14 @@ def main():
                   "falling back to positional names")
         for offset, geometry in enumerate(geometries):
             label = named[offset] if aligned else f"part_{start + offset:02d}"
+            escaped = box_escape(geometry.bounds, chunk[offset])
+            if escaped > BOX_ESCAPE_WARNING:
+                # Surface conditioning trades the box crop's incidental context for
+                # precision, and a small part occasionally loses its sense of scale
+                # without it: one part per model came back many times too big. The box
+                # says how big the part was, so the failure is at least detectable.
+                print(f"  {label} overruns its box by {escaped:.0%}; the generated solid "
+                      "is unlikely to be that part")
             out.add_geometry(geometry, geom_name=f"{start + offset:02d}_{label}")
         torch.cuda.empty_cache()
 

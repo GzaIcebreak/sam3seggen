@@ -51,16 +51,17 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from merge_parts import (
-    COMPLETE_MODES, DEFAULT_CONCEPT_BANK, DEFAULT_PY_XPART, DEFAULT_RADIUS,
-    DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD, DEFAULT_VIEW_AZIMUTHS,
-    DEFAULT_VIEW_ELEVATIONS, DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS, FLAT_PAINT_MODES,
+    COMPLETE_MODES, CONDITION_MODES, DEFAULT_CONCEPT_BANK, DEFAULT_CONDITION,
+    DEFAULT_PY_XPART, DEFAULT_RADIUS, DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD,
+    DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS, DEFAULT_XPART_ROOT,
+    DEFAULT_XPART_WEIGHTS, FLAT_PAINT_MODES,
     canonical_prompts, export_labelled, guidance, merge_parts,
 )
 from prompt_specs import normalize_part_specs
 from segment_api import DEFAULT_PY_SAM3, DEFAULT_SAM3, DEFAULT_TRANSFORMS, _run
 
 DEFAULT_CKPT = os.path.join(ROOT, "ckpt", "full_seg.ckpt")
-DEFAULT_SAMPLES = 5
+DEFAULT_SAMPLES = 7
 DEFAULT_AZIMUTH_JITTER = 30.0
 
 
@@ -122,6 +123,7 @@ def segment_parts(
     xpart_weights=DEFAULT_XPART_WEIGHTS,
     octree_resolution=512,
     seed=42,
+    condition=DEFAULT_CONDITION,
     reuse=True,
     strict_parts=True,
     with_texture=True,
@@ -134,13 +136,17 @@ def segment_parts(
             part, optionally under a name ("body=head+face+hand"). Only `merge="off"`
             accepts no prompts at all.
         samples: how many full_seg samples to intersect. 1 reproduces the old single-sample
-            behaviour. 5 is enough for the robot, but not in general: on Mickey it leaves
-            13 atoms whose largest covers 48% of the surface, and the ears never get cut
-            away from the head, so no prompt can name them. 9 gives 40 atoms, largest 19%,
-            and `ear` and `arm` appear. Reading each sample more finely does not
-            substitute -- dropping color_tol from 20 to 3 multiplied the labels per sample
-            twentyfold and produced the same 13 atoms, because the extra labels are
-            speckle. Only another sample can draw a cut that no sample drew.
+            behaviour. What more samples buy is not a finer split but a less lucky one.
+            One draw of 5 left Mickey with 13 atoms, the largest covering 48% of the
+            surface and the ears never cut away from the head, so no prompt could name
+            them; a different draw of 5 gave 34 atoms and all six parts. That spread
+            between draws is wider than the gap between 5 and 9, and it is what the extra
+            samples close: 7 and 9 both land on the same six parts. 9 is not worth the two
+            extra passes -- it adds atoms (40 against 34) without adding a part.
+            Reading each sample more finely does not substitute -- dropping color_tol from
+            20 to 3 multiplied the labels per sample twentyfold and produced the same 13
+            atoms, because the extra labels are speckle. Only another sample can draw a
+            cut that no sample drew.
         azimuth / azimuth_jitter: the conditioning camera, and how far the extra samples
             orbit either side of it. See sample_azimuths. Widening the jitter is not a
             substitute for more samples and can cost parts: at 60 degrees several of
@@ -261,7 +267,7 @@ def segment_parts(
             concept_bank=concept_bank, flat_paint=flat_paint, units=units,
             complete=complete, py_xpart=py_xpart, xpart_root=xpart_root,
             xpart_weights=xpart_weights, octree_resolution=octree_resolution, seed=seed,
-            reuse=reuse, strict_parts=strict_parts,
+            condition=condition, reuse=reuse, strict_parts=strict_parts,
             with_texture=with_texture, texture_size=texture_size,
         )
 
@@ -338,6 +344,9 @@ def main():
     parser.add_argument("--complete", default="off", choices=COMPLETE_MODES,
                         help="Hand the parts to X-Part: boxes = prompts only, "
                              "full = also regenerate each part as a closed solid")
+    parser.add_argument("--condition", default=DEFAULT_CONDITION, choices=CONDITION_MODES,
+                        help="What describes a part to X-Part: the faces the split "
+                             "assigned to it, or (box) whatever falls inside its box")
     parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
     parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
     parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)
@@ -378,6 +387,7 @@ def main():
         xpart_weights=args.xpart_weights,
         octree_resolution=args.octree_resolution,
         seed=args.seed,
+        condition=args.condition,
         reuse=not args.no_reuse,
         strict_parts=not args.allow_partial,
         with_texture=not args.no_texture,

@@ -51,6 +51,9 @@ FLAT_PAINT_MODES = ("auto", "on", "off")
 # Our parts are open where they were cut. X-Part regenerates each one as a closed solid
 # from the whole model plus a box prompt; "boxes" writes those prompts without loading it.
 COMPLETE_MODES = ("off", "boxes", "full")
+# A box also contains whatever else passes through it; our split knows the faces exactly.
+CONDITION_MODES = ("surface", "box")
+DEFAULT_CONDITION = "surface"
 DEFAULT_PY_XPART = os.environ.get(
     "SEGVIGEN_PY_XPART", "/root/autodl-tmp/envs/xpart/bin/python")
 DEFAULT_XPART_ROOT = os.environ.get(
@@ -285,6 +288,7 @@ def merge_parts(
     xpart_weights=DEFAULT_XPART_WEIGHTS,
     octree_resolution=512,
     seed=42,
+    condition=DEFAULT_CONDITION,
     reuse=True,
     strict_parts=True,
     with_texture=True,
@@ -374,7 +378,8 @@ def merge_parts(
         validate_named_rows(expected_names, manifest, key="name")
     print(f"saved {out_glb} ({len(manifest)} parts)")
     complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
-                   py_xpart, xpart_root, xpart_weights, octree_resolution, seed)
+                   py_xpart, xpart_root, xpart_weights, octree_resolution, seed,
+                   condition)
     return manifest
 
 
@@ -400,19 +405,22 @@ def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
 
 def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
                    xpart_root=DEFAULT_XPART_ROOT, model_path=DEFAULT_XPART_WEIGHTS,
-                   octree_resolution=512, seed=42):
-    """Hand the parts to X-Part as box prompts so it can close them into solids.
+                   octree_resolution=512, seed=42, condition=DEFAULT_CONDITION):
+    """Hand the parts to X-Part so it can close them into solids.
 
     Splitting one shell leaves every part open where it was cut. X-Part regenerates each
-    as a watertight shape from the whole model plus a box, so the cut is healed by
-    generation rather than by capping geometry we never had. See xpart_complete.py -- it
-    runs in its own venv and imports nothing from here, hence the dispatch.
+    as a watertight shape from the whole model plus a prompt, so the cut is healed by
+    generation rather than by capping geometry we never had. The prompt is a box and, by
+    default, the surface our split assigned to that part -- a box alone also contains
+    whatever else passes through it. See xpart_complete.py -- it runs in its own venv and
+    imports nothing from here, hence the dispatch.
     """
     if mode not in COMPLETE_MODES:
         raise ValueError(f"complete must be one of {COMPLETE_MODES}, got {mode!r}")
     if mode == "off":
         return None
-    print(f"[complete] X-Part box prompts from {os.path.basename(parts_glb)} ({mode}) ...")
+    print(f"[complete] X-Part prompts from {os.path.basename(parts_glb)} "
+          f"({mode}, {condition} conditioning) ...")
     os.makedirs(out_dir, exist_ok=True)
     command = [
         # "boxes" is pure trimesh, so it stays in this interpreter and needs no X-Part.
@@ -424,7 +432,8 @@ def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
         command.append("--boxes_only")
     else:
         command += ["--xpart_root", xpart_root, "--model_path", model_path,
-                    "--octree_resolution", octree_resolution, "--seed", seed]
+                    "--octree_resolution", octree_resolution, "--seed", seed,
+                    "--condition", condition]
     _run(command)
     with open(os.path.join(out_dir, "boxes.json"), "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -474,6 +483,9 @@ def main():
     parser.add_argument("--complete", default="off", choices=COMPLETE_MODES,
                         help="Hand the parts to X-Part: boxes = prompts only, "
                              "full = also regenerate each part as a closed solid")
+    parser.add_argument("--condition", default=DEFAULT_CONDITION, choices=CONDITION_MODES,
+                        help="What describes a part to X-Part: the faces the split "
+                             "assigned to it, or (box) whatever falls inside its box")
     parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
     parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
     parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)
@@ -507,6 +519,7 @@ def main():
         xpart_weights=args.xpart_weights,
         octree_resolution=args.octree_resolution,
         seed=args.seed,
+        condition=args.condition,
         reuse=not args.no_reuse,
         strict_parts=not args.allow_partial,
         with_texture=not args.no_texture,

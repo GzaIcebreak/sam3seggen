@@ -166,20 +166,58 @@ stages:
    the most specific one winning; unseen faces inherit the nearest visible one. Faces are
    exported per name with the source albedo baked back on.
 6. **complete**, gated by `--complete`: our parts are open where they were cut, so X-Part
-   regenerates each as a closed solid from the whole model plus a box prompt
-   (`xpart_complete.py`). Look at `boxes` first: a box is a lossy prompt, and a part whose
-   box overlaps its neighbours' comes back filled out to that box.
+   regenerates each as a closed solid (`xpart_complete.py`).
 
 Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached.
 
-`--samples` is the main lever on split quality, and reading each sample more finely is no
-substitute. On Mickey, 5 samples leave 13 atoms whose largest covers 48% of the surface
-and never cut the ears from the head; dropping `--color_tol` from 20 to 3 multiplied the
-labels per sample twentyfold and still gave 13 atoms, because the extra labels are
-speckle. 9 samples give 40 atoms, largest 19%, and `ear` and `arm` appear. Widening
-`--azimuth_jitter` is not a substitute and can cost parts: at 60 degrees several samples
-came back with 2-6 labels, and those near-blank partitions fragment the meet along
-boundaries that are not real.
+### What more samples buy is a less lucky split, not a finer one
+
+One draw of 5 samples left Mickey with 13 atoms, the largest covering 48% of the surface
+and the ears never cut from the head; a different draw of 5 gave 34 atoms and all six
+parts. **That spread between draws is wider than the gap between 5 and 9**, and closing it
+is what the extra samples are for: 7 and 9 land on the same six parts, so the default is 7.
+9 only adds atoms (40 against 34), not parts.
+
+Reading each sample more finely is no substitute: dropping `--color_tol` from 20 to 3
+multiplied the labels per sample twentyfold and still gave 13 atoms, because the extra
+labels are speckle. Nor is widening `--azimuth_jitter`, which can cost parts: at 60 degrees
+several samples came back with 2-6 labels, and those near-blank partitions fragment the
+meet along boundaries that are not real.
+
+The knobs to coarsen with are the size floors (`--min_atom_faces` 300, `--min_unit_faces`
+600). An atom below that is a sliver of disagreement between samples, not a part boundary.
+Raising them from 150/300 took the robot from 66 atoms to 59 and Mickey from 40 to 34
+without either model losing a named part, and **the share of surface named by an actual
+vote rather than by the nearest-neighbour fallback went up** (robot 75.0% to 76.1%).
+Coarser still keeps the parts but starts making units that span two of them, and the vote
+coverage falls away again (73.3% at 1000).
+
+### Telling X-Part what a part looks like (`--condition`)
+
+A box is a lossy prompt, because a box also contains whatever else passes through it.
+X-Part conditions each part on the source surface it finds *inside the box*, so the robot's
+torso box handed over the tops of both legs and what came back was a torso with legs.
+
+We are not limited to a box: the split already decided, per face, which part each triangle
+belongs to. The default `--condition surface` samples the conditioning points from exactly
+those faces and passes them as `part_surface_inbbox` -- the same tensor X-Part would have
+built by cropping, only built from the assignment. The box still goes along; it is what
+sizes the token budget.
+
+Measured as how far a point on the generated solid strays from that part's own surface
+(counted beyond 2% of the model diagonal):
+
+| | box | surface |
+|---|---|---|
+| robot torso | 65.4% (volume 0.0530) | **5.0%** (volume 0.0183) |
+| robot legs | 9.2% / 13.2% | **2.3% / 2.3%** |
+| Mickey, mean over 11 parts | 24.1% | **18.7%** |
+
+It comes with one new failure mode: on each model exactly one very small part blew up
+instead, 15 to 59 times its volume. The box crop incidentally gave a small part some
+surrounding context to anchor its scale against, and its own surface alone does not. A
+solid that overruns its prompt box by half the box's width is therefore reported, so the
+failure is at least visible. `--condition box` keeps the old behaviour to compare against.
 
 The default grid is `45,225 × 10`, a barely-raised 3/4 pair. A level azimuth-90 misses
 `torso` on the chest, but height costs more than it buys: at 35 degrees the camera looks

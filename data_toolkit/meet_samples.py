@@ -42,7 +42,11 @@ from data_toolkit.parts_rebake import (  # noqa: E402
 # Finer than parts_rebake's 40: a single full_seg sample already carries distinct
 # clusters ~25 apart that 40 folds together, and the meet needs every cut it can get.
 DEFAULT_COLOR_TOL = 20.0
-DEFAULT_MIN_FACES = 150
+# An atom below this is a sliver of disagreement between samples, not a part boundary.
+# Raising it from 150 took the robot from 66 atoms to 59 and Mickey from 40 to 34 without
+# changing either model's named parts, and the robot's share of surface named by an actual
+# vote rather than by the nearest-neighbour fallback went up, 75.0% to 76.1%.
+DEFAULT_MIN_FACES = 300
 # A face counts as mirrored if its reflection lands this close (share of the bbox
 # diagonal) to some face; the plane is used only if that holds for MIRROR_SHARE of them.
 DEFAULT_MIRROR_TOLERANCE = 0.01
