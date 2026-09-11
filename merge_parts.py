@@ -32,14 +32,31 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from prompt_specs import normalize_part_specs, part_names, validate_named_rows, validate_target_name
-from segment_api import DEFAULT_PY_SAM3, DEFAULT_SAM3, _run
+from segment_api import (
+    BANK_THRESHOLD, DEFAULT_CONCEPT_BANK, DEFAULT_PY_SAM3, DEFAULT_SAM3, _run,
+)
 
-DEFAULT_VIEW_AZIMUTHS = "0,45,90,135,180,225,270,315"
-DEFAULT_VIEW_ELEVATIONS = "0,35"
+# The 3/4 pair (45 and 225), barely raised. A level azimuth-90 misses "torso" on the
+# chest and the arm mask then swallows the backpack, but height costs more than it buys:
+# at 35 degrees the camera looks down far enough that the torso hides the legs, feet and
+# base. 10 degrees keeps the 3/4 framing and still shows the bottom half.
+DEFAULT_VIEW_AZIMUTHS = "45,225"
+DEFAULT_VIEW_ELEVATIONS = "10"
 DEFAULT_RADIUS = 2.0
 DEFAULT_RESOLUTION = 512
-DEFAULT_SAM3_THRESHOLD = 0.3
+DEFAULT_SAM3_THRESHOLD = BANK_THRESHOLD
 MERGE_MODES = ("name", "unit")
+# "auto" paints only a model the renders show as grey; see flat_paint.is_colorless.
+FLAT_PAINT_MODES = ("auto", "on", "off")
+# Our parts are open where they were cut. X-Part regenerates each one as a closed solid
+# from the whole model plus a box prompt; "boxes" writes those prompts without loading it.
+COMPLETE_MODES = ("off", "boxes", "full")
+DEFAULT_PY_XPART = os.environ.get(
+    "SEGVIGEN_PY_XPART", "/root/autodl-tmp/envs/xpart/bin/python")
+DEFAULT_XPART_ROOT = os.environ.get(
+    "SEGVIGEN_XPART_ROOT", "/root/autodl-tmp/Hunyuan3D-Part/XPart")
+DEFAULT_XPART_WEIGHTS = os.environ.get(
+    "SEGVIGEN_XPART_WEIGHTS", "/root/autodl-tmp/Hunyuan3D-Part/weights")
 
 
 def canonical_prompts(specs):
@@ -68,19 +85,77 @@ def views_are_current(views_dir, azimuths, elevations, radius, resolution):
                for view in manifest["views"])
 
 
-def masks_name(prompts, unassigned_to, threshold, model):
-    """Mask files are keyed by what produced them, so changing prompts cannot reuse them."""
-    key = json.dumps([prompts, unassigned_to, threshold, model], sort_keys=True)
+def masks_name(prompts, unassigned_to, threshold, model, azimuths, elevations,
+               concept_bank=None, overlay="v3", flat_paint=False):
+    """Mask files are keyed by what produced them, so a new grid or prompt cannot reuse them."""
+    key = json.dumps(
+        [prompts, unassigned_to, threshold, model, azimuths, elevations,
+         concept_bank or "", overlay, bool(flat_paint)],
+        sort_keys=True)
     return f"masks_{hashlib.sha1(key.encode()).hexdigest()[:10]}.npz"
+
+
+GUIDANCE_COLORS = [
+    (220, 40, 40), (40, 90, 230), (30, 180, 70), (240, 210, 30),
+    (40, 200, 210), (230, 70, 180), (140, 50, 200), (240, 130, 30),
+]
+
+
+def paint_guidance(views_dir, masks_npz, out_dir):
+    """Overlay each view's SAM3 masks on the render, smaller concepts on top.
+
+    Written next to the vote so a wrong name can be blamed on the 2D mask (or not)
+    without opening the npz.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    from data_toolkit.lift_sam3 import load_masks
+
+    os.makedirs(out_dir, exist_ok=True)
+    for name in os.listdir(out_dir):
+        if name.endswith(".png"):
+            os.remove(os.path.join(out_dir, name))
+    mask_set = load_masks(masks_npz)
+    written = []
+    for view, name in enumerate(mask_set.views):
+        image = np.asarray(Image.open(os.path.join(views_dir, f"{name}.png")).convert("RGB"))
+        paint = image.astype(np.float32)
+        order = sorted(range(len(mask_set.concepts)),
+                       key=lambda i: int(mask_set.masks[view, i].sum()))
+        for index in order:
+            if mask_set.scores[view, index] <= 0:
+                continue
+            hit = mask_set.masks[view, index]
+            color = np.array(GUIDANCE_COLORS[index % len(GUIDANCE_COLORS)], dtype=np.float32)
+            paint[hit] = paint[hit] * 0.35 + color * 0.65
+        canvas = Image.fromarray(paint.clip(0, 255).astype(np.uint8))
+        draw = ImageDraw.Draw(canvas)
+        top = 6
+        for index, (concept, owner) in enumerate(zip(mask_set.concepts, mask_set.owners)):
+            if mask_set.scores[view, index] <= 0:
+                continue
+            color = GUIDANCE_COLORS[index % len(GUIDANCE_COLORS)]
+            draw.rectangle([6, top, 22, top + 14], fill=color)
+            draw.text((28, top),
+                      f"{owner}  {mask_set.scores[view, index]:.2f}  "
+                      f"{int(mask_set.masks[view, index].sum())}px",
+                      fill=(20, 20, 20))
+            top += 16
+        path = os.path.join(out_dir, f"{name}.png")
+        canvas.save(path)
+        written.append(path)
+    print(f"  guidance overlays -> {out_dir} ({len(written)} views)")
+    return written
 
 
 def render_views(glb, views_dir, azimuths=DEFAULT_VIEW_AZIMUTHS,
                  elevations=DEFAULT_VIEW_ELEVATIONS, radius=DEFAULT_RADIUS,
                  resolution=DEFAULT_RESOLUTION, reuse=True):
     if reuse and views_are_current(views_dir, azimuths, elevations, radius, resolution):
-        print(f"[1/4] reusing the view grid in {views_dir}")
+        print(f"[render] reusing the view grid in {views_dir}")
         return views_dir
-    print(f"[1/4] rendering the view grid ({azimuths} x {elevations}) ...")
+    print(f"[render] rendering the view grid ({azimuths} x {elevations}) ...")
     os.makedirs(views_dir, exist_ok=True)
     _run([
         sys.executable, os.path.join(ROOT, "data_toolkit", "render_multiview.py"),
@@ -92,21 +167,85 @@ def render_views(glb, views_dir, azimuths=DEFAULT_VIEW_AZIMUTHS,
 
 
 def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
-               model=DEFAULT_SAM3, threshold=DEFAULT_SAM3_THRESHOLD, reuse=True):
+               model=DEFAULT_SAM3, threshold=DEFAULT_SAM3_THRESHOLD, reuse=True,
+               concept_bank=DEFAULT_CONCEPT_BANK, raw=False):
     if reuse and os.path.isfile(out_npz):
-        print(f"[2/4] reusing masks for {prompts} ({os.path.basename(out_npz)})")
+        print(f"[guidance] reusing masks for {prompts} ({os.path.basename(out_npz)})")
         return out_npz
-    print(f"[2/4] SAM3 prompts {prompts} over the view grid ...")
+    print(f"[guidance] SAM3 v3 prompts {prompts} over the view grid ...")
     command = [
         py_sam3 or DEFAULT_PY_SAM3, os.path.join(ROOT, "sam3_multiview.py"),
         "--views_dir", views_dir, "--out", out_npz,
         "--model", model, "--threshold", threshold,
+        "--concept_bank", concept_bank or "",
     ]
+    if raw:
+        command.append("--raw")
     if unassigned_to:
         command += ["--unassigned_to", unassigned_to]
     # --prompts is nargs="+" and would otherwise swallow the flags after it.
     _run(command + ["--prompts", *prompts])
     return out_npz
+
+
+def flat_paint_stage(seg_glb, views_dir, out_dir, mode="auto", reuse=True):
+    """Return (the views SAM3 should read, whether they were painted).
+
+    An untextured model gives SAM3 nothing to hold on to -- on the robot's back view it
+    reported "no instance" for both `head` and `torso`. Painting one full_seg sample's
+    parts onto the renders in flat colour puts them back. See flat_paint.py.
+    """
+    from data_toolkit.lift_sam3 import load_cameras
+    from flat_paint import is_colorless, paint_views
+
+    if mode not in FLAT_PAINT_MODES:
+        raise ValueError(f"flat_paint must be one of {FLAT_PAINT_MODES}, got {mode!r}")
+    if mode == "off":
+        return views_dir, False
+    manifest, cameras = load_cameras(views_dir)
+    if mode == "auto" and not is_colorless(views_dir, manifest):
+        return views_dir, False
+    if reuse and views_complete(out_dir, manifest):
+        print(f"[paint] reusing the flat-painted views in {out_dir}")
+        return out_dir, True
+    print("[paint] no usable colour; flat-painting one full_seg sample onto the views ...")
+    paint_views(seg_glb, views_dir, out_dir, manifest, cameras)
+    return out_dir, True
+
+
+def views_complete(views_dir, manifest):
+    """True if `views_dir` holds an image for every view in an already-rendered grid."""
+    return all(os.path.isfile(os.path.join(views_dir, view["image"]))
+               for view in manifest["views"])
+
+
+def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
+             view_azimuths=DEFAULT_VIEW_AZIMUTHS, view_elevations=DEFAULT_VIEW_ELEVATIONS,
+             radius=DEFAULT_RADIUS, resolution=DEFAULT_RESOLUTION, py_sam3=None,
+             sam3_model=DEFAULT_SAM3, sam3_threshold=DEFAULT_SAM3_THRESHOLD,
+             concept_bank=DEFAULT_CONCEPT_BANK, flat_paint="auto", reuse=True):
+    """Render, flat-paint if needed, run SAM3, and draw the overlays a human reviews.
+
+    Returns (views_dir, masks_npz). Cheap to call twice: everything downstream of the
+    render is keyed by what produced it, so `segment_parts` can put this before the
+    split -- the point being that the overlays are worth looking at before paying for
+    four more full_seg samples -- and `merge_parts` can still call it standalone.
+    """
+    views_dir = render_views(glb, os.path.join(work_dir, "views"), view_azimuths,
+                             view_elevations, radius, resolution, reuse)
+    prompt_dir, painted = flat_paint_stage(
+        seg_glb, views_dir, os.path.join(work_dir, "views_flat"), flat_paint, reuse)
+    bank = os.path.abspath(concept_bank) if concept_bank else ""
+    masks_npz = sam3_masks(
+        prompt_dir, prompts,
+        os.path.join(work_dir, masks_name(
+            prompts, unassigned_to, sam3_threshold, sam3_model,
+            view_azimuths, view_elevations, bank, "v3", painted)),
+        unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse, concept_bank=bank)
+    # Overlay on the real render even when SAM3 read the painted one: they are rasterised
+    # through the same camera, and a reviewer needs to see the actual model under a mask.
+    paint_guidance(views_dir, masks_npz, os.path.join(work_dir, "guidance"))
+    return views_dir, masks_npz
 
 
 def split_artifacts(split_dir, mesh=None, atoms=None):
@@ -137,6 +276,15 @@ def merge_parts(
     py_sam3=None,
     sam3_model=DEFAULT_SAM3,
     sam3_threshold=DEFAULT_SAM3_THRESHOLD,
+    concept_bank=DEFAULT_CONCEPT_BANK,
+    flat_paint="auto",
+    units=None,
+    complete="off",
+    py_xpart=None,
+    xpart_root=DEFAULT_XPART_ROOT,
+    xpart_weights=DEFAULT_XPART_WEIGHTS,
+    octree_resolution=512,
+    seed=42,
     reuse=True,
     strict_parts=True,
     with_texture=True,
@@ -151,6 +299,12 @@ def merge_parts(
             traced to a unit before it is merged away.
         unassigned_to: the part absorbing units no concept claimed. Without it those faces
             are dropped from the output.
+        flat_paint: "auto" gives a model the renders show as grey a temporary flat colour
+            before prompting, because SAM3 finds nothing on an untextured one.
+        units: the split's shell-fused unit ids. Left None they are recomputed here, which
+            is correct but wasteful when the caller just built them.
+        complete: hand the parts to X-Part afterwards. "boxes" only writes the prompts and
+            a preview (cheap, no GPU); "full" also regenerates each part as a closed solid.
         reuse: keep the renders and, for these exact prompts, the masks already in
             `split_dir`. Turn off to re-render (e.g. after editing the source model).
 
@@ -180,14 +334,12 @@ def merge_parts(
     min_unit_faces = DEFAULT_MIN_UNIT_FACES if min_unit_faces is None else min_unit_faces
     min_recall = DEFAULT_MIN_RECALL if min_recall is None else min_recall
 
-    views_dir = render_views(glb, os.path.join(split_dir, "views"), view_azimuths,
-                             view_elevations, radius, resolution, reuse)
-    masks_npz = sam3_masks(
-        views_dir, prompt_list,
-        os.path.join(split_dir, masks_name(prompt_list, unassigned_to, sam3_threshold, sam3_model)),
-        unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse)
+    views_dir, masks_npz = guidance(
+        glb, split_dir, mesh_path, prompt_list, unassigned_to,
+        view_azimuths, view_elevations, radius, resolution,
+        py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse)
 
-    print("[3/4] naming units by multi-view SAM3 voting ...")
+    print("[merge] naming units by multi-view SAM3 voting ...")
     reference = load_single_mesh(mesh_path)
     atom_labels = np.load(atoms_path)
     if len(atom_labels) != len(reference.faces):
@@ -197,7 +349,7 @@ def merge_parts(
     labels, rows, units = vote(
         reference, atom_labels, mask_set, cameras, float(manifest_views["camera_angle_x"]),
         int(manifest_views["resolution"]), expected_names, unassigned_to,
-        min_unit_faces, min_recall,
+        min_unit_faces, min_recall, units=units,
     )
     print_report(rows, list(dict.fromkeys(mask_set.owners)))
     if merge == "unit":
@@ -221,11 +373,13 @@ def merge_parts(
     if strict_parts and merge == "name":
         validate_named_rows(expected_names, manifest, key="name")
     print(f"saved {out_glb} ({len(manifest)} parts)")
+    complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
+                   py_xpart, xpart_root, xpart_weights, octree_resolution, seed)
     return manifest
 
 
 def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
-                    with_texture=True, texture_size=2048, step="[4/4]"):
+                    with_texture=True, texture_size=2048, step="[export]"):
     """Cut the reference mesh by a face label array and write one node per label."""
     print(f"{step} exporting parts (texture={'on' if with_texture else 'off'}) ...")
     out_dir = os.path.dirname(out_glb) or "."
@@ -241,6 +395,38 @@ def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
                 else ["--no_bake"])
     _run(command)
     with open(os.path.join(out_dir, "parts.json"), "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
+                   xpart_root=DEFAULT_XPART_ROOT, model_path=DEFAULT_XPART_WEIGHTS,
+                   octree_resolution=512, seed=42):
+    """Hand the parts to X-Part as box prompts so it can close them into solids.
+
+    Splitting one shell leaves every part open where it was cut. X-Part regenerates each
+    as a watertight shape from the whole model plus a box, so the cut is healed by
+    generation rather than by capping geometry we never had. See xpart_complete.py -- it
+    runs in its own venv and imports nothing from here, hence the dispatch.
+    """
+    if mode not in COMPLETE_MODES:
+        raise ValueError(f"complete must be one of {COMPLETE_MODES}, got {mode!r}")
+    if mode == "off":
+        return None
+    print(f"[complete] X-Part box prompts from {os.path.basename(parts_glb)} ({mode}) ...")
+    os.makedirs(out_dir, exist_ok=True)
+    command = [
+        # "boxes" is pure trimesh, so it stays in this interpreter and needs no X-Part.
+        sys.executable if mode == "boxes" else (py_xpart or DEFAULT_PY_XPART),
+        os.path.join(ROOT, "xpart_complete.py"),
+        "--glb", glb, "--parts", parts_glb, "--out_dir", out_dir,
+    ]
+    if mode == "boxes":
+        command.append("--boxes_only")
+    else:
+        command += ["--xpart_root", xpart_root, "--model_path", model_path,
+                    "--octree_resolution", octree_resolution, "--seed", seed]
+    _run(command)
+    with open(os.path.join(out_dir, "boxes.json"), "r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -279,7 +465,24 @@ def main():
     parser.add_argument("--py_sam3", default=None, help=f"default: {DEFAULT_PY_SAM3}")
     parser.add_argument("--sam3_model", default=DEFAULT_SAM3)
     parser.add_argument("--sam3_threshold", type=float, default=DEFAULT_SAM3_THRESHOLD)
+    parser.add_argument("--concept_bank", default=DEFAULT_CONCEPT_BANK,
+                        help="SAM3 v3 bank.pt (the maps.png stain). Empty = raw SAM3.")
+    parser.add_argument("--no_concept_bank", action="store_true",
+                        help="Disable the v3 bank and fall back to raw SAM3 scores")
+    parser.add_argument("--flat_paint", default="auto", choices=FLAT_PAINT_MODES,
+                        help="Temporary flat colour for a model the renders show as grey")
+    parser.add_argument("--complete", default="off", choices=COMPLETE_MODES,
+                        help="Hand the parts to X-Part: boxes = prompts only, "
+                             "full = also regenerate each part as a closed solid")
+    parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
+    parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
+    parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)
+    parser.add_argument("--octree_resolution", type=int, default=512,
+                        help="Marching-cubes resolution X-Part reconstructs each part at")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.no_concept_bank and args.concept_bank != DEFAULT_CONCEPT_BANK:
+        parser.error("pass either --concept_bank or --no_concept_bank, not both")
 
     merge_parts(
         args.glb, args.prompts, args.split, args.out,
@@ -296,6 +499,14 @@ def main():
         py_sam3=args.py_sam3,
         sam3_model=args.sam3_model,
         sam3_threshold=args.sam3_threshold,
+        concept_bank="" if args.no_concept_bank else args.concept_bank,
+        flat_paint=args.flat_paint,
+        complete=args.complete,
+        py_xpart=args.py_xpart,
+        xpart_root=args.xpart_root,
+        xpart_weights=args.xpart_weights,
+        octree_resolution=args.octree_resolution,
+        seed=args.seed,
         reuse=not args.no_reuse,
         strict_parts=not args.allow_partial,
         with_texture=not args.no_texture,

@@ -3,7 +3,9 @@ import unittest
 import numpy as np
 
 from data_toolkit.meet_samples import meet_labels
-from data_toolkit.unit_vote import assign_units, score_units, split_units, tally_votes
+from data_toolkit.unit_vote import (
+    assign_units, fuse_inner_shells, score_units, split_units, tally_votes,
+)
 from segment_parts import sample_azimuths
 
 
@@ -56,6 +58,35 @@ class UnitTest(unittest.TestCase):
         adjacency = mesh.face_adjacency
         units = split_units(mesh, atoms, adjacency, min_unit_faces=2)
         self.assertEqual(len(np.unique(units)), 2)
+
+
+class FuseInnerShellsTest(unittest.TestCase):
+    def test_inward_shell_joins_the_containing_outward_one(self):
+        import trimesh
+
+        outer = trimesh.creation.box(extents=[2, 2, 2])
+        inner = trimesh.creation.box(extents=[1.6, 1.6, 1.6])
+        inner.invert()
+        mesh = trimesh.util.concatenate([outer, inner])
+        units = np.concatenate([
+            np.zeros(len(outer.faces), dtype=np.int64),
+            np.ones(len(inner.faces), dtype=np.int64),
+        ])
+        fused = fuse_inner_shells(mesh, units)
+        self.assertEqual(len(np.unique(fused)), 1)
+
+    def test_two_outward_parts_are_not_fused(self):
+        import trimesh
+
+        left = trimesh.creation.box()
+        right = trimesh.creation.box().apply_translation([5, 0, 0])
+        mesh = trimesh.util.concatenate([left, right])
+        units = np.concatenate([
+            np.zeros(len(left.faces), dtype=np.int64),
+            np.ones(len(right.faces), dtype=np.int64),
+        ])
+        fused = fuse_inner_shells(mesh, units)
+        self.assertEqual(len(np.unique(fused)), 2)
 
 
 class ScoreUnitsTest(unittest.TestCase):

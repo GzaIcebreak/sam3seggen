@@ -32,6 +32,38 @@ import trimesh
 DEFAULT_XPART_ROOT = "/root/autodl-tmp/Hunyuan3D-Part/XPart"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_CONTAINMENT = 0.98
+DEFAULT_FIT_TOLERANCE = 0.05
+
+
+def source_frame_transform(parts_bounds, source_bounds, tolerance=DEFAULT_FIT_TOLERANCE):
+    """(scale, parts centre, source centre) mapping the parts' frame onto the source's.
+
+    The boxes prompt X-Part about the *source* mesh, but the split normalises its output
+    into a unit cube while the source may sit anywhere: Mickey stands on the ground plane,
+    so his parts land half a unit below the model they are meant to describe. The robot is
+    already origin-centred, which is exactly why this stayed invisible.
+
+    The fit is a uniform scale plus a translation, recovered from the two bounding boxes.
+    The three per-axis scales agreeing is what says the parts really do cover the whole
+    model; when they disagree the fit means nothing, and handing X-Part boxes in the wrong
+    place is worse than stopping.
+    """
+    parts_extent = parts_bounds[1] - parts_bounds[0]
+    source_extent = source_bounds[1] - source_bounds[0]
+    if np.any(parts_extent < 1e-9):
+        raise SystemExit("the parts are flat in some axis; cannot fit them to the source")
+    per_axis = source_extent / parts_extent
+    spread = float(per_axis.max() / per_axis.min() - 1.0)
+    if spread > tolerance:
+        raise SystemExit(
+            f"parts and source do not describe the same shape: per-axis scales "
+            f"{np.round(per_axis, 4)} differ by {spread:.1%} (limit {tolerance:.0%}). "
+            "Usually this means part of the model was dropped -- pass --unassigned_to.")
+    return float(per_axis.mean()), parts_bounds.mean(axis=0), source_bounds.mean(axis=0)
+
+
+def to_source_frame(boxes, scale, parts_centre, source_centre):
+    return (boxes - parts_centre) * scale + source_centre
 
 
 def load_part_nodes(parts_glb):
@@ -100,6 +132,38 @@ def component_boxes(nodes, min_area_share=DEFAULT_MIN_AREA_SHARE,
     return boxes[keep], rows
 
 
+def load_pipeline(model_path):
+    """X-Part's pipeline without the P3-SAM box predictor it builds unconditionally.
+
+    That predictor is the part of X-Part we are replacing: it downloads facebook/sonata
+    on construction, and the pipeline only ever calls it when `aabb` is None, which ours
+    never is. Building it would make our segmentation depend on the box guesser it exists
+    to override -- and on a network round trip -- for nothing.
+    """
+    from partgen import partformer_pipeline
+
+    target = None
+    config_path = os.path.join(model_path, "p3sam", "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as handle:
+            target = json.load(handle).get("target")
+
+    original = partformer_pipeline.instantiate_from_config
+
+    def skip_box_predictor(config, **kwargs):
+        if target and config.get("target") == target:
+            print(f"  not building {target}; the boxes are ours")
+            return None
+        return original(config, **kwargs)
+
+    partformer_pipeline.instantiate_from_config = skip_box_predictor
+    try:
+        return partformer_pipeline.PartFormerPipeline.from_pretrained(
+            model_path=model_path, verbose=True)
+    finally:
+        partformer_pipeline.instantiate_from_config = original
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -115,8 +179,20 @@ def main():
     parser.add_argument("--octree_resolution", type=int, default=512,
                         help="Marching-cubes resolution X-Part reconstructs each part at")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--parts_per_batch", type=int, default=4,
+                        help="Boxes generated per forward pass; twelve at once needs "
+                             "more than 24 GB")
+    parser.add_argument("--num_chunks", type=int, default=50000,
+                        help="Query points per marching-cubes block; X-Part's own 400000 "
+                             "needs 3 GiB a block and runs out on a 32 GB card")
     parser.add_argument("--boxes_only", action="store_true",
                         help="Write the box prompts and a preview, without loading X-Part")
+    parser.add_argument("--no_source_frame", dest="source_frame", action="store_false",
+                        help="Prompt with the boxes as they are, skipping the fit onto the "
+                             "source model's frame (they only coincide for a model that "
+                             "was already origin-centred)")
+    parser.add_argument("--fit_tolerance", type=float, default=DEFAULT_FIT_TOLERANCE,
+                        help="How far the three per-axis scales of that fit may disagree")
     parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
     parser.add_argument("--model_path", default="tencent/Hunyuan3D-Part",
                         help="Local weights directory or HF repo id")
@@ -124,10 +200,25 @@ def main():
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
-    boxes, rows = component_boxes(
-        load_part_nodes(os.path.abspath(args.parts)), args.min_area_share, args.containment)
+    nodes = load_part_nodes(os.path.abspath(args.parts))
+    boxes, rows = component_boxes(nodes, args.min_area_share, args.containment)
     if not len(boxes):
         raise SystemExit("no part component survived the filters; lower --min_area_share")
+
+    source = trimesh.load(os.path.abspath(args.glb), force="mesh")
+    if args.source_frame:
+        parts_bounds = np.stack([
+            np.min([mesh.bounds[0] for _, mesh in nodes], axis=0),
+            np.max([mesh.bounds[1] for _, mesh in nodes], axis=0),
+        ])
+        scale, parts_centre, source_centre = source_frame_transform(
+            parts_bounds, source.bounds, args.fit_tolerance)
+        shift = source_centre - parts_centre
+        print(f"parts -> source frame: scale {scale:.4f}, shift {np.round(shift, 4)}")
+        boxes = to_source_frame(boxes, scale, parts_centre, source_centre)
+        for row, box in zip(rows, boxes):
+            row["box"] = box.tolist()
+
     print(f"{len(boxes)} box prompts:")
     for row in rows:
         print(f"  {row['name']:<18} {row['faces']:>7} faces  {row['area_share']:.1%} of the area")
@@ -135,7 +226,7 @@ def main():
         json.dump(rows, handle, indent=2)
 
     preview = trimesh.Scene()
-    preview.add_geometry(trimesh.load(os.path.abspath(args.glb), force="mesh"))
+    preview.add_geometry(source)
     for box in boxes:
         outline = trimesh.path.creation.box_outline()
         outline.vertices *= (box[1] - box[0])
@@ -146,24 +237,55 @@ def main():
         print(f"saved {out_dir}/boxes.glb")
         return
 
-    sys.path.insert(0, os.path.abspath(args.xpart_root))
+    # X-Part builds its own P3-SAM box predictor at load time even though we supply the
+    # boxes ourselves, and that module reaches for its sibling with a *relative*
+    # sys.path.append("../P3-SAM") -- which only resolves when cwd happens to be XPart/.
+    # Add both roots absolutely so the import works wherever this is dispatched from.
+    xpart_root = os.path.abspath(args.xpart_root)
+    for path in (xpart_root, os.path.join(os.path.dirname(xpart_root), "P3-SAM")):
+        if path not in sys.path:
+            sys.path.insert(0, path)
     import torch
-    from partgen.partformer_pipeline import PartFormerPipeline
 
-    pipeline = PartFormerPipeline.from_pretrained(model_path=args.model_path, verbose=True)
+    pipeline = load_pipeline(args.model_path)
     pipeline.to(device="cuda", dtype=torch.float32)
-    parts, (out_bbox, mesh_gt_bbox, exploded) = pipeline(
-        mesh_path=os.path.abspath(args.glb),
-        aabb=boxes[None].astype(np.float32),
-        octree_resolution=args.octree_resolution,
-        seed=args.seed,
-        output_type="trimesh",
-    )
-    parts.export(os.path.join(out_dir, "xpart_parts.glb"))
-    exploded.export(os.path.join(out_dir, "xpart_exploded.glb"))
-    out_bbox.export(os.path.join(out_dir, "xpart_parts_bbox.glb"))
-    mesh_gt_bbox.export(os.path.join(out_dir, "xpart_input_bbox.glb"))
-    print(f"saved {out_dir}/xpart_parts.glb")
+
+    # Parts are the batch dimension -- attention never crosses them, and the part-id
+    # embedding is re-randomised on every call anyway -- so generating them a few at a
+    # time is not an approximation. It is also the only way twelve of them fit in memory.
+    out = trimesh.Scene()
+    for start in range(0, len(boxes), args.parts_per_batch):
+        chunk = boxes[start:start + args.parts_per_batch]
+        named = [rows[start + i]["name"] for i in range(len(chunk))]
+        print(f"[{start + 1}-{start + len(chunk)}/{len(boxes)}] {', '.join(named)}")
+        parts, _ = pipeline(
+            mesh_path=os.path.abspath(args.glb),
+            # [K, 2, 3], not the [B, K, 2, 3] the docstring claims: check_inputs indexes
+            # the boxes directly and adds the batch dimension itself.
+            aabb=chunk.astype(np.float32),
+            octree_resolution=args.octree_resolution,
+            # The decode queries the implicit function in blocks of this many points and
+            # X-Part defaults to 400k, which alone wants 3 GiB on top of everything the
+            # diffusion pass is still holding. It only trades speed for memory.
+            num_chunks=args.num_chunks,
+            seed=args.seed,
+            output_type="trimesh",
+        )
+        # X-Part drops a box whose surface sample came back empty, so the geometry it
+        # returns is not guaranteed to line up one-for-one with the chunk; keep our names
+        # only when the counts agree rather than mislabelling the output.
+        geometries = list(parts.geometry.values())
+        aligned = len(geometries) == len(chunk)
+        if not aligned:
+            print(f"  X-Part returned {len(geometries)} parts for {len(chunk)} boxes; "
+                  "falling back to positional names")
+        for offset, geometry in enumerate(geometries):
+            label = named[offset] if aligned else f"part_{start + offset:02d}"
+            out.add_geometry(geometry, geom_name=f"{start + offset:02d}_{label}")
+        torch.cuda.empty_cache()
+
+    out.export(os.path.join(out_dir, "xpart_parts.glb"))
+    print(f"saved {out_dir}/xpart_parts.glb ({len(out.geometry)} solids)")
 
 
 if __name__ == "__main__":

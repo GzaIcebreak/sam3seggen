@@ -77,7 +77,78 @@ def split_units(mesh, atoms, adjacency, min_unit_faces=DEFAULT_MIN_UNIT_FACES):
                 unit_local[component] = unit_local[anchors[nearest]]
         units[faces] = unit_local
         next_unit += len(big)
-    return units
+    return fuse_inner_shells(mesh, units)
+
+
+def _outwardness(mesh, faces):
+    """Share of faces whose normal points away from the component's own centroid."""
+    centroids = mesh.triangles_center[faces]
+    center = centroids.mean(axis=0)
+    return float(((mesh.face_normals[faces] * (centroids - center)).sum(axis=1) > 0).mean())
+
+
+def fuse_inner_shells(mesh, units, centroid_frac=0.08, contain=0.9, area_lo=0.4, area_hi=1.6):
+    """Merge a remesh inner wall into the outer shell it sits inside.
+
+    SegviGen's remesh is a thick shell: an outward-facing outer surface and an
+    inward-facing inner wall that share no edges. They become two units and, if they
+    vote separately, the hidden inner one inherits whoever happens to sit nearest --
+    which on the robot was an arm, so the backpack's lining turned the whole back
+    into an arm after the name merge. Pairing them first makes that inheritance a
+    no-op: both faces already have the same unit id.
+    """
+    n_units = int(units.max()) + 1
+    if n_units < 2:
+        return units
+    diagonal = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    stats = []
+    for unit in range(n_units):
+        faces = np.flatnonzero(units == unit)
+        corners = mesh.vertices[np.unique(mesh.faces[faces])]
+        stats.append({
+            "faces": faces,
+            "centroid": mesh.triangles_center[faces].mean(axis=0),
+            "lo": corners.min(axis=0),
+            "hi": corners.max(axis=0),
+            "area": float(mesh.area_faces[faces].sum()),
+            "outward": _outwardness(mesh, faces),
+        })
+    outer = [i for i, row in enumerate(stats) if row["outward"] >= 0.7]
+    inner = [i for i, row in enumerate(stats) if row["outward"] <= 0.3]
+    remap = np.arange(n_units)
+    claimed = set()
+    fused = 0
+    for inner_id in sorted(inner, key=lambda i: -stats[i]["area"]):
+        candidate, best = None, diagonal
+        row = stats[inner_id]
+        volume = float(np.prod(np.maximum(row["hi"] - row["lo"], 1e-9)))
+        for outer_id in outer:
+            if outer_id in claimed:
+                continue
+            other = stats[outer_id]
+            distance = float(np.linalg.norm(row["centroid"] - other["centroid"]))
+            if distance > centroid_frac * diagonal:
+                continue
+            overlap = float(np.prod(np.maximum(
+                0.0, np.minimum(row["hi"], other["hi"]) - np.maximum(row["lo"], other["lo"]))))
+            if overlap < contain * volume:
+                continue
+            ratio = row["area"] / max(other["area"], 1e-9)
+            if ratio < area_lo or ratio > area_hi:
+                continue
+            if distance < best:
+                candidate, best = outer_id, distance
+        if candidate is not None:
+            remap[inner_id] = candidate
+            claimed.add(candidate)
+            fused += 1
+    if not fused:
+        return units
+    merged = remap[units]
+    _, compact = np.unique(merged, return_inverse=True)
+    print(f"fused {fused} remesh inner shells into their outer unit "
+          f"({n_units} -> {compact.max() + 1} units)")
+    return compact
 
 
 def unit_mask_overlap(face_ids, unit_of_face, mask_set):
@@ -176,10 +247,16 @@ def silhouette_agreement(face_ids, foreground):
 
 def vote(mesh, atoms, mask_set, cameras, camera_angle_x, resolution, part_order,
          unassigned_to=None, min_unit_faces=DEFAULT_MIN_UNIT_FACES, min_recall=DEFAULT_MIN_RECALL,
-         min_visible_pixels=DEFAULT_MIN_VISIBLE_PIXELS):
-    """Return (face labels indexed into `part_order`, -1 for unnamed; report rows; units)."""
-    adjacency = welded_face_adjacency(mesh)
-    unit_of_face = split_units(mesh, atoms, adjacency, min_unit_faces)
+         min_visible_pixels=DEFAULT_MIN_VISIBLE_PIXELS, units=None):
+    """Return (face labels indexed into `part_order`, -1 for unnamed; report rows; units).
+
+    `units` is the split's own shell-fused unit id per face. Pass it whenever the caller
+    already ran the split: recomputing it here would be both slower and a chance for the
+    names to be voted onto a different partition than the one that was exported.
+    """
+    unit_of_face = units
+    if unit_of_face is None:
+        unit_of_face = split_units(mesh, atoms, welded_face_adjacency(mesh), min_unit_faces)
     vertices, _ = normalize_to_unit_cube(np.asarray(mesh.vertices) @ SEG_TO_CAMERA.T)
     face_ids = rasterize_face_ids(vertices, np.asarray(mesh.faces), cameras, camera_angle_x, resolution)
     agreement = silhouette_agreement(face_ids, mask_set.foreground)

@@ -145,17 +145,46 @@ python segment_parts.py \
   --out out/parts.glb --work_dir out/work
 ```
 
-Geometry decides every boundary, language only picks names:
+Geometry decides every boundary, language only picks names. The pipeline is five fixed
+stages:
 
-1. `--samples` prompt-free `full_seg` runs, the conditioning camera jittered by
-   `--azimuth_jitter` around `--azimuth` (`sample_azimuths`: base view, then ±jitter);
-2. their partitions are intersected — two faces share an atom only if *every* sample
-   coloured them alike, so every cut any sample drew survives (`data_toolkit/meet_samples.py`);
-3. the source model is rendered over a fixed view grid and SAM3 masks every view;
-4. each atom's connected components take the name whose masks cover them, the most
-   specific one winning; unseen inner walls inherit the nearest visible face
-   (`data_toolkit/unit_vote.py`);
-5. faces are exported per name with the source albedo baked back on.
+1. **paint.** The source model is rendered over a fixed view grid; if those renders carry
+   no colour of their own (an untextured model), one `full_seg` sample's part colouring is
+   painted onto them flat (`flat_paint.py`). Textured models skip this.
+2. **guidance.** SAM3 masks every view and the overlays a human reviews are written to
+   `work/guidance/`. This deliberately comes before the samples: a bad prompt set shows up
+   here, and the split has not been paid for yet.
+3. **split.** `--samples` prompt-free `full_seg` runs, the conditioning camera jittered by
+   `--azimuth_jitter` around `--azimuth`, their partitions intersected — two faces share an
+   atom only if *every* sample coloured them alike, so every cut any sample drew survives
+   (`data_toolkit/meet_samples.py`).
+4. **units.** Atoms are cut into connected components and each remesh inner wall is fused
+   into the shell it lines. This has to happen before anything is named: the two are not
+   edge-connected, so a separately-voted inner wall inherits whichever part sits nearest it
+   (`unit_vote.split_units`).
+5. **merge**, gated by `--merge`: each unit takes the name whose stage-2 masks cover it,
+   the most specific one winning; unseen faces inherit the nearest visible one. Faces are
+   exported per name with the source albedo baked back on.
+6. **complete**, gated by `--complete`: our parts are open where they were cut, so X-Part
+   regenerates each as a closed solid from the whole model plus a box prompt
+   (`xpart_complete.py`). Look at `boxes` first: a box is a lossy prompt, and a part whose
+   box overlaps its neighbours' comes back filled out to that box.
+
+Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached.
+
+`--samples` is the main lever on split quality, and reading each sample more finely is no
+substitute. On Mickey, 5 samples leave 13 atoms whose largest covers 48% of the surface
+and never cut the ears from the head; dropping `--color_tol` from 20 to 3 multiplied the
+labels per sample twentyfold and still gave 13 atoms, because the extra labels are
+speckle. 9 samples give 40 atoms, largest 19%, and `ear` and `arm` appear. Widening
+`--azimuth_jitter` is not a substitute and can cost parts: at 60 degrees several samples
+came back with 2-6 labels, and those near-blank partitions fragment the meet along
+boundaries that are not real.
+
+The default grid is `45,225 × 10`, a barely-raised 3/4 pair. A level azimuth-90 misses
+`torso` on the chest, but height costs more than it buys: at 35 degrees the camera looks
+down far enough that the torso hides the legs and base. `--flat_paint on|off` forces or
+disables stage 1.
 
 Why over-segment first: `full_seg` has no granularity knob and a single sample fuses
 neighbouring parts often enough to matter — on the robot test model, shoulder armour and
@@ -164,8 +193,35 @@ conditioning view broke it apart. Over-segmentation costs the naming step nothin
 only merge), while under-segmentation is unrecoverable.
 
 `work/atoms.glb` shows the atoms the vote merged, one colour each; `work/vote_report.json`
-has the per-unit coverage/IoU table. When a part comes out wrong, look at `atoms.glb`
-first: if the boundary is not there, no amount of prompt tuning will produce it.
+has the per-unit vote table. When a part comes out wrong, look at `atoms.glb` first: if
+the boundary is not there, no amount of prompt tuning will produce it.
+
+### `merge_parts.py` — the naming half, on its own
+
+Splitting is expensive and prompt-independent; naming is cheap and is what you re-run
+while deciding what the parts should be called. `--merge off` stops after stage 4, still
+writing the guidance overlays if prompts were given, so you can look before merging:
+
+```sh
+python segment_parts.py --glb model.glb --merge off --out split/units.glb \
+  --prompts head torso arm hand leg foot --unassigned_to torso
+# after reviewing split/work/guidance/*.png
+python merge_parts.py --glb model.glb --split split/work \
+  --prompts head torso arm hand leg foot --unassigned_to torso \
+  --out named/parts.glb
+```
+
+Renders and masks are cached in the split directory, keyed by the prompts that produced
+them, so re-running with the same prompts costs seconds and re-running with new prompts
+only re-runs SAM3. `--merge unit` writes one node per voted unit instead of fusing them,
+which is how you see *which* unit took a wrong name.
+
+Every unit is voted on **per view**: each camera that sees enough of it picks the most
+specific mask covering it there, and the unit takes the name most cameras agree on.
+Pooling pixels across views instead lets whichever camera happens to see the unit head-on
+decide alone — and that is exactly the camera where a part half hidden behind another one
+gets its neighbour's name. On the robot, switching to per-view voting moved ~9.7k faces of
+shoulder armour from `torso` to `arm`.
 
 ### `segment_api.py` — deprecated: prompts in, one named-parts GLB out
 
