@@ -78,8 +78,8 @@ conventions verified against the renderer (IoU 0.987).
 
 ## 📷 Results
 
-Over-segment then name. Each row is **original / stain / explode**: the stain is one colour
-per named part, the explode pulls those parts apart.
+Over-segment then name. Each row is **original / stain / repaired**: the stain is one
+colour per named part, the third panel explodes the closed X-Part solids.
 
 Mickey (coarse, `head` / `torso` / `base`; the moustache hangs on the head):
 
@@ -99,28 +99,18 @@ Robot (`head` / `torso` / `arm` / `hand` / `leg` / `foot`; the source is untextu
   <img src="docs/images/robot_compare.png" width="100%"/>
 </p>
 
-Dog (coarse, `head` / `body` / `leg` / `tail`):
-
-<p>
-  <img src="docs/images/dog_compare.png" width="100%"/>
-</p>
-
-Chair (coarse, `seat` / `backrest` / `leg`; `armrest` dropped — SAM3 never found it):
-
-<p>
-  <img src="docs/images/chair_compare.png" width="100%"/>
-</p>
-
-Sword (coarse, `blade` / `guard`; the grip had no mask and stayed on the blade):
-
-<p>
-  <img src="docs/images/sword_compare.png" width="100%"/>
-</p>
-
 Shelf (coarse, `shelf board` / `frame`):
 
 <p>
   <img src="docs/images/shelf_compare.png" width="100%"/>
+</p>
+
+Wall-clock of a coarse split (`--complete off`, 7 `full_seg` samples per model) on
+an RTX 5090. Each tooth is one `full_seg` child: VRAM peaks at 13–15 GB, then
+drops to ~0 when the process exits. Peak VRAM **15.24 GB**, peak pipeline RSS 8.7 GB.
+
+<p>
+  <img src="docs/images/perf_curves.png" width="100%"/>
 </p>
 
 ## 🔨 Deployment

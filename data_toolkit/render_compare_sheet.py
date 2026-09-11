@@ -1,4 +1,7 @@
-"""Three-panel sheet: original albedo, part stain, exploded split.
+"""Three-panel sheet: original albedo, part stain, exploded repaired solids.
+
+`--completed` is the X-Part (or otherwise closed) glb; the third panel pulls those
+solids apart. Without it the open split is exploded instead.
 
 parts.glb is in the source glTF frame; scene-graph transforms are baked first so a
 model that stores parts in local nodes does not come out on its side.
@@ -97,43 +100,66 @@ def caption(image, text):
     return image
 
 
-def render_sheet(source_glb, parts_glb, out_png, azimuth=20.0, elevation=15.0,
-                 explode=0.45, resolution=640, radius=2.3):
-    source_names, source_meshes = bake_nodes(trimesh.load(source_glb, process=False))
-    part_names, part_meshes = bake_nodes(trimesh.load(parts_glb, process=False))
+def has_texture(meshes):
+    return any(
+        getattr(getattr(item.visual, "material", None), "baseColorTexture", None) is not None
+        for item in meshes
+    )
 
-    source = trimesh.util.concatenate(source_meshes)
-    parts = trimesh.util.concatenate(part_meshes)
+
+def pack(meshes):
+    mesh = trimesh.util.concatenate(meshes)
     owner = np.concatenate(
-        [np.full(len(mesh.faces), index, dtype=np.int32)
-         for index, mesh in enumerate(part_meshes)])
-
-    albedo = np.concatenate([albedo_face_colors(mesh) for mesh in source_meshes])
+        [np.full(len(item.faces), index, dtype=np.int32)
+         for index, item in enumerate(meshes)])
     stain = LABEL_COLORS[owner % len(LABEL_COLORS)].astype(np.float32)
+    albedo = np.concatenate([albedo_face_colors(item) for item in meshes])
+    return mesh, owner, stain, albedo if has_texture(meshes) else stain
+
+
+def render_sheet(source_glb, parts_glb, out_png, azimuth=20.0, elevation=15.0,
+                 explode=0.45, resolution=640, radius=2.3, completed_glb=None):
+    _, source_meshes = bake_nodes(trimesh.load(source_glb, process=False))
+    part_names, part_meshes = bake_nodes(trimesh.load(parts_glb, process=False))
+    source = trimesh.util.concatenate(source_meshes)
+    src_albedo = np.concatenate([albedo_face_colors(item) for item in source_meshes])
+    parts, part_owner, part_stain, _ = pack(part_meshes)
+
+    if completed_glb:
+        done_names, done_meshes = bake_nodes(trimesh.load(completed_glb, process=False))
+        done, done_owner, done_stain, done_color = pack(done_meshes)
+        explode_title = "修复后"
+    else:
+        done_names, done, done_owner, done_color = part_names, parts, part_owner, part_stain
+        explode_title = "爆照"
 
     src_vertices, _ = normalize_to_unit_cube(
         np.asarray(source.vertices) @ GLTF_TO_BLENDER.T)
     part_vertices, _ = normalize_to_unit_cube(
         np.asarray(parts.vertices) @ GLTF_TO_BLENDER.T)
+    done_vertices, _ = normalize_to_unit_cube(
+        np.asarray(done.vertices) @ GLTF_TO_BLENDER.T)
     src_faces = np.asarray(source.faces)
     part_faces = np.asarray(parts.faces)
-    exploded = explode_vertices(part_vertices, part_faces, owner, explode)
+    done_faces = np.asarray(done.faces)
+    exploded = explode_vertices(done_vertices, done_faces, done_owner, explode)
 
     src_normals = np.asarray(source.face_normals) @ GLTF_TO_BLENDER.T
     part_normals = np.asarray(parts.face_normals) @ GLTF_TO_BLENDER.T
+    done_normals = np.asarray(done.face_normals) @ GLTF_TO_BLENDER.T
     cameras = camera_ring([azimuth], [elevation], radius)
     camera = cameras[0]
 
     panels = [
         ("original", paint(
             rasterize_face_ids(src_vertices, src_faces, cameras, CAMERA_ANGLE, resolution)[0],
-            albedo, src_normals, camera, resolution), "原模型"),
+            src_albedo, src_normals, camera, resolution), "原模型"),
         ("stain", paint(
             rasterize_face_ids(part_vertices, part_faces, cameras, CAMERA_ANGLE, resolution)[0],
-            stain, part_normals, camera, resolution), "染色"),
-        ("explode", paint(
-            rasterize_face_ids(exploded, part_faces, cameras, CAMERA_ANGLE, resolution)[0],
-            stain, part_normals, camera, resolution), "爆照"),
+            part_stain, part_normals, camera, resolution), "染色"),
+        ("repaired", paint(
+            rasterize_face_ids(exploded, done_faces, cameras, CAMERA_ANGLE, resolution)[0],
+            done_color, done_normals, camera, resolution), explode_title),
     ]
     images = [caption(Image.fromarray(canvas), title) for _, canvas, title in panels]
     sheet = Image.new("RGB", (resolution * 3, resolution), (255, 255, 255))
@@ -141,7 +167,7 @@ def render_sheet(source_glb, parts_glb, out_png, azimuth=20.0, elevation=15.0,
         sheet.paste(image, (index * resolution, 0))
     os.makedirs(os.path.dirname(os.path.abspath(out_png)) or ".", exist_ok=True)
     sheet.save(out_png)
-    print(f"saved {out_png} ({len(part_names)} parts: {', '.join(part_names)})")
+    print(f"saved {out_png} ({len(part_names)} parts / {len(done_names)} repaired)")
     return out_png
 
 
@@ -155,10 +181,13 @@ def main():
     parser.add_argument("--explode", type=float, default=0.45)
     parser.add_argument("--resolution", type=int, default=640)
     parser.add_argument("--radius", type=float, default=2.3)
+    parser.add_argument("--completed", default=None,
+                        help="Closed solids (X-Part xpart_parts.glb) for the third panel")
     args = parser.parse_args()
     render_sheet(os.path.abspath(args.source), os.path.abspath(args.parts),
                  os.path.abspath(args.out), args.azimuth, args.elevation, args.explode,
-                 args.resolution, args.radius)
+                 args.resolution, args.radius,
+                 os.path.abspath(args.completed) if args.completed else None)
 
 
 if __name__ == "__main__":
