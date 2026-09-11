@@ -62,5 +62,42 @@ class VoteUnitsTest(unittest.TestCase):
         self.assertEqual(len(np.unique(out)), 1)
 
 
+class HangOffTest(unittest.TestCase):
+    """A sliver no mask claimed should join the part it hangs off, not the dump bucket."""
+
+    def assign(self, votes, neighbors, faces, unassigned_to="torso", hang_share=0.1):
+        names = ["head", "torso"]
+        n = len(votes)
+        unit_of_face = np.concatenate(
+            [np.full(count, unit, dtype=np.int64) for unit, count in enumerate(faces)])
+        mesh = mock.Mock()
+        mesh.triangles_center = np.zeros((len(unit_of_face), 3))
+        assignment, _ = unit_vote.assign_units(
+            mesh, unit_of_face, names, np.asarray(votes), np.asarray(votes, dtype=float),
+            seen=np.ones(n, dtype=int), unassigned_to=unassigned_to,
+            neighbors=neighbors, hang_share=hang_share)
+        return assignment
+
+    def test_whiskers_that_only_touch_the_head_join_the_head(self):
+        # unit 0 = head (voted), unit 1 = whiskers (4% of the head, only touches it)
+        self.assertEqual(
+            self.assign([[1, 0], [0, 0]], [[1], [0]], [1000, 40]),
+            ["head", "head"])
+
+    def test_a_body_that_also_touches_the_head_stays_with_unassigned(self):
+        # The neck is a shared edge; dumping every unvoted neighbour of the head
+        # onto it would swallow the torso. The body also touches the hands (unit 2).
+        self.assertEqual(
+            self.assign([[1, 0], [0, 0], [0, 0]], [[1], [0, 2], [1]], [1000, 400, 200]),
+            ["head", "torso", "torso"])
+
+    def test_a_large_piece_that_only_touches_the_head_is_still_a_part(self):
+        # A torso whose only neighbour is the head -- SAM3 missed it entirely --
+        # must not be absorbed just because it hangs off something named.
+        self.assertEqual(
+            self.assign([[1, 0], [0, 0]], [[1], [0]], [1000, 400]),
+            ["head", "torso"])
+
+
 if __name__ == "__main__":
     unittest.main()

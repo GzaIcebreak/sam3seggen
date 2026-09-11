@@ -6,8 +6,11 @@
     GET  /jobs/{id}/parts/*  one part's glb
     GET  /jobs/{id}/atoms    the over-segmented atoms the vote merged (vertex-coloured)
     GET  /jobs/{id}/report   the per-unit vote report
+    GET  /jobs/{id}/complete the X-Part solids (textured, if baked)
+    GET  /jobs/{id}/complete_raw the solids before the albedo bake
+    GET  /jobs/{id}/guidance/{name} one review overlay from work/guidance/
     GET  /jobs/{id}/map      the 2D part map, legacy jobs only
-    GET  /health             defaults and whether the GPU is busy
+    GET  /health             stages, switches, current defaults, GPU busy flag
 
 Every stage still runs as a subprocess that loads its own model, and the default pipeline
 samples SegviGen several times, so a request costs several minutes and the box has one
@@ -41,6 +44,12 @@ if ROOT not in sys.path:
 
 import segment_api
 import segment_parts
+from pipeline import (
+    COMPLETE_MODES, CONDITION_MODES, FLAT_PAINT_MODES, GRANULARITY,
+    MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
+)
+
+_DEFAULTS = PipelineOptions()
 
 JOBS_DIR = os.path.abspath(os.environ.get(
     "SEGVIGEN_JOBS_DIR", os.path.join(tempfile.gettempdir(), "segvigen_jobs")))
@@ -113,12 +122,23 @@ def _run_job(job_id: str, upload: bytes, filename: str, options: dict, legacy=Fa
         return result
     with open(os.path.join(job, "work", "atoms_report.json"), "r", encoding="utf-8") as file:
         atoms = json.load(file)
+    guidance_dir = os.path.join(job, "work", "guidance")
     result.update({
         "pipeline": "segment_parts",
         "samples": len(atoms["samples"]),
         "atoms": atoms["atoms"],
         "atoms_glb": f"{base}/atoms",
-        "report": f"{base}/report",
+        "report": f"{base}/report" if os.path.isfile(
+            os.path.join(job, "work", "vote_report.json")) else None,
+        "complete": f"{base}/complete" if os.path.isfile(
+            os.path.join(job, "complete", "xpart_parts.glb")) else None,
+        "complete_raw": f"{base}/complete_raw" if os.path.isfile(
+            os.path.join(job, "complete", "xpart_parts_raw.glb")) else None,
+        "guidance": [
+            f"{base}/guidance/{name}"
+            for name in sorted(os.listdir(guidance_dir))
+            if name.endswith(".png")
+        ] if os.path.isdir(guidance_dir) else [],
     })
     return result
 
@@ -129,12 +149,9 @@ def health() -> dict:
         "status": "ok",
         "busy": _gpu.locked(),
         "jobs_dir": JOBS_DIR,
-        "defaults": {
-            "pipeline": "segment_parts",
-            "samples": segment_parts.DEFAULT_SAMPLES,
-            "azimuth_jitter": segment_parts.DEFAULT_AZIMUTH_JITTER,
-            "checkpoint": segment_parts.DEFAULT_CKPT,
-        },
+        "pipeline": "segment_parts",
+        "checkpoint": segment_parts.DEFAULT_CKPT,
+        **_DEFAULTS.public(),
         "legacy_defaults": {
             "assign": "paint",
             "use_v6": True,
@@ -151,46 +168,106 @@ def health() -> dict:
 async def segment(
     glb: UploadFile = File(..., description="The model to split."),
     prompts: list[str] = Form(
-        ..., description="Repeat once per output part. Join concepts with '+' to merge "
-                         "them into one part, optionally named: 'opening=door+window'. "
-                         "Never space-separate them -- a concept may contain spaces."),
+        default=[],
+        description="Repeat once per output part. Join concepts with '+' to merge them "
+                    "into one part, optionally named: 'opening=door+window'. Empty is "
+                    "allowed only with merge=off."),
     unassigned_to: str | None = Form(
-        None, description="Part that absorbs atoms no concept claimed, so the output has "
-                          "exactly as many parts as were asked for."),
-    samples: int = Form(
-        segment_parts.DEFAULT_SAMPLES,
-        description="full_seg samples to intersect. More samples means finer atoms and a "
-                    "longer run: each one is a full flow-model pass."),
-    azimuth: float = Form(0.0, description="Degrees to orbit the conditioning camera."),
-    azimuth_jitter: float = Form(
-        segment_parts.DEFAULT_AZIMUTH_JITTER,
-        description="How far the extra samples orbit either side of azimuth. full_seg only "
-                    "holds up near the front, so keep this under ~45."),
-    with_texture: bool = Form(True, description="Bake the source albedo onto each part."),
-    texture_size: int = Form(2048),
-    sam3_threshold: float = Form(0.3),
-    allow_partial: bool = Form(
-        False, description="Accept requested parts that ended up with no faces."),
+        None, description="Part that absorbs units no concept claimed."),
+    samples: int = Form(_DEFAULTS.samples),
+    azimuth: float = Form(_DEFAULTS.azimuth),
+    azimuth_jitter: float = Form(_DEFAULTS.azimuth_jitter),
+    granularity: str = Form(
+        _DEFAULTS.granularity,
+        description="fine 150/300 | medium 300/600 | coarse 800/1600. An explicit floor wins."),
+    min_atom_faces: int | None = Form(None),
+    min_unit_faces: int | None = Form(None),
+    color_tol: float | None = Form(None),
+    mirror: str = Form(_DEFAULTS.mirror, description=" | ".join(MIRROR_MODES)),
+    min_recall: float | None = Form(None),
+    view_azimuths: str = Form(_DEFAULTS.view_azimuths),
+    view_elevations: str = Form(_DEFAULTS.view_elevations),
+    radius: float = Form(_DEFAULTS.radius),
+    resolution: int = Form(_DEFAULTS.resolution),
+    flat_paint: str = Form(_DEFAULTS.flat_paint, description=" | ".join(FLAT_PAINT_MODES)),
+    merge: str = Form(
+        _DEFAULTS.merge,
+        description="name = one node per prompt; unit = one node per voted unit; "
+                    "off = stop after the units."),
+    complete: str = Form(
+        _DEFAULTS.complete,
+        description="off | boxes (prompts only) | full (regenerate + bake)."),
+    condition: str = Form(
+        _DEFAULTS.condition,
+        description="surface = faces the split assigned; box = whatever is in the box."),
+    min_area_share: float = Form(_DEFAULTS.min_area_share),
+    redraws: int = Form(_DEFAULTS.redraws),
+    octree_resolution: int = Form(_DEFAULTS.octree_resolution),
+    seed: int = Form(_DEFAULTS.seed),
+    with_texture: bool = Form(_DEFAULTS.with_texture),
+    texture_size: int = Form(_DEFAULTS.texture_size),
+    reuse: bool = Form(_DEFAULTS.reuse),
+    sam3_threshold: float = Form(_DEFAULTS.sam3_threshold),
+    concept_bank: str | None = Form(None),
+    no_concept_bank: bool = Form(False),
+    allow_partial: bool = Form(False, description="Accept requested parts with no faces."),
 ) -> dict:
+    if granularity not in GRANULARITY:
+        raise HTTPException(400, f"granularity must be one of {tuple(GRANULARITY)}")
+    if merge not in MERGE_MODES_ALL:
+        raise HTTPException(400, f"merge must be one of {MERGE_MODES_ALL}")
+    if complete not in COMPLETE_MODES:
+        raise HTTPException(400, f"complete must be one of {COMPLETE_MODES}")
+    if condition not in CONDITION_MODES:
+        raise HTTPException(400, f"condition must be one of {CONDITION_MODES}")
+    if flat_paint not in FLAT_PAINT_MODES:
+        raise HTTPException(400, f"flat_paint must be one of {FLAT_PAINT_MODES}")
+    if mirror not in MIRROR_MODES:
+        raise HTTPException(400, f"mirror must be one of {MIRROR_MODES}")
+    if no_concept_bank and concept_bank:
+        raise HTTPException(400, "pass either concept_bank or no_concept_bank, not both")
+    options = PipelineOptions.from_mapping({
+        "unassigned_to": unassigned_to,
+        "samples": samples,
+        "azimuth": azimuth,
+        "azimuth_jitter": azimuth_jitter,
+        "granularity": granularity,
+        "min_atom_faces": min_atom_faces,
+        "min_unit_faces": min_unit_faces,
+        "color_tol": color_tol,
+        "mirror": mirror,
+        "min_recall": min_recall,
+        "view_azimuths": view_azimuths,
+        "view_elevations": view_elevations,
+        "radius": radius,
+        "resolution": resolution,
+        "flat_paint": flat_paint,
+        "merge": merge,
+        "complete": complete,
+        "condition": condition,
+        "min_area_share": min_area_share,
+        "redraws": redraws,
+        "octree_resolution": octree_resolution,
+        "seed": seed,
+        "with_texture": with_texture,
+        "texture_size": texture_size,
+        "reuse": reuse,
+        "sam3_threshold": sam3_threshold,
+        "concept_bank": concept_bank,
+        "no_concept_bank": no_concept_bank,
+        "allow_partial": allow_partial,
+    })
     if not _gpu.acquire(blocking=False):
         raise HTTPException(409, "another segmentation is already running on this GPU")
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             _run_job, uuid.uuid4().hex, await glb.read(), glb.filename or "input.glb",
-            {
-                "prompts": prompts,
-                "unassigned_to": unassigned_to,
-                "samples": samples,
-                "azimuth": azimuth,
-                "azimuth_jitter": azimuth_jitter,
-                "with_texture": with_texture,
-                "texture_size": texture_size,
-                "sam3_threshold": sam3_threshold,
-                "strict_parts": not allow_partial,
-            },
+            {"prompts": prompts, **options.segment_kwargs()},
         )
     finally:
         _gpu.release()
+    result["options"] = options.public()["defaults"]
+    return result
 
 
 @app.post("/segment_legacy", deprecated=True)
@@ -284,6 +361,25 @@ def atoms(job_id: str):
 def report(job_id: str):
     return FileResponse(_artifact(job_id, "work", "vote_report.json"),
                         media_type="application/json")
+
+
+@app.get("/jobs/{job_id}/complete")
+def complete(job_id: str):
+    return FileResponse(_artifact(job_id, "complete", "xpart_parts.glb"),
+                        media_type="model/gltf-binary", filename="xpart_parts.glb")
+
+
+@app.get("/jobs/{job_id}/complete_raw")
+def complete_raw(job_id: str):
+    return FileResponse(_artifact(job_id, "complete", "xpart_parts_raw.glb"),
+                        media_type="model/gltf-binary", filename="xpart_parts_raw.glb")
+
+
+@app.get("/jobs/{job_id}/guidance/{name}")
+def guidance(job_id: str, name: str):
+    if os.path.basename(name) != name or not name.endswith(".png"):
+        raise HTTPException(404, "no such overlay")
+    return FileResponse(_artifact(job_id, "work", "guidance", name), media_type="image/png")
 
 
 @app.get("/jobs/{job_id}/map")

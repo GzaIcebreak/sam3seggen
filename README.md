@@ -9,6 +9,27 @@ mesh，带真实贴图。
 [在线 Demo](https://huggingface.co/spaces/fenghora/SegviGen) |
 [权重](https://huggingface.co/fenghora/SegviGen)
 
+## 📣 近期更新
+
+主线从「一张 2D 图去引导生成」换成「几何过分割再命名」，并接上封闭补全与贴图回烘。
+CLI、Python 和 HTTP **共用一份配置**（`pipeline.py` 的 `PipelineOptions`），开关不再各写各的。
+
+- **六步管线**：`paint → guidance → split → units → [merge] → [complete → bake]`。
+  几何定边界，语言只取名。`--merge off` 停在 units；`--complete off`（默认）停在开放的
+  `parts.glb`。
+- **X-Part 补全**（`--complete full`）：把切口敞开的部件生成为封闭实体。默认
+  `--condition surface` 用拆分已经定好的归属面做条件，而不是盒内裁到的东西；过小件
+  `--min_area_share 0.005` 折进最近大件（不再丢弃）；超框用同样条件 `--redraws 2` 重抽，
+  只留更贴盒的那一抽。
+- **贴图回烘**：开放件和封闭实体都把源 albedo 烘回去。实体笼子更松（`0.05 / 0.15`），
+  因为生成面只是近似原表面。
+- **投票挂接**：无票碎件如果只挂在一个已命名部件上、且不到其 10%，并进去（米奇的胡子跟头）；
+  否则走 `--unassigned_to`。
+- **统一接口**：下表是当前默认值。`GET /health` 原样返回六步、开关取值和这份默认。
+  `POST /segment` 的 `sam3_threshold` 已改为 **0.4**（概念库），不再是旧表单里的 0.3。
+
+入口与字段见 [接口](#-接口)。
+
 ## 🌟 相对原版的改进
 
 **识别 —— 语义提示词替代手涂 2D 引导图。**
@@ -20,8 +41,12 @@ mesh，带真实贴图。
 **合并 —— 每个语义物体恰好一个 mesh。**
 朴素 2D 引导会把复杂壳体拆成几十块碎片。`segment_parts.py` 换了一条路：先做多次无提示全量
 分割并对分区取交（故意过分割），再多视角渲染交给 SAM3 打掩码，每个**原子连通分量**投票选最
-贴合它的提示词，同名部件通过贴图图集合并成单个 mesh——UV 无损重映射，不重烘。语言只决定名字，
-边界全部来自几何，所以一个标错的像素再也撕不开一条边。
+贴合它的提示词，同名面导出为一个节点，并把源 albedo 烘回去。语言只决定名字，边界全部来自
+几何，所以一个标错的像素再也撕不开一条边。
+
+**补全 —— 敞开的切口可以封成实体。**
+拆开的壳体在切口处是空的。`--complete full` 把每个部件交给 X-Part 重生为封闭实体，再用同一套
+烘焙把贴图烘回去。默认条件是拆分归属面，不是盒子里碰巧装着的东西。
 
 **正面视角自动选择。**
 2D 引导模式对渲染朝向敏感。`--front_view` 自动挑选条件视角：
@@ -66,7 +91,8 @@ metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
 ## 🔨 部署
 
 在 Windows 11 + RTX 5090D（32 GB）上开发验证；原版面向 Linux + ≥24 GB 显存——两者都可用。
-需要**两个** Python 环境，因为 SAM3（transformers 5.x）与 SegviGen（transformers 4.57.6）依赖冲突：
+需要**两个** Python 环境跑拆分（SAM3 的 transformers 5.x 与 SegviGen 的 4.57.6 冲突）；
+`--complete full` 再加第三个 X-Part 环境：
 
 1. SegviGen 环境（运行本仓库的环境）：先装 [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) 依赖
     ```sh
@@ -86,7 +112,13 @@ metallic 系数修复、相机约定经渲染器实测标定（IoU 0.987）。
     pip install "transformers>=5"   # 外加与你 CUDA 匹配的 torch
     ```
 
-3. 模型权重（见下节）
+3. X-Part 环境（仅 `--complete full` 需要；`boxes` 只写提示，不进这个 venv）
+    ```sh
+    # Hunyuan3D-Part / XPart，独立 venv；权重落到 SEGVIGEN_XPART_WEIGHTS
+    # 推理时由 SEGVIGEN_PY_XPART 调度，本仓库不 import 它
+    ```
+
+4. 模型权重（见下节）
 
 ### 权重位置
 
@@ -123,12 +155,34 @@ huggingface-cli download Zaun1996/sam3-concept-bank bank.pt --local-dir datasets
 运行时配置：
 
 - `SEGVIGEN_PY_SAM3` —— SAM3 环境的 Python 路径（默认 `../.venv_holo/Scripts/python.exe`）。
+- `SEGVIGEN_PY_XPART` / `SEGVIGEN_XPART_ROOT` / `SEGVIGEN_XPART_WEIGHTS` —— X-Part 解释器、
+  源码根和权重；只在 `--complete full` 时用到。
 - GPU 后端（Blackwell 已验证）：`ATTN_BACKEND=flash_attn SPARSE_CONV_BACKEND=flex_gemm FLEX_GEMM_ALGO=explicit_gemm`。
 - VLM 正面模式：`MOONSHOT_API_KEY`（环境变量或仓库根目录下 gitignored 的 `.env` 文件）；
   `SEGVIGEN_VLM_BASE_URL` / `SEGVIGEN_VLM_MODEL` 可覆盖默认值
   （`https://api.moonshot.cn/v1`，`kimi-latest`）。
 
 ## 📒 接口
+
+三个入口读同一份契约：`pipeline.PipelineOptions`。路径（`glb` / `out` / `work_dir`）每次不同，
+留在调用方；**怎么跑**的开关全部在这个对象上。CLI 由 `add_cli_arguments()` 挂上，HTTP
+`POST /segment` 字段名与 dataclass 对齐，`GET /health` 返回 `public()`。
+
+| 入口 | 文件 | 做什么 |
+|---|---|---|
+| CLI 全程 | `segment_parts.py` | 六步；`--merge off` 只拆不命名 |
+| CLI 只命名 | `merge_parts.py` | 对已有 `work/` 命名、导出、可选补全 |
+| Python | `from pipeline import PipelineOptions` | `segment_kwargs()` / `merge_kwargs()` |
+| HTTP | `serve_api.py` | `POST /segment`；旧 2D 路线在 `/segment_legacy` |
+
+```python
+from pipeline import PipelineOptions
+from segment_parts import segment_parts
+
+opts = PipelineOptions(merge="name", complete="off", granularity="medium")
+segment_parts("model.glb", ["head", "torso"], "out/parts.glb",
+              work_dir="out/work", **opts.segment_kwargs())
+```
 
 ### `segment_parts.py` —— 当前主线：先过分割，再命名
 
@@ -140,7 +194,7 @@ python segment_parts.py \
   --out out/parts.glb --work_dir out/work
 ```
 
-边界全部由几何决定，语言只负责取名。管线是固定的五步：
+边界全部由几何决定，语言只负责取名。管线是固定的六步：
 
 1. **平涂**：用固定视角网格渲染**原始模型**；如果渲染图本身没有颜色（无贴图的白模），拿
    一次 `full_seg` 的部件色给它涂一层临时平色（`flat_paint.py`）。有贴图的模型跳过这步。
@@ -154,9 +208,33 @@ python segment_parts.py \
 5. **合并**（由 `--merge` 开关控制）：每个单元取第 2 步掩码覆盖它的名字，同时覆盖的取最
    贴合的那个；相机看不到的按最近可见面继承。按名字导出，并把原模型的 albedo 烘回每个部件。
 6. **补全**（由 `--complete` 开关控制）：我们的部件在切口处是敞开的，X-Part 把每个部件重新
-   生成为封闭实体（`xpart_complete.py`）。
+   生成为封闭实体（`xpart_complete.py`）。`--complete full` 之后把原模型 albedo 烘回这些实体
+   （和拆分那步同一套 Blender selected-to-active，只是笼子更松，因为生成面只是近似原表面）。
 
 第 3、6 步要花 GPU 时间，其余在渲染图缓存后都是秒级。
+
+| 开关 | 取值 | 当前默认 | 作用 |
+|---|---|---|---|
+| `--merge` | `name` / `unit` / `off` | `name` | 命名；`off` 停在 units |
+| `--complete` | `off` / `boxes` / `full` | `off` | X-Part；`full` 再生成为实体后再烘贴图 |
+| `--condition` | `surface` / `box` | `surface` | X-Part 条件：拆分归属面，或盒内裁剪 |
+| `--flat_paint` | `auto` / `on` / `off` | `auto` | 渲染无色时先平涂 |
+| `--granularity` | `fine` / `medium` / `coarse` | `medium` | 原子/单元下限 150/300、300/600、800/1600 |
+| `--min_atom_faces` / `--min_unit_faces` | int | 随粒度 | 显式覆盖对应那一半 |
+| `--samples` | int | `7` | meet 采样次数 |
+| `--azimuth` / `--azimuth_jitter` | float | `0` / `30` | 条件相机及抖动 |
+| `--color_tol` | float | `20` | 同一样本内分色距离 |
+| `--mirror` | `auto` / `none` / `x` / `y` / `z` | `auto` | 对称求交 |
+| `--min_recall` | float | `0.5` | 掩码认领单元的覆盖门槛 |
+| `--view_azimuths` × `--view_elevations` | 角度列表 | `45,225` × `10` | SAM3 投票视角 |
+| `--radius` / `--resolution` | | `2` / `512` | 投票渲染 |
+| `--sam3_threshold` | float | `0.4` | 概念库阈值（无库时画笔是 0.3） |
+| `--min_area_share` | float | `0.005` | 过小件折进最近大件 |
+| `--redraws` | int | `2` | 超框实体重抽次数 |
+| `--octree_resolution` / `--seed` | | `512` / `42` | X-Part 重建 |
+| `--texture_size` | int | `2048` | 烘焙分辨率 |
+| `--no_texture` / `--no_reuse` / `--allow_partial` | flag | 关 | 跳过烘焙 / 不复用缓存 / 允许缺件 |
+| `--unassigned_to` | 部件名 | 无 | 无票单元并入该部件；否则丢弃 |
 
 ### 采样数买到的不是更细，是更少靠运气
 
@@ -335,20 +413,30 @@ manifest = segment(
 curl -X POST http://127.0.0.1:8020/segment \
   -F "glb=@model.glb" \
   -F "prompts=leaves" -F "prompts=fruit" \
-  -F "unassigned_to=fruit" -F "samples=5"
+  -F "unassigned_to=fruit" \
+  -F "granularity=coarse" -F "complete=full"
 ```
 
-`POST /segment` 走 `segment_parts.py`；`POST /segment_legacy` 是旧的 2D 引导路线，保留
-`azimuth` / `front_view` / `assign` / `split_mode` 这些选项。
+`POST /segment` 走 `segment_parts.py`。multipart 字段名与 `PipelineOptions` 一致，未传的用上表
+默认值。`prompts` 每个部件传一次（概念可以带空格）；`merge=off` 时可以为空。
+`sam3_threshold` 默认 **0.4**。`POST /segment_legacy` 是旧的 2D 引导路线。
 
-返回 `parts` 清单和下载链接：`GET /jobs/{id}/download` 取结果，
-`GET /jobs/{id}/parts/{node}.glb` 取单件，`GET /jobs/{id}/atoms` 取投票前的原子、
-`GET /jobs/{id}/report` 取投票表（旧路线的任务则是 `/map` 和 `/render`）。
-`GET /health` 列出当前默认权重和 GPU 是否占用。
+成功响应带 `parts` 清单、本次生效的 `options`，以及下面这些链接：
 
-`prompts` 必须每个部件传一次，不要用空格拼在一起——概念本身可以带空格（`small mushroom`）。
+| 方法 | 路径 | 内容 |
+|---|---|---|
+| `GET` | `/health` | 六步、开关取值、当前默认、GPU 是否占用 |
+| `POST` | `/segment` | 上传 GLB + 选项 → 清单和下载链接 |
+| `POST` | `/segment_legacy` | 旧 2D 引导（`front_view` / `assign` / `split_mode`） |
+| `GET` | `/jobs/{id}/download` | `parts.glb`（开放、已命名的部件） |
+| `GET` | `/jobs/{id}/atoms` | 投票前的过分割原子 |
+| `GET` | `/jobs/{id}/report` | 逐单元投票表（`merge=off` 时没有） |
+| `GET` | `/jobs/{id}/complete` | 烘过贴图的 X-Part 实体（`complete=full`） |
+| `GET` | `/jobs/{id}/complete_raw` | 烘焙前的生成实体 |
+| `GET` | `/jobs/{id}/guidance/{name}` | `work/guidance/` 里的审阅叠加图 |
+| `GET` | `/jobs/{id}/map`、`/render` | 仅旧路线 |
 
-各阶段仍是各自加载模型的子进程，一次请求约两分钟，而且只有一块卡：任务串行加锁，第二个请求
+各阶段仍是各自加载模型的子进程，一次请求约数分钟，而且只有一块卡：任务串行加锁，第二个请求
 直接返回 409 而不是排队。它是给外部联调用的测试服务，不是吞吐服务。
 
 ### `segment_vote.py` —— 已弃用：单次采样 + 覆盖率投票

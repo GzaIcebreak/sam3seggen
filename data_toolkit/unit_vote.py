@@ -18,7 +18,12 @@ Four decisions that matter, all measured on the robot test case:
   the unit head-on outvote all the others, which is exactly the view where a part half
   hidden behind another one gets its neighbour's name;
 * the remesh's inner walls are invisible to every camera and would otherwise all fall to
-  the same name; hidden units inherit the label of the nearest visible face instead.
+  the same name; hidden units inherit the label of the nearest visible face instead;
+* a visible unit no mask claimed is not automatically the dump bucket. Mickey's whiskers
+  are their own atom, SAM3's head mask stops at the cheeks, and `--unassigned_to torso`
+  then painted them onto the body. A sliver that only touches voted units and is a small
+  fraction of them joins those units; a large unvoted region (the torso, hanging off the
+  head at the neck) still goes to `unassigned_to`.
 """
 from __future__ import annotations
 
@@ -49,6 +54,22 @@ SEG_TO_CAMERA = np.diag([1.0, -1.0, -1.0])
 DEFAULT_MIN_UNIT_FACES = 600
 DEFAULT_MIN_RECALL = 0.5
 DEFAULT_MIN_VISIBLE_PIXELS = 50
+# An unvoted unit may join the voted parts it only hangs off, if it is this small
+# relative to the largest of them. Mickey's whiskers are 4% of the head; the hands,
+# which also touch the head, are 21% and stay with the body.
+DEFAULT_HANG_SHARE = 0.1
+
+
+def unit_neighbors(unit_of_face, adjacency):
+    """Undirected neighbour list: unit -> sorted unique neighboring unit ids."""
+    n_units = int(unit_of_face.max()) + 1
+    left, right = unit_of_face[adjacency[:, 0]], unit_of_face[adjacency[:, 1]]
+    cross = left != right
+    neighbors = [[] for _ in range(n_units)]
+    for a, b in zip(left[cross], right[cross]):
+        neighbors[int(a)].append(int(b))
+        neighbors[int(b)].append(int(a))
+    return [sorted(set(row)) for row in neighbors]
 
 
 def split_units(mesh, atoms, adjacency, min_unit_faces=DEFAULT_MIN_UNIT_FACES):
@@ -210,16 +231,38 @@ def tally_votes(recall, iou, unit_pixels, min_recall=DEFAULT_MIN_RECALL,
     return counts, weight
 
 
-def assign_units(mesh, unit_of_face, names, votes, weight, seen, unassigned_to):
-    """One name (or None) per unit. Hidden units copy the nearest visible face's name."""
+def assign_units(mesh, unit_of_face, names, votes, weight, seen, unassigned_to,
+                 neighbors=None, hang_share=DEFAULT_HANG_SHARE):
+    """One name (or None) per unit. Hidden units copy the nearest visible face's name.
+
+    Visible units no mask claimed join an adjacent voted part when they only hang off
+    voted parts and are a small fraction of them -- a leftover of the split, not a part
+    of their own. Everything else still goes to `unassigned_to`.
+    """
     assignment = [None] * len(seen)
+    voted = set()
     for unit in np.flatnonzero(seen):
         if votes[unit].any():
             # ties go to the name the views that voted for it fitted best
             best = int(np.lexsort((weight[unit], votes[unit]))[-1])
             assignment[unit] = names[best]
-        else:
-            assignment[unit] = unassigned_to
+            voted.add(int(unit))
+    faces_of = np.bincount(unit_of_face, minlength=len(seen))
+    for unit in np.flatnonzero(seen):
+        if assignment[unit] is not None:
+            continue
+        assignment[unit] = unassigned_to
+        if not neighbors:
+            continue
+        adj = neighbors[int(unit)]
+        voted_adj = [n for n in adj if n in voted]
+        if not voted_adj or any(n not in voted for n in adj):
+            continue
+        ceiling = hang_share * max(int(faces_of[n]) for n in voted_adj)
+        if faces_of[unit] >= ceiling:
+            continue
+        labels = [assignment[n] for n in voted_adj]
+        assignment[unit] = max(set(labels), key=labels.count)
     visible = np.asarray(seen, dtype=bool)
     if (~visible).any():
         centroids = mesh.triangles_center
@@ -271,8 +314,9 @@ def vote(mesh, atoms, mask_set, cameras, camera_angle_x, resolution, part_order,
     names, recall, iou = score_units(inter, unit_pixels, mask_pixels, list(mask_set.owners))
     votes, weight = tally_votes(recall, iou, unit_pixels, min_recall, min_visible_pixels)
     seen = (unit_pixels >= min_visible_pixels).sum(axis=0)
+    neighbors = unit_neighbors(unit_of_face, welded_face_adjacency(mesh))
     assignment, visible = assign_units(mesh, unit_of_face, names, votes, weight, seen,
-                                       unassigned_to)
+                                       unassigned_to, neighbors)
 
     index_of = {name: i for i, name in enumerate(part_order)}
     labels = np.full(len(atoms), -1, dtype=np.int64)

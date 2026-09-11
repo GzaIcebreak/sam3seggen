@@ -19,8 +19,9 @@ boundary and language only chooses names:
        units are fused and exported.
     6. complete, gated by `--complete`: our parts are open where they were cut, so X-Part
        regenerates each as a closed solid from the whole model plus a box prompt
-       (xpart_complete.py). Look at "boxes" first -- a box is a lossy prompt, and a part
-       whose box overlaps its neighbours' comes back filled out to that box.
+       (xpart_complete.py). `--complete full` then bakes the source albedo onto those
+       solids. Look at "boxes" first -- a box is a lossy prompt, and a part whose box
+       overlaps its neighbours' comes back filled out to that box.
 
 Steps 3 and 6 cost GPU minutes; the rest costs seconds once the renders are cached.
 `--merge off` stops after step 4 and writes one node per unit -- still producing the
@@ -50,38 +51,20 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from merge_parts import (
-    COMPLETE_MODES, CONDITION_MODES, DEFAULT_CONCEPT_BANK, DEFAULT_CONDITION,
-    DEFAULT_PY_XPART, DEFAULT_RADIUS, DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD,
-    DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS, DEFAULT_XPART_ROOT,
-    DEFAULT_XPART_WEIGHTS, FLAT_PAINT_MODES,
-    canonical_prompts, export_labelled, guidance, merge_parts,
+from merge_parts import canonical_prompts, export_labelled, guidance, merge_parts
+from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public contract
+    DEFAULT_AZIMUTH, DEFAULT_AZIMUTH_JITTER, DEFAULT_COMPLETE, DEFAULT_CONCEPT_BANK,
+    DEFAULT_CONDITION, DEFAULT_FLAT_PAINT, DEFAULT_GRANULARITY, DEFAULT_MERGE,
+    DEFAULT_MIN_AREA_SHARE, DEFAULT_MIRROR, DEFAULT_OCTREE_RESOLUTION, DEFAULT_RADIUS,
+    DEFAULT_REDRAWS, DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD, DEFAULT_SAMPLES,
+    DEFAULT_SEED, DEFAULT_TEXTURE_SIZE, DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS,
+    DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS, GRANULARITY,
+    PipelineOptions, add_cli_arguments, check_cli, floors,
 )
 from prompt_specs import normalize_part_specs
 from segment_api import DEFAULT_PY_SAM3, DEFAULT_SAM3, DEFAULT_TRANSFORMS, _run
 
 DEFAULT_CKPT = os.path.join(ROOT, "ckpt", "full_seg.ckpt")
-DEFAULT_SAMPLES = 7
-DEFAULT_AZIMUTH_JITTER = 30.0
-
-# (min_atom_faces, min_unit_faces) under one name, because the two only make sense
-# together -- a floor on the atoms that the units then undo is no floor at all.
-#
-# Sweeping both against naming quality on the robot and Mickey, the named part count came
-# out the same at every setting from 150/300 to 800/1600: over-segmenting costs the merge
-# nothing, it only fuses. What the floors do change is how much surface gets named by an
-# actual vote instead of by the nearest-neighbour fallback, since a unit too small for any
-# camera to see well casts no vote, and that peaks in the middle (robot 75.0% at fine,
-# 76.1% at medium, 73.3% at coarse). Hence the default.
-#
-# Go finer to keep a part the size of a bolt head or a button; go coarser when the parts
-# are large and the split is shattering flat surfaces into panels.
-GRANULARITY = {
-    "fine": (150, 300),
-    "medium": (300, 600),
-    "coarse": (800, 1600),
-}
-DEFAULT_GRANULARITY = "medium"
 
 
 def sample_azimuths(count, azimuth, jitter):
@@ -116,14 +99,14 @@ def segment_parts(
     out_glb,
     work_dir=None,
     samples=DEFAULT_SAMPLES,
-    azimuth=0.0,
+    azimuth=DEFAULT_AZIMUTH,
     azimuth_jitter=DEFAULT_AZIMUTH_JITTER,
     ckpt=None,
     transforms=None,
     color_tol=None,
     granularity=DEFAULT_GRANULARITY,
     min_atom_faces=None,
-    mirror="auto",
+    mirror=DEFAULT_MIRROR,
     min_unit_faces=None,
     min_recall=None,
     view_azimuths=DEFAULT_VIEW_AZIMUTHS,
@@ -134,20 +117,22 @@ def segment_parts(
     sam3_model=DEFAULT_SAM3,
     sam3_threshold=DEFAULT_SAM3_THRESHOLD,
     concept_bank=DEFAULT_CONCEPT_BANK,
-    flat_paint="auto",
+    flat_paint=DEFAULT_FLAT_PAINT,
     unassigned_to=None,
-    merge="name",
-    complete="off",
+    merge=DEFAULT_MERGE,
+    complete=DEFAULT_COMPLETE,
     py_xpart=None,
     xpart_root=DEFAULT_XPART_ROOT,
     xpart_weights=DEFAULT_XPART_WEIGHTS,
-    octree_resolution=512,
-    seed=42,
+    octree_resolution=DEFAULT_OCTREE_RESOLUTION,
+    seed=DEFAULT_SEED,
     condition=DEFAULT_CONDITION,
+    min_area_share=DEFAULT_MIN_AREA_SHARE,
+    redraws=DEFAULT_REDRAWS,
     reuse=True,
     strict_parts=True,
     with_texture=True,
-    texture_size=2048,
+    texture_size=DEFAULT_TEXTURE_SIZE,
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -215,12 +200,7 @@ def segment_parts(
     py_sam3 = py_sam3 or DEFAULT_PY_SAM3
     py_self = sys.executable
     color_tol = DEFAULT_COLOR_TOL if color_tol is None else color_tol
-    if granularity not in GRANULARITY:
-        raise ValueError(f"granularity must be one of {tuple(GRANULARITY)}, "
-                         f"got {granularity!r}")
-    atom_floor, unit_floor = GRANULARITY[granularity]
-    min_atom_faces = atom_floor if min_atom_faces is None else min_atom_faces
-    min_unit_faces = unit_floor if min_unit_faces is None else min_unit_faces
+    min_atom_faces, min_unit_faces = floors(granularity, min_atom_faces, min_unit_faces)
 
     work_dir = os.path.abspath(work_dir or os.path.join(out_dir, "work_parts"))
     atoms_npy = os.path.join(work_dir, "atoms.npy")
@@ -296,7 +276,8 @@ def segment_parts(
             concept_bank=concept_bank, flat_paint=flat_paint, units=units,
             complete=complete, py_xpart=py_xpart, xpart_root=xpart_root,
             xpart_weights=xpart_weights, octree_resolution=octree_resolution, seed=seed,
-            condition=condition, reuse=reuse, strict_parts=strict_parts,
+            condition=condition, min_area_share=min_area_share, redraws=redraws,
+            reuse=reuse, strict_parts=strict_parts,
             with_texture=with_texture, texture_size=texture_size,
         )
 
@@ -323,111 +304,22 @@ def main():
     parser.add_argument("--out", required=True, help="Output glb, one node per part")
     parser.add_argument("--work_dir", default=None,
                         help="Keep intermediates here. Default: work_parts/ next to --out.")
-    parser.add_argument("--samples", type=int, default=DEFAULT_SAMPLES,
-                        help="full_seg samples to intersect; each costs one flow-model run")
-    parser.add_argument("--azimuth", type=float, default=0.0,
-                        help="Degrees to orbit transforms.json's camera for the base sample")
-    parser.add_argument("--azimuth_jitter", type=float, default=DEFAULT_AZIMUTH_JITTER,
-                        help="How far the extra samples orbit either side of --azimuth")
     parser.add_argument("--ckpt", default=None, help=f"default: {DEFAULT_CKPT}")
     parser.add_argument("--transforms", default=None, help=f"default: {DEFAULT_TRANSFORMS}")
-    parser.add_argument("--color_tol", type=float, default=None,
-                        help="RGB distance separating two colours within one sample")
-    parser.add_argument("--granularity", default=DEFAULT_GRANULARITY,
-                        choices=tuple(GRANULARITY),
-                        help="How fine the split is allowed to get: sets both size floors "
-                             "at once (%s). Either floor given explicitly wins."
-                             % ", ".join(f"{k} {v[0]}/{v[1]}"
-                                         for k, v in GRANULARITY.items()))
-    parser.add_argument("--min_atom_faces", type=int, default=None,
-                        help="Slivers under this many faces join their majority neighbour")
-    parser.add_argument("--mirror", default="auto", choices=("auto", "none", "x", "y", "z"),
-                        help="Also intersect each sample reflected across this plane, so a "
-                             "joint one sample cut on the left is cut on the right too")
-    parser.add_argument("--min_unit_faces", type=int, default=None,
-                        help="Connected components under this many faces are not voted on alone")
-    parser.add_argument("--min_recall", type=float, default=None,
-                        help="A mask claims a unit once it covers this share of the unit's pixels")
-    parser.add_argument("--view_azimuths", default=DEFAULT_VIEW_AZIMUTHS)
-    parser.add_argument("--view_elevations", default=DEFAULT_VIEW_ELEVATIONS)
-    parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS)
-    parser.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION)
-    parser.add_argument("--unassigned_to", default=None,
-                        help="Part that absorbs units no concept claimed")
-    parser.add_argument("--merge", default="name", choices=("name", "unit", "off"),
-                        help="name = one node per prompt. unit = one node per voted unit, "
-                             "nothing merged and nothing dropped, for inspecting the vote. "
-                             "off = stop after the units; the guidance overlays are still "
-                             "written if --prompts were given, so they can be reviewed "
-                             "before merging")
-    parser.add_argument("--no_reuse", action="store_true",
-                        help="Re-run every stage instead of reusing what is in --work_dir")
-    parser.add_argument("--allow_partial", action="store_true",
-                        help="Accept requested names that ended up with no faces")
-    parser.add_argument("--no_texture", action="store_true",
-                        help="Skip the Blender bake; parts get a flat placeholder colour")
-    parser.add_argument("--texture_size", type=int, default=2048)
     parser.add_argument("--py_sam3", default=None, help=f"default: {DEFAULT_PY_SAM3}")
     parser.add_argument("--sam3_model", default=DEFAULT_SAM3)
-    parser.add_argument("--sam3_threshold", type=float, default=DEFAULT_SAM3_THRESHOLD)
-    parser.add_argument("--concept_bank", default=DEFAULT_CONCEPT_BANK,
-                        help="SAM3 v3 bank.pt (the maps.png stain). Empty = raw SAM3.")
-    parser.add_argument("--no_concept_bank", action="store_true",
-                        help="Disable the v3 bank and fall back to raw SAM3 scores")
-    parser.add_argument("--flat_paint", default="auto", choices=FLAT_PAINT_MODES,
-                        help="Temporary flat colour for a model the renders show as grey")
-    parser.add_argument("--complete", default="off", choices=COMPLETE_MODES,
-                        help="Hand the parts to X-Part: boxes = prompts only, "
-                             "full = also regenerate each part as a closed solid")
-    parser.add_argument("--condition", default=DEFAULT_CONDITION, choices=CONDITION_MODES,
-                        help="What describes a part to X-Part: the faces the split "
-                             "assigned to it, or (box) whatever falls inside its box")
-    parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
-    parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
-    parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)
-    parser.add_argument("--octree_resolution", type=int, default=512,
-                        help="Marching-cubes resolution X-Part reconstructs each part at")
-    parser.add_argument("--seed", type=int, default=42)
+    add_cli_arguments(parser, split=True, merge_off=True)
     args = parser.parse_args()
-    if args.no_concept_bank and args.concept_bank != DEFAULT_CONCEPT_BANK:
-        parser.error("pass either --concept_bank or --no_concept_bank, not both")
-
+    check_cli(parser, args)
+    options = PipelineOptions.from_namespace(args)
     segment_parts(
         args.glb, args.prompts, args.out,
         work_dir=args.work_dir,
-        samples=args.samples,
-        azimuth=args.azimuth,
-        azimuth_jitter=args.azimuth_jitter,
         ckpt=args.ckpt,
         transforms=args.transforms,
-        color_tol=args.color_tol,
-        granularity=args.granularity,
-        min_atom_faces=args.min_atom_faces,
-        mirror=args.mirror,
-        min_unit_faces=args.min_unit_faces,
-        min_recall=args.min_recall,
-        view_azimuths=args.view_azimuths,
-        view_elevations=args.view_elevations,
-        radius=args.radius,
-        resolution=args.resolution,
         py_sam3=args.py_sam3,
         sam3_model=args.sam3_model,
-        sam3_threshold=args.sam3_threshold,
-        concept_bank="" if args.no_concept_bank else args.concept_bank,
-        flat_paint=args.flat_paint,
-        unassigned_to=args.unassigned_to,
-        merge=args.merge,
-        complete=args.complete,
-        py_xpart=args.py_xpart,
-        xpart_root=args.xpart_root,
-        xpart_weights=args.xpart_weights,
-        octree_resolution=args.octree_resolution,
-        seed=args.seed,
-        condition=args.condition,
-        reuse=not args.no_reuse,
-        strict_parts=not args.allow_partial,
-        with_texture=not args.no_texture,
-        texture_size=args.texture_size,
+        **options.segment_kwargs(),
     )
 
 

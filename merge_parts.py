@@ -31,35 +31,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from prompt_specs import normalize_part_specs, part_names, validate_named_rows, validate_target_name
-from segment_api import (
-    BANK_THRESHOLD, DEFAULT_CONCEPT_BANK, DEFAULT_PY_SAM3, DEFAULT_SAM3, _run,
+from pipeline import (
+    COMPLETE_MODES, CONDITION_MODES, DEFAULT_CONDITION, DEFAULT_CONCEPT_BANK,
+    DEFAULT_MIN_AREA_SHARE, DEFAULT_OCTREE_RESOLUTION, DEFAULT_PY_XPART,
+    DEFAULT_RADIUS, DEFAULT_REDRAWS, DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD,
+    DEFAULT_TEXTURE_SIZE, DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS,
+    DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS, FLAT_PAINT_MODES, MERGE_MODES,
+    PipelineOptions, add_cli_arguments, check_cli,
 )
-
-# The 3/4 pair (45 and 225), barely raised. A level azimuth-90 misses "torso" on the
-# chest and the arm mask then swallows the backpack, but height costs more than it buys:
-# at 35 degrees the camera looks down far enough that the torso hides the legs, feet and
-# base. 10 degrees keeps the 3/4 framing and still shows the bottom half.
-DEFAULT_VIEW_AZIMUTHS = "45,225"
-DEFAULT_VIEW_ELEVATIONS = "10"
-DEFAULT_RADIUS = 2.0
-DEFAULT_RESOLUTION = 512
-DEFAULT_SAM3_THRESHOLD = BANK_THRESHOLD
-MERGE_MODES = ("name", "unit")
-# "auto" paints only a model the renders show as grey; see flat_paint.is_colorless.
-FLAT_PAINT_MODES = ("auto", "on", "off")
-# Our parts are open where they were cut. X-Part regenerates each one as a closed solid
-# from the whole model plus a box prompt; "boxes" writes those prompts without loading it.
-COMPLETE_MODES = ("off", "boxes", "full")
-# A box also contains whatever else passes through it; our split knows the faces exactly.
-CONDITION_MODES = ("surface", "box")
-DEFAULT_CONDITION = "surface"
-DEFAULT_PY_XPART = os.environ.get(
-    "SEGVIGEN_PY_XPART", "/root/autodl-tmp/envs/xpart/bin/python")
-DEFAULT_XPART_ROOT = os.environ.get(
-    "SEGVIGEN_XPART_ROOT", "/root/autodl-tmp/Hunyuan3D-Part/XPart")
-DEFAULT_XPART_WEIGHTS = os.environ.get(
-    "SEGVIGEN_XPART_WEIGHTS", "/root/autodl-tmp/Hunyuan3D-Part/weights")
+from prompt_specs import normalize_part_specs, part_names, validate_named_rows, validate_target_name
+from segment_api import DEFAULT_PY_SAM3, DEFAULT_SAM3, _run
 
 
 def canonical_prompts(specs):
@@ -286,13 +267,15 @@ def merge_parts(
     py_xpart=None,
     xpart_root=DEFAULT_XPART_ROOT,
     xpart_weights=DEFAULT_XPART_WEIGHTS,
-    octree_resolution=512,
+    octree_resolution=DEFAULT_OCTREE_RESOLUTION,
     seed=42,
     condition=DEFAULT_CONDITION,
+    min_area_share=DEFAULT_MIN_AREA_SHARE,
+    redraws=DEFAULT_REDRAWS,
     reuse=True,
     strict_parts=True,
     with_texture=True,
-    texture_size=2048,
+    texture_size=DEFAULT_TEXTURE_SIZE,
 ):
     """Name the atoms in `split_dir` with `prompts` and write the parts into `out_glb`.
 
@@ -379,7 +362,7 @@ def merge_parts(
     print(f"saved {out_glb} ({len(manifest)} parts)")
     complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
                    py_xpart, xpart_root, xpart_weights, octree_resolution, seed,
-                   condition)
+                   condition, with_texture, texture_size, min_area_share, redraws)
     return manifest
 
 
@@ -405,7 +388,9 @@ def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
 
 def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
                    xpart_root=DEFAULT_XPART_ROOT, model_path=DEFAULT_XPART_WEIGHTS,
-                   octree_resolution=512, seed=42, condition=DEFAULT_CONDITION):
+                   octree_resolution=512, seed=42, condition=DEFAULT_CONDITION,
+                   with_texture=True, texture_size=DEFAULT_TEXTURE_SIZE,
+                   min_area_share=DEFAULT_MIN_AREA_SHARE, redraws=DEFAULT_REDRAWS):
     """Hand the parts to X-Part so it can close them into solids.
 
     Splitting one shell leaves every part open where it was cut. X-Part regenerates each
@@ -433,8 +418,22 @@ def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
     else:
         command += ["--xpart_root", xpart_root, "--model_path", model_path,
                     "--octree_resolution", octree_resolution, "--seed", seed,
-                    "--condition", condition]
+                    "--condition", condition,
+                    "--min_area_share", min_area_share, "--redraws", redraws]
     _run(command)
+    closed = os.path.join(out_dir, "xpart_parts.glb")
+    if mode == "full" and with_texture and os.path.isfile(closed):
+        raw = os.path.join(out_dir, "xpart_parts_raw.glb")
+        os.replace(closed, raw)
+        print("[complete] baking source albedo onto the closed solids ...")
+        _run([
+            sys.executable, os.path.join(ROOT, "data_toolkit", "parts_rebake.py"),
+            "--completed", raw, "--source_glb", glb, "--out_dir", out_dir,
+            "--combined_name", "xpart_parts.glb", "--texture_size", texture_size,
+            # Generated solids only approximate the source; the split's 0.02/0.05 cage
+            # leaves most of an X-Part surface unhit.
+            "--cage_extrusion", "0.05", "--max_ray_distance", "0.15",
+        ])
     with open(os.path.join(out_dir, "boxes.json"), "r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -452,78 +451,17 @@ def main():
     parser.add_argument("--out", required=True, help="Output glb, one node per part")
     parser.add_argument("--mesh", default=None, help="Override the reference seg.glb")
     parser.add_argument("--atoms", default=None, help="Override the atom label npy")
-    parser.add_argument("--unassigned_to", default=None,
-                        help="Part that absorbs units no concept claimed")
-    parser.add_argument("--merge", default="name", choices=MERGE_MODES,
-                        help="name = one node per prompt; unit = one node per voted unit")
-    parser.add_argument("--min_unit_faces", type=int, default=None,
-                        help="Connected components under this many faces are not voted on alone")
-    parser.add_argument("--min_recall", type=float, default=None,
-                        help="A mask claims a unit in one view once it covers this share of it")
-    parser.add_argument("--view_azimuths", default=DEFAULT_VIEW_AZIMUTHS)
-    parser.add_argument("--view_elevations", default=DEFAULT_VIEW_ELEVATIONS)
-    parser.add_argument("--radius", type=float, default=DEFAULT_RADIUS)
-    parser.add_argument("--resolution", type=int, default=DEFAULT_RESOLUTION)
-    parser.add_argument("--no_reuse", action="store_true",
-                        help="Re-render and re-mask instead of reusing what is in --split")
-    parser.add_argument("--allow_partial", action="store_true",
-                        help="Accept requested names that ended up with no faces")
-    parser.add_argument("--no_texture", action="store_true",
-                        help="Skip the Blender bake; parts get a flat placeholder colour")
-    parser.add_argument("--texture_size", type=int, default=2048)
     parser.add_argument("--py_sam3", default=None, help=f"default: {DEFAULT_PY_SAM3}")
     parser.add_argument("--sam3_model", default=DEFAULT_SAM3)
-    parser.add_argument("--sam3_threshold", type=float, default=DEFAULT_SAM3_THRESHOLD)
-    parser.add_argument("--concept_bank", default=DEFAULT_CONCEPT_BANK,
-                        help="SAM3 v3 bank.pt (the maps.png stain). Empty = raw SAM3.")
-    parser.add_argument("--no_concept_bank", action="store_true",
-                        help="Disable the v3 bank and fall back to raw SAM3 scores")
-    parser.add_argument("--flat_paint", default="auto", choices=FLAT_PAINT_MODES,
-                        help="Temporary flat colour for a model the renders show as grey")
-    parser.add_argument("--complete", default="off", choices=COMPLETE_MODES,
-                        help="Hand the parts to X-Part: boxes = prompts only, "
-                             "full = also regenerate each part as a closed solid")
-    parser.add_argument("--condition", default=DEFAULT_CONDITION, choices=CONDITION_MODES,
-                        help="What describes a part to X-Part: the faces the split "
-                             "assigned to it, or (box) whatever falls inside its box")
-    parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
-    parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
-    parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)
-    parser.add_argument("--octree_resolution", type=int, default=512,
-                        help="Marching-cubes resolution X-Part reconstructs each part at")
-    parser.add_argument("--seed", type=int, default=42)
+    add_cli_arguments(parser, split=False, merge_off=False)
     args = parser.parse_args()
-    if args.no_concept_bank and args.concept_bank != DEFAULT_CONCEPT_BANK:
-        parser.error("pass either --concept_bank or --no_concept_bank, not both")
-
+    check_cli(parser, args)
+    options = PipelineOptions.from_namespace(args)
     merge_parts(
         args.glb, args.prompts, args.split, args.out,
-        mesh=args.mesh,
-        atoms=args.atoms,
-        unassigned_to=args.unassigned_to,
-        merge=args.merge,
-        min_unit_faces=args.min_unit_faces,
-        min_recall=args.min_recall,
-        view_azimuths=args.view_azimuths,
-        view_elevations=args.view_elevations,
-        radius=args.radius,
-        resolution=args.resolution,
-        py_sam3=args.py_sam3,
-        sam3_model=args.sam3_model,
-        sam3_threshold=args.sam3_threshold,
-        concept_bank="" if args.no_concept_bank else args.concept_bank,
-        flat_paint=args.flat_paint,
-        complete=args.complete,
-        py_xpart=args.py_xpart,
-        xpart_root=args.xpart_root,
-        xpart_weights=args.xpart_weights,
-        octree_resolution=args.octree_resolution,
-        seed=args.seed,
-        condition=args.condition,
-        reuse=not args.no_reuse,
-        strict_parts=not args.allow_partial,
-        with_texture=not args.no_texture,
-        texture_size=args.texture_size,
+        mesh=args.mesh, atoms=args.atoms,
+        py_sam3=args.py_sam3, sam3_model=args.sam3_model,
+        **options.merge_kwargs(),
     )
 
 

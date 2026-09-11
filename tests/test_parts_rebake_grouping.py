@@ -9,6 +9,7 @@ from data_toolkit.parts_rebake import (
     SPLIT_MODES,
     _split_labels,
     absorb_small_fragments,
+    completed_part_geometries,
     merge_labels_by_part,
     palette_from_legend,
     reassign_label_islands,
@@ -91,3 +92,19 @@ class PartsRebakeGroupingTest(unittest.TestCase):
             adjacency, labels, seen_sparse, min_visible_share=0.5, min_visible_faces=2)
         self.assertEqual(same.tolist(), labels.tolist())
         self.assertEqual(moved_faces, 0)
+
+
+class CompletedBakeInputTest(unittest.TestCase):
+    def test_scene_transforms_are_baked_before_the_cage_is_aimed(self):
+        import trimesh
+
+        box = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+        box.apply_translation([0.0, 2.0, 0.0])
+        scene = trimesh.Scene()
+        scene.add_geometry(box, geom_name="head", transform=np.eye(4))
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "closed.glb")
+            scene.export(path)
+            parts = completed_part_geometries(path)
+        self.assertEqual([p["name"] for p in parts], ["head"])
+        np.testing.assert_allclose(np.asarray(parts[0]["vertices"]).mean(axis=0)[1], 2.0, atol=1e-3)

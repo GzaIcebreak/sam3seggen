@@ -351,8 +351,13 @@ def _setup_cycles_bake(samples, cage_extrusion, max_ray_distance, margin=2):
     scene.render.bake.margin_type = "EXTEND"
 
 
-def _import_aligned_source(source_glb):
-    """Bring the original glb into the same frame as a to_glb / process_glb_to_vxz mesh."""
+def _import_source(source_glb, align_to_seg=True):
+    """Import the original glb. `align_to_seg` puts it in the to_glb / remesh frame.
+
+    X-Part writes solids in the source model's own frame, so baking those must skip the
+    align -- otherwise the cage looks at a unit-cube, rotated copy of the source and
+    the generated parts miss it entirely.
+    """
     import bpy
     from mathutils import Matrix, Vector
 
@@ -360,6 +365,8 @@ def _import_aligned_source(source_glb):
     source_objects = [o for o in bpy.context.scene.objects if o.type == "MESH"]
     if not source_objects:
         raise SystemExit(f"no mesh imported from {source_glb}")
+    if not align_to_seg:
+        return source_objects
 
     # to_glb rotates the voxelised model about X, and the glTF importer applies the same
     # kind of rotation to both files, so undoing it here puts the source model back into
@@ -379,6 +386,10 @@ def _import_aligned_source(source_glb):
         obj.matrix_world = normalize @ obj.matrix_world
     bpy.context.view_layer.update()
     return source_objects
+
+
+def _import_aligned_source(source_glb):
+    return _import_source(source_glb, align_to_seg=True)
 
 
 def _undo_to_glb_rotation(objs):
@@ -540,7 +551,7 @@ def blender_reuv_and_bake(mesh, source_glb, texture_size=2048, uv_angle_limit=66
 
 def bake_parts(parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_margin,
                cage_extrusion, max_ray_distance, samples, margin=2, combined_name="parts.glb",
-               save_textures=False):
+               save_textures=False, source_frame=False):
     """Re-UV and bake every part, then export them all as one glb (one node per part).
 
     Each part keeps its own mesh/material/UV/texture, so downstream tools can still tell
@@ -551,7 +562,7 @@ def bake_parts(parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_marg
 
     _setup_cycles_bake(samples, cage_extrusion, max_ray_distance, margin)
     _reset_bpy_scene()
-    source_objects = _import_aligned_source(source_glb)
+    source_objects = _import_source(source_glb, align_to_seg=not source_frame)
 
     # A selected-to-active bake only finds the source surface if the two overlap, so make
     # the assumed alignment visible rather than silently baking a blank texture.
@@ -593,7 +604,8 @@ def bake_parts(parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_marg
             "area": part["area"],
         })
 
-    _undo_to_glb_rotation(part_objects)
+    if not source_frame:
+        _undo_to_glb_rotation(part_objects)
 
     combined_path = os.path.join(out_dir, combined_name)
     bpy.ops.object.select_all(action="DESELECT")
@@ -746,6 +758,57 @@ def export_parts(seg_glb, source_glb, out_dir, palette=None, texture_size=2048, 
                       combined_name=combined_name, save_textures=save_textures)
 
 
+def _short_part_name(name):
+    """00_part_00_head -> head, so the bake does not prefix the prefix."""
+    import re
+
+    stripped = re.sub(r"^(?:\d+_)+", "", name)
+    stripped = re.sub(r"^(?:part_\d+_)+", "", stripped)
+    return stripped or name
+
+
+def completed_part_geometries(completed_glb):
+    """One bake-parts dict per node of a closed-parts glb already in the source frame."""
+    scene = trimesh.load(completed_glb, force="scene")
+    parts = []
+    for label, name in enumerate(scene.geometry):
+        mesh = scene.geometry[name].copy()
+        if name in scene.graph.geometry_nodes:
+            transform, _ = scene.graph.get(scene.graph.geometry_nodes[name][0])
+            mesh.apply_transform(transform)
+        parts.append({
+            "label": int(label),
+            "name": _short_part_name(name),
+            "part_color": [int(c) for c in LABEL_COLORS[label % len(LABEL_COLORS)]],
+            "vertices": np.asarray(mesh.vertices),
+            "faces": np.asarray(mesh.faces),
+            "area": float(mesh.area),
+        })
+    if not parts:
+        raise SystemExit(f"no mesh found in {completed_glb}")
+    return parts
+
+
+def bake_completed(completed_glb, source_glb, out_dir, texture_size=2048,
+                   uv_angle_limit=66.0, uv_margin=0.003, cage_extrusion=0.05,
+                   max_ray_distance=0.15, samples=16, margin=2,
+                   combined_name="xpart_parts.glb", save_textures=False):
+    """Re-UV X-Part's closed solids and bake the source albedo onto them.
+
+    The cage is looser than the split bake: a generated solid only approximates the
+    source surface, and the default 0.02/0.05 pair leaves most of it unhit.
+    """
+    parts = completed_part_geometries(completed_glb)
+    print(f"{len(parts)} closed solids from {os.path.basename(completed_glb)}")
+    for part in parts:
+        print(f"  {part['name']}: {len(part['faces'])} faces")
+    return bake_parts(
+        parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_margin,
+        cage_extrusion, max_ray_distance, samples, margin,
+        combined_name=combined_name, save_textures=save_textures, source_frame=True,
+    )
+
+
 def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_area_ratio=0.01,
                           smooth_iterations=3, combined_name="parts.glb", min_island_ratio=0.2,
                           two_d_map=None, transforms=None, azimuth=0.0,
@@ -807,7 +870,10 @@ def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_are
 
 def main():
     parser = argparse.ArgumentParser(description="Split SegviGen output into parts and rebake source texture")
-    parser.add_argument("--seg_glb", required=True, help="SegviGen output glb (part colours)")
+    parser.add_argument("--seg_glb", default=None, help="SegviGen output glb (part colours)")
+    parser.add_argument("--completed", default=None,
+                        help="Closed parts already in the source frame (X-Part output). "
+                             "Skip the split; just re-UV and bake the source albedo onto them.")
     parser.add_argument("--source_glb", default=None,
                         help="Original model whose texture is baked back (required unless --no_bake)")
     parser.add_argument("--out_dir", required=True)
@@ -875,6 +941,26 @@ def main():
         parser.error("--source_glb is required unless --no_bake is set")
     if bool(args.labels) != bool(args.label_names):
         parser.error("--labels and --label_names must be given together")
+    if args.completed and args.seg_glb:
+        parser.error("pass either --completed or --seg_glb, not both")
+    if not args.completed and not args.seg_glb and not args.blender_reuv:
+        parser.error("one of --seg_glb, --completed or --blender_reuv is required")
+
+    if args.completed:
+        bake_completed(
+            os.path.abspath(args.completed), os.path.abspath(args.source_glb),
+            os.path.abspath(args.out_dir),
+            texture_size=args.texture_size,
+            uv_angle_limit=args.uv_angle_limit,
+            uv_margin=args.uv_margin,
+            cage_extrusion=args.cage_extrusion,
+            max_ray_distance=args.max_ray_distance,
+            samples=args.samples,
+            margin=args.margin,
+            combined_name=args.combined_name,
+            save_textures=args.save_textures,
+        )
+        return
 
     if args.blender_reuv:
         os.makedirs(os.path.abspath(args.out_dir), exist_ok=True)

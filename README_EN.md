@@ -9,6 +9,32 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 [Online Demo](https://huggingface.co/spaces/fenghora/SegviGen) |
 [Weights](https://huggingface.co/fenghora/SegviGen)
 
+## 📣 What's new
+
+The main line is no longer "steer generation with one 2D map". It over-segments by
+geometry, names the pieces, then optionally closes them and bakes the source albedo back
+on. The CLI, the Python call and HTTP share **one** config object
+(`pipeline.PipelineOptions`), so a knob cannot drift between entry points.
+
+- **Six stages:** `paint → guidance → split → units → [merge] → [complete → bake]`.
+  Geometry decides every boundary; language only names. `--merge off` stops after units;
+  `--complete off` (the default) stops at the open `parts.glb`.
+- **X-Part completion** (`--complete full`): regenerates each open cut as a closed solid.
+  Default `--condition surface` conditions on the faces the split already assigned, not on
+  whatever falls inside a box. Pieces below `--min_area_share 0.005` fold into the nearest
+  larger neighbour (they used to be dropped). A solid that overruns its box is redrawn
+  `--redraws 2` times from the same prompt and kept only if it sits closer.
+- **Texture bake:** both the open parts and the closed solids get the source albedo back.
+  The solid uses a looser cage (`0.05 / 0.15`) because a generated surface only
+  approximates the source.
+- **Hanging scraps:** an unvoted sliver that only touches one named part and is under 10%
+  of it joins that part (Mickey's moustache on the head); otherwise `--unassigned_to`.
+- **One interface:** the table below is the current default. `GET /health` returns the
+  six stages, every switch and this default as-is. `POST /segment` now defaults
+  `sam3_threshold` to **0.4** (the concept bank), not the 0.3 the old form used.
+
+Entry points and fields are under [The interface](#-the-interface).
+
 ## 🌟 What this fork adds
 
 **Recognition — semantic prompts instead of hand-painted maps.**
@@ -22,10 +48,14 @@ a named part, so the output has exactly as many parts as requested.
 Naive 2D guidance shatters complex shells into dozens of fragments. `segment_parts.py`
 takes the other route: several prompt-free full segmentations are intersected into
 deliberately over-segmented atoms, then multi-view renders are masked by SAM3 and every
-atom *component* takes the prompt that covers it most specifically. Parts sharing a name
-are merged into a single mesh with their textures packed into an atlas — lossless UV
-remapping, no rebake. Language only picks names; every boundary comes from geometry, so a
-mislabelled pixel can no longer tear one open.
+atom *component* takes the prompt that covers it most specifically. Faces that share a
+name become one node, with the source albedo baked back on. Language only picks names;
+every boundary comes from geometry, so a mislabelled pixel can no longer tear one open.
+
+**Completion — an open cut can be closed into a solid.**
+A split shell is empty where it was cut. `--complete full` hands each part to X-Part to
+regenerate as a watertight solid, then bakes the texture back with the same path. The
+default condition is the faces the split assigned, not whatever happened to sit in the box.
 
 **Automatic front-view selection.**
 The 2D-guided mode is sensitive to which side of the model gets rendered. `--front_view`
@@ -67,8 +97,9 @@ The two extracted parts — the mushroom alone / the chair with the mushroom rem
 ## 🔨 Deployment
 
 Developed and tested on Windows 11 + RTX 5090D (32 GB); upstream targets Linux with ≥24 GB
-VRAM — both work. Two Python environments are required because SAM3 (transformers 5.x) and
-SegviGen (transformers 4.57.6) conflict:
+VRAM — both work. Two Python environments are required for the split (SAM3's
+transformers 5.x conflicts with SegviGen's 4.57.6); `--complete full` needs a third
+X-Part env:
 
 1. SegviGen env (the one that runs this repo): [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) dependencies first
     ```sh
@@ -88,7 +119,13 @@ SegviGen (transformers 4.57.6) conflict:
     pip install "transformers>=5"   # plus torch matching your CUDA
     ```
 
-3. Weights (see below)
+3. X-Part env (only `--complete full`; `boxes` writes prompts and stays in this interpreter)
+    ```sh
+    # Hunyuan3D-Part / XPart, its own venv; weights under SEGVIGEN_XPART_WEIGHTS
+    # Dispatched via SEGVIGEN_PY_XPART — this repo never imports it
+    ```
+
+4. Weights (see below)
 
 ### Where the weights live
 
@@ -128,12 +165,35 @@ holdout numbers but worse on external assets, so **deployment stays on the root 
 Runtime configuration:
 
 - `SEGVIGEN_PY_SAM3` — Python of the SAM3 venv (default `../.venv_holo/Scripts/python.exe`).
+- `SEGVIGEN_PY_XPART` / `SEGVIGEN_XPART_ROOT` / `SEGVIGEN_XPART_WEIGHTS` — X-Part
+  interpreter, source root and weights; used only by `--complete full`.
 - GPU backends (verified on Blackwell): `ATTN_BACKEND=flash_attn SPARSE_CONV_BACKEND=flex_gemm FLEX_GEMM_ALGO=explicit_gemm`.
 - VLM front-view mode: `MOONSHOT_API_KEY` (env var or a gitignored `.env` at the repo
   root); `SEGVIGEN_VLM_BASE_URL` / `SEGVIGEN_VLM_MODEL` override the defaults
   (`https://api.moonshot.cn/v1`, `kimi-latest`).
 
 ## 📒 The interface
+
+Three entry points read one contract: `pipeline.PipelineOptions`. Paths (`glb` / `out` /
+`work_dir`) change every run and stay on the call; every switch that configures *how* the
+pipeline runs lives on this object. The CLI attaches them with `add_cli_arguments()`,
+`POST /segment` uses the same field names, and `GET /health` returns `public()`.
+
+| entry | file | what it does |
+|---|---|---|
+| CLI, full run | `segment_parts.py` | all six stages; `--merge off` splits without naming |
+| CLI, naming only | `merge_parts.py` | name / export / optionally complete an existing `work/` |
+| Python | `from pipeline import PipelineOptions` | `segment_kwargs()` / `merge_kwargs()` |
+| HTTP | `serve_api.py` | `POST /segment`; the old 2D route is `/segment_legacy` |
+
+```python
+from pipeline import PipelineOptions
+from segment_parts import segment_parts
+
+opts = PipelineOptions(merge="name", complete="off", granularity="medium")
+segment_parts("model.glb", ["head", "torso"], "out/parts.glb",
+              work_dir="out/work", **opts.segment_kwargs())
+```
 
 ### `segment_parts.py` — the current pipeline: over-segment, then name
 
@@ -145,7 +205,7 @@ python segment_parts.py \
   --out out/parts.glb --work_dir out/work
 ```
 
-Geometry decides every boundary, language only picks names. The pipeline is five fixed
+Geometry decides every boundary, language only picks names. The pipeline is six fixed
 stages:
 
 1. **paint.** The source model is rendered over a fixed view grid; if those renders carry
@@ -166,9 +226,34 @@ stages:
    the most specific one winning; unseen faces inherit the nearest visible one. Faces are
    exported per name with the source albedo baked back on.
 6. **complete**, gated by `--complete`: our parts are open where they were cut, so X-Part
-   regenerates each as a closed solid (`xpart_complete.py`).
+   regenerates each as a closed solid (`xpart_complete.py`). `--complete full` then bakes
+   the source albedo onto those solids (the same Blender selected-to-active path as the
+   split, with a looser cage, because a generated surface only approximates the source).
 
 Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached.
+
+| switch | values | current default | what it does |
+|---|---|---|---|
+| `--merge` | `name` / `unit` / `off` | `name` | naming; `off` stops after units |
+| `--complete` | `off` / `boxes` / `full` | `off` | X-Part; `full` regenerates then bakes |
+| `--condition` | `surface` / `box` | `surface` | X-Part prompt: split faces, or crop-in-box |
+| `--flat_paint` | `auto` / `on` / `off` | `auto` | temporary flat colour on a grey model |
+| `--granularity` | `fine` / `medium` / `coarse` | `medium` | atom/unit floors 150/300, 300/600, 800/1600 |
+| `--min_atom_faces` / `--min_unit_faces` | int | from granularity | explicit floor wins |
+| `--samples` | int | `7` | meet samples |
+| `--azimuth` / `--azimuth_jitter` | float | `0` / `30` | conditioning camera |
+| `--color_tol` | float | `20` | colour distance inside one sample |
+| `--mirror` | `auto` / `none` / `x` / `y` / `z` | `auto` | also intersect the reflection |
+| `--min_recall` | float | `0.5` | mask must cover this share of a unit |
+| `--view_azimuths` × `--view_elevations` | degrees | `45,225` × `10` | SAM3 voting views |
+| `--radius` / `--resolution` | | `2` / `512` | voting renders |
+| `--sam3_threshold` | float | `0.4` | concept-bank threshold (0.3 without a bank) |
+| `--min_area_share` | float | `0.005` | fold a tiny X-Part piece into its neighbour |
+| `--redraws` | int | `2` | redraw a solid that overruns its box |
+| `--octree_resolution` / `--seed` | | `512` / `42` | X-Part reconstruction |
+| `--texture_size` | int | `2048` | bake resolution |
+| `--no_texture` / `--no_reuse` / `--allow_partial` | flag | off | skip bake / ignore cache / allow empty parts |
+| `--unassigned_to` | part name | none | absorb unclaimed units; else they are dropped |
 
 ### What more samples buy is a less lucky split, not a finer one
 
@@ -390,23 +475,33 @@ manifest = segment(
 curl -X POST http://127.0.0.1:8020/segment \
   -F "glb=@model.glb" \
   -F "prompts=leaves" -F "prompts=fruit" \
-  -F "unassigned_to=fruit" -F "samples=5"
+  -F "unassigned_to=fruit" \
+  -F "granularity=coarse" -F "complete=full"
 ```
 
-`POST /segment` runs `segment_parts.py`; `POST /segment_legacy` is the old 2D-map route
-with its `azimuth` / `front_view` / `assign` / `split_mode` options.
+`POST /segment` runs `segment_parts.py`. Multipart field names match `PipelineOptions`;
+anything omitted takes the table above. Repeat `prompts` once per part (a concept may
+contain spaces); they may be empty only with `merge=off`. `sam3_threshold` defaults to
+**0.4**. `POST /segment_legacy` is the old 2D-map route.
 
-The response carries the `parts` manifest and download links: `GET /jobs/{id}/download`
-for the result, `GET /jobs/{id}/parts/{node}.glb` for one part, `GET /jobs/{id}/atoms` for
-the atoms the vote merged and `GET /jobs/{id}/report` for the vote table (legacy jobs have
-`/map` and `/render` instead). `GET /health` reports the resolved default weights and
-whether the GPU is busy.
+A successful response carries the `parts` manifest, the `options` that actually ran, and
+these links:
 
-Repeat `prompts` once per part rather than space-separating them — a concept may itself
-contain spaces (`small mushroom`).
+| method | path | what |
+|---|---|---|
+| `GET` | `/health` | six stages, switches, current defaults, GPU busy flag |
+| `POST` | `/segment` | upload a GLB + options → manifest and download links |
+| `POST` | `/segment_legacy` | old 2D route (`front_view` / `assign` / `split_mode`) |
+| `GET` | `/jobs/{id}/download` | `parts.glb` (open, named parts) |
+| `GET` | `/jobs/{id}/atoms` | over-segmented atoms before the vote |
+| `GET` | `/jobs/{id}/report` | per-unit vote table (absent when `merge=off`) |
+| `GET` | `/jobs/{id}/complete` | textured X-Part solids (`complete=full`) |
+| `GET` | `/jobs/{id}/complete_raw` | generated solids before the bake |
+| `GET` | `/jobs/{id}/guidance/{name}` | a review overlay from `work/guidance/` |
+| `GET` | `/jobs/{id}/map`, `/render` | legacy jobs only |
 
-Every stage still runs as a subprocess that loads its own model, so a request costs a couple
-of minutes, and the box has one GPU: jobs take a lock and a second request gets 409 instead
+Every stage still runs as a subprocess that loads its own model, so a request costs several
+minutes, and the box has one GPU: jobs take a lock and a second request gets 409 instead
 of queueing invisibly. This is a test harness, not a throughput service.
 
 ### `segment_vote.py` — deprecated: one sample, coverage voting
