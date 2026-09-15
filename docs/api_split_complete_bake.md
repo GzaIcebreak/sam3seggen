@@ -329,41 +329,70 @@ for mesh in meshes:
 
 ## 推荐的一条龙取值
 
-不写提示词（主体 / 底座 + 混合修复）：
+默认值就是推荐组合：下面这张表是 `GET /health` 里 `defaults` 的意思，以及每一项为什么是这个值。不传就是这样跑。
+
+### 默认组合（什么都不传时生效）
+
+| 阶段 | 开关 | 默认 | 为什么 |
+|---|---|---|---|
+| 命名 | `prompts` | 空 → `主体, 底座` | 语言只取名，边界来自几何；两个词能覆盖大多数带底座的单体模型 |
+| 命名 | `merge` | `name` | 每个提示词一个节点，同名件焊在一起，输出部件数和提示词数一致 |
+| 命名 | `unassigned_to` | `body` | 没有掩码认领的单元并进这个名字。**必须是提示词里的名字**，否则被忽略、无票面从输出丢掉（日志 `unassigned_to=... ignored`）；用中文或别的主体名时要显式传，如 `unassigned_to=主体` |
+| 命名 | `refine` | `off` | 按面切分单元只在"几何没分开、掩码分得开"时有用；猴子的手背在掩码里也是护腕，它帮不上，还会挪错小块 |
+| 拆分 | `granularity` | `medium`（300 / 600 面） | 小件（螺栓、按钮）才降到 `fine`，大件被切成面板才升 `coarse` |
+| 拆分 | `samples` / `mirror` | `7` / `auto` | 多采样买到的是少靠运气；对称求交免费 |
+| 投票 | `view_azimuths` × `view_elevations` | `45,135,225,315` × `10` | 四个 3/4 视角两侧都看得到；正对或抬高会漏胸口、挡腿脚 |
+| 投票 | `sam3_threshold` | `0.4` | 概念库下的门槛（无库 0.3） |
+| 导出 | `export_from` | `source` | 部件直接从原模型切，原分辨率、原 UV、原贴图；重建网格上手部比原模型粗 4.5 倍，手指在那一步就没了 |
+| 导出 | `with_texture` / `texture_size` | `true` / `2048` | 只对封闭实体和 `remesh` 退路生效；大件自动升到 4096 / 8192 |
+| 修复 | `complete` | `hybrid` | 先 X-Part，再按评分决定 |
+| 修复 | `condition` | `surface` | 条件点从拆分归属面采，盒子里装着别人的腿也不会被当成躯干 |
+| 修复 | `min_area_share` / `redraws` | `0.005` / `2` | 碎片折进邻件；超框实体重抽两次、只留更贴盒的 |
+| 修复 | `merge_gap` / `fold_within_part` / `part_min_area_share` | `0` / `false` / 无 | 都关。它们是给两类特殊模型开的，见下 |
+| 修复 | `holopart_large` | `score` | 每个 X-Part 实体和开口面比对打分；只看出框率抓不到 0% 出框却修成圆块的树身 |
+| 修复 | `score_candidate` / `score_candidate_small` | `0.8` / `0.6` | 大件多问一次 HoloPart（数量少、修坏代价大）；小件 X-Part 本来就在行，问得少（圣诞树上 0.8 全用会把一半装饰品白送去 HoloPart） |
+| 修复 | `score_floor` | `0.3` | 两个后端都差就保留开口面，不硬塞错的实体 |
+
+一句话：**只上传 glb**，或者只加一句 `prompts`，其余不动。
+
+### 什么时候要改
+
+| 模型长什么样 | 症状 | 改这些 |
+|---|---|---|
+| 主体上挂满几十上百个小物件（圣诞树、挂饰、按钮阵列） | 小物件全部被折进主体，只剩一个大框 | `part_min_area_share=小物件名=0.001`、`fold_within_part=true`；`merge_gap` 必须保持 `0`，否则挨着的小物件会被接成一件 |
+| 小件被别的部件穿过、切成几段（握棍的手、穿过袖口的手臂） | 半只手被 X-Part 生成成 3–5 倍大的板 | `merge_gap=0.01`（同一部件、表面相距 < 对角线 1% 的小块接回一件） |
+| 没有贴图的白模 / 灰模 | SAM3 什么都认不出、投票全 0 | `flat_paint=auto` 默认就会平涂；仍然不行时 `flat_paint=on` |
+| 某个提示词整只丢了 | 输出少一个部件 | 先看 `work/guidance/*.png`：掩码没有就是提示词的事，换概念词；掩码有、面没有就是 `unassigned_to` 或 `min_recall` |
+| 同名两件被焊在一起、想分开看 | 两只手一个节点 | `merge=unit` 或 `merge=fragments` 看单元级结果 |
+| 修复太慢 | 一次几十分钟 | `score_candidate_small` 降到 `0.5`，或 `holopart_large=escape` 回到只在超框时换 |
+| 修复后大件是光滑圆块 | 树身、躯干没细节 | 这是 X-Part 的局限；确认 `holopart_large=score`（会换 HoloPart），仍不满意就 `complete=off` 保留开口件 |
+| 源模型超过 ~50 万面 | 内存暴涨、任务被杀 | 上传前先减面到 30 万左右（Blender Decimate），管线自身不减面；90 GB 的机器曾被 187 万面的树撑爆 |
+| 源模型多网格 / 多材质 | 日志里 `source is not one textured mesh` | `export_from` 自动退回 `remesh` + 烘焙，不用改；想要原 UV 就先在 DCC 里合并成单网格单材质 |
+
+### 三组写法
+
+只上传 glb（主体 / 底座 + 评分修复）：
 
 ```
-# 只上传 glb，其余用默认
-# 实际生效：prompts=主体, 底座，merge=name，granularity=medium，complete=hybrid
+# 实际生效：prompts=主体, 底座，merge=name，granularity=medium，complete=hybrid，
+#           holopart_large=score，export_from=source
 ```
 
-有名字的中等部件、可能无贴图：
+有名字的人形 / 道具（猴子这类）：
 
 ```
-prompts=head, torso, arm, hand, leg, foot
-unassigned_to=torso
-merge=name
-# complete 默认 hybrid，不用写
-condition=surface
-granularity=medium
-flat_paint=auto
-with_texture=true
-min_area_share=0.005
-redraws=2
-# holopart_large 默认 score，export_from 默认 source，不用写
+prompts=armor, staff, base, body=head+face+hand+boot+leg
+unassigned_to=body
+merge_gap=0.01          # 手被棍子切开时才需要；没有这种情况保持 0
+# 其余全部默认
 ```
 
-主体上挂满小物件（圣诞树、挂饰）：
+主体上挂满小物件（圣诞树）：
 
 ```
-prompts=装饰品=bauble+star+bow+pinecone, 树=christmas tree
+prompts=装饰品=bauble+christmas ball+star+bow+pinecone, 树=christmas tree+tree stand
 unassigned_to=树
 part_min_area_share=装饰品=0.001
 fold_within_part=true
-# merge_gap 保持 0：挨着的装饰品不能接成一件
-```
-
-小件被别的部件切碎（握着棍子的手）：
-
-```
-merge_gap=0.01
+# merge_gap 保持 0；提示词避开 ornament / garland / tinsel 这类会盖住整棵树的词
 ```
