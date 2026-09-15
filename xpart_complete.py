@@ -51,6 +51,7 @@ import trimesh
 DEFAULT_XPART_ROOT = "/root/autodl-tmp/Hunyuan3D-Part/XPart"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_CONTAINMENT = 0.98
+DEFAULT_MERGE_MAX_SHARE = 0.05
 DEFAULT_FIT_TOLERANCE = 0.05
 # What X-Part samples per part; the conditioner's positional encoding is fitted to it.
 XPART_CONDITION_POINTS = 81920
@@ -133,9 +134,19 @@ def welded_components(mesh):
 
 
 def welded_pieces(nodes):
-    """Every welded connected component of every part node, as (name, submesh)."""
-    return [(name, mesh.submesh([faces], append=True))
-            for name, mesh in nodes for faces in welded_components(mesh)]
+    """Every welded connected component of every part node, as (name, submesh).
+
+    Geometry only. A textured submesh carries a copy of the part's material, so a split
+    with thousands of shells (a decorated tree: ~7900) ran the 90 GB box out of memory
+    before X-Part even loaded. Nothing downstream reads the pieces' textures -- the
+    conditioning samples points and face normals, and the bake uses the source glb.
+    """
+    pieces = []
+    for name, mesh in nodes:
+        bare = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
+        pieces += [(name, bare.submesh([faces], append=True))
+                   for faces in welded_components(bare)]
+    return pieces
 
 
 def bounding_box(mesh):
@@ -152,26 +163,28 @@ def drop_inner_shells(pieces, containment=DEFAULT_CONTAINMENT):
     Containment across parts is left alone -- a hand sits inside the arm's box and is
     still its own part.
     """
-    boxes = [bounding_box(piece) for _, piece in pieces]
-    volumes = [float(np.prod(np.maximum(box[1] - box[0], 1e-9))) for box in boxes]
+    if not pieces:
+        return []
+    boxes = np.stack([bounding_box(piece) for _, piece in pieces])
+    volumes = np.prod(np.maximum(boxes[:, 1] - boxes[:, 0], 1e-9), axis=1)
+    _, name_ids = np.unique([name for name, _ in pieces], return_inverse=True)
     keep = []
-    for index, (name, _) in enumerate(pieces):
-        low, high = boxes[index]
-        inside = False
-        for other, (other_name, _) in enumerate(pieces):
-            if other == index or other_name != name or volumes[other] <= volumes[index]:
+    # Vectorised over the rivals: a decorated tree splits into ~7900 pieces, and the
+    # pairwise Python loop this replaces was 63 million iterations.
+    for index in range(len(pieces)):
+        rivals = (name_ids == name_ids[index]) & (volumes > volumes[index])
+        if rivals.any():
+            low, high = boxes[index]
+            overlap = np.maximum(0.0, np.minimum(high, boxes[rivals, 1])
+                                 - np.maximum(low, boxes[rivals, 0]))
+            if np.any(np.prod(overlap, axis=1) >= containment * volumes[index]):
                 continue
-            other_low, other_high = boxes[other]
-            overlap = np.maximum(0.0, np.minimum(high, other_high) - np.maximum(low, other_low))
-            if float(np.prod(overlap)) >= containment * volumes[index]:
-                inside = True
-                break
-        if not inside:
-            keep.append(index)
+        keep.append(index)
     return [pieces[i] for i in keep]
 
 
-def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE):
+def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE,
+                      part_min_area_share=None, fold_within_part=False):
     """Fold a component too small to be worth its own prompt into the nearest bigger one.
 
     X-Part is not reliable on a sliver: on both test models exactly one component under 1%
@@ -186,12 +199,19 @@ def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE):
     not a useful tie-breaker here -- three of Mickey's foot components are nowhere near
     each other, and merging them because they share a name would make one box spanning the
     gaps between them.
+
+    `fold_within_part` is the exception for a part made of many small separate things
+    stuck onto a bigger one (ornaments on a tree): by distance alone every ornament sliver
+    goes to the branch it touches and the part disappears. With it, a sliver joins the
+    nearest kept piece of its own part, and falls back to any part only when its own part
+    kept nothing. `part_min_area_share` ({name: share}) sets the floor per part.
     """
     from scipy.spatial import cKDTree
 
     total_area = sum(float(piece.area) for _, piece in pieces)
-    floor = min_area_share * total_area
-    keep = [index for index, (_, piece) in enumerate(pieces) if piece.area >= floor]
+    floors = part_min_area_share or {}
+    keep = [index for index, (name, piece) in enumerate(pieces)
+            if piece.area >= floors.get(name, min_area_share) * total_area]
     if not keep:
         raise SystemExit(
             f"every component is below --min_area_share {min_area_share}; lower it")
@@ -202,7 +222,8 @@ def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE):
         if index in groups:
             continue
         vertices = np.asarray(piece.vertices)
-        target = min(keep, key=lambda i: float(trees[i].query(vertices)[0].min()))
+        own = [i for i in keep if pieces[i][0] == name] if fold_within_part else []
+        target = min(own or keep, key=lambda i: float(trees[i].query(vertices)[0].min()))
         print(f"  {name} component at {piece.area / total_area:.2%} of the surface is too "
               f"small to generate; folded into the {pieces[target][0]} next to it")
         groups[target].append(piece)
@@ -212,11 +233,76 @@ def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE):
             for index in keep]
 
 
+def merge_split_fragments(pieces, gap, max_share=DEFAULT_MERGE_MAX_SHARE):
+    """Rejoin same-name pieces that only came apart where another part cut through them.
+
+    The monk's hands are one part with the body, but the staff he grips splits each hand
+    into two shells a staff-width apart, and X-Part turned those half-hands into slabs three
+    to five times their size. The two halves sit 0.3% of the model diagonal from each
+    other; joined, each is a whole hand again and a prompt X-Part can close.
+
+    Two pieces of the same part are joined when their surfaces come within gap (a share
+    of the model diagonal) and at least one of them is under max_share of the surface.
+    Two big pieces never join: the head and the legs are both "body" and both belong on
+    their own. Joining is transitive, so a staff cut into four by two hands is one staff.
+    A gap of 0 turns this off.
+    """
+    from scipy.spatial import cKDTree
+
+    if gap <= 0 or len(pieces) < 2:
+        return pieces
+    boxes = np.stack([bounding_box(piece) for _, piece in pieces])
+    diag = float(np.linalg.norm(boxes[:, 1].max(axis=0) - boxes[:, 0].min(axis=0)))
+    reach = gap * diag
+    total_area = sum(float(piece.area) for _, piece in pieces)
+    small = np.array([piece.area < max_share * total_area for _, piece in pieces])
+    _, name_ids = np.unique([name for name, _ in pieces], return_inverse=True)
+    parent = list(range(len(pieces)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    trees = {}
+    for i in range(len(pieces)):
+        # Boxes grown by the reach must overlap before the surfaces are worth measuring.
+        near = (name_ids == name_ids[i]) & (small | small[i]) & (np.arange(len(pieces)) > i)
+        near &= np.all(boxes[:, 0] <= boxes[i, 1] + reach, axis=1)
+        near &= np.all(boxes[:, 1] >= boxes[i, 0] - reach, axis=1)
+        for j in np.flatnonzero(near):
+            if find(i) == find(j):
+                continue
+            if j not in trees:
+                trees[j] = cKDTree(np.asarray(pieces[j][1].vertices))
+            if trees[j].query(np.asarray(pieces[i][1].vertices), distance_upper_bound=reach)[0].min() <= reach:
+                parent[find(j)] = find(i)
+
+    groups = {}
+    for index in range(len(pieces)):
+        groups.setdefault(find(index), []).append(index)
+    merged = []
+    for members in groups.values():
+        name = pieces[members[0]][0]
+        if len(members) > 1:
+            shares = ", ".join(f"{pieces[m][1].area / total_area:.1%}" for m in members)
+            print(f"  {name}: {len(members)} pieces within {gap:.1%} of the diagonal "
+                  f"({shares}) joined into one prompt")
+        merged.append((name, trimesh.util.concatenate([pieces[m][1] for m in members])
+                       if len(members) > 1 else pieces[members[0]][1]))
+    return merged
+
+
 def component_boxes(nodes, min_area_share=DEFAULT_MIN_AREA_SHARE,
-                    containment=DEFAULT_CONTAINMENT):
+                    containment=DEFAULT_CONTAINMENT, part_min_area_share=None,
+                    fold_within_part=False, merge_gap=0.0,
+                    merge_max_share=DEFAULT_MERGE_MAX_SHARE):
     """Per part instance: (boxes [K,2,3], rows of metadata, the surfaces they came from)."""
     pieces = fold_small_pieces(
-        drop_inner_shells(welded_pieces(nodes), containment), min_area_share)
+        merge_split_fragments(drop_inner_shells(welded_pieces(nodes), containment),
+                              merge_gap, merge_max_share),
+        min_area_share, part_min_area_share, fold_within_part)
     total_area = sum(float(piece.area) for _, piece in pieces)
     boxes = np.stack([bounding_box(piece) for _, piece in pieces])
     rows = [{"name": name, "instance": index, "faces": int(len(piece.faces)),
@@ -324,6 +410,18 @@ def main():
     parser.add_argument("--containment", type=float, default=DEFAULT_CONTAINMENT,
                         help="Drop a box this fully inside a bigger box of the same part "
                              "(that is what the remesh's inner walls look like)")
+    parser.add_argument("--part_min_area_share", action="append", default=[],
+                        metavar="NAME=SHARE",
+                        help="Per-part --min_area_share, repeatable (e.g. 装饰品=0.001)")
+    parser.add_argument("--merge_gap", type=float, default=0.0,
+                        help="Join same-part pieces whose surfaces come within this share "
+                             "of the model diagonal (a hand the staff cut in two). 0 = off")
+    parser.add_argument("--merge_max_share", type=float, default=DEFAULT_MERGE_MAX_SHARE,
+                        help="Only a piece under this share of the surface joins a "
+                             "neighbour; two big pieces stay apart")
+    parser.add_argument("--fold_within_part", action="store_true",
+                        help="Fold a small component only into its own part's pieces "
+                             "(many small things on a big one: ornaments on a tree)")
     parser.add_argument("--octree_resolution", type=int, default=512,
                         help="Marching-cubes resolution X-Part reconstructs each part at")
     parser.add_argument("--seed", type=int, default=42)
@@ -353,11 +451,19 @@ def main():
     parser.add_argument("--model_path", default="tencent/Hunyuan3D-Part",
                         help="Local weights directory or HF repo id")
     args = parser.parse_args()
+    part_floors = {}
+    for item in args.part_min_area_share:
+        name, _, share = item.rpartition("=")
+        if not name:
+            parser.error(f"--part_min_area_share expects NAME=SHARE, got {item!r}")
+        part_floors[name] = float(share)
 
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
     nodes = load_part_nodes(os.path.abspath(args.parts))
-    boxes, rows, surfaces = component_boxes(nodes, args.min_area_share, args.containment)
+    boxes, rows, surfaces = component_boxes(nodes, args.min_area_share, args.containment,
+                                            part_floors, args.fold_within_part,
+                                            args.merge_gap, args.merge_max_share)
     if not len(boxes):
         raise SystemExit("no part component survived the filters; lower --min_area_share")
 

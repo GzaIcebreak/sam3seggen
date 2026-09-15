@@ -56,6 +56,9 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=3.5)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_chunks", type=int, default=20000)
+    parser.add_argument("--only", action="append", default=[], metavar="NODE",
+                        help="Generate only these instances (repeatable). Every instance "
+                             "still describes the whole shape HoloPart conditions on.")
     args = parser.parse_args()
 
     out_dir = os.path.abspath(args.out_dir)
@@ -78,6 +81,20 @@ def main():
     print(f"[holopart] {len(names)} instances from {os.path.basename(args.parts)}")
     pipe = HoloPartPipeline.from_pretrained(weights).to("cuda", torch.float16)
     batch = prepare_data(ordered, device="cuda")
+    if args.only:
+        missing = [name for name in args.only if name not in names]
+        if missing:
+            raise SystemExit(f"--only instance(s) not in {args.parts}: {missing}")
+        # Slice after prepare_data: whole_cond is sampled from all instances, so the
+        # context keeps every part while only the chosen ones pay for a diffusion run.
+        picked = [names.index(name) for name in args.only]
+        index = torch.tensor(picked, device="cuda")
+        for key in ("whole_cond", "part_cond", "part_local_cond"):
+            batch[key] = batch[key].index_select(0, index)
+        for key in ("part_id_list", "part_center_list", "part_scale_list"):
+            batch[key] = [batch[key][i] for i in picked]
+        names = [names[i] for i in picked]
+        print(f"[holopart] generating {len(names)} of the instances: {names}")
     scene = run_holopart(
         pipe,
         batch=batch,

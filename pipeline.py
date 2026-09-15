@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
+from hybrid_complete import SCORE_CANDIDATE, SCORE_CANDIDATE_SMALL, SCORE_FLOOR
+from xpart_complete import DEFAULT_MERGE_MAX_SHARE
 
 # --- stages -----------------------------------------------------------------
 
@@ -63,6 +65,8 @@ DEFAULT_CONDITION = "surface"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_FRAGMENT_SHARE = 0.01
 DEFAULT_REDRAWS = 2
+DEFAULT_HOLOPART_LARGE = "score"   # escape | always | score; see hybrid_complete.py
+HOLOPART_LARGE_MODES = ("escape", "always", "score")
 DEFAULT_OCTREE_RESOLUTION = 512
 DEFAULT_SEED = 42
 DEFAULT_TEXTURE_SIZE = 2048
@@ -137,6 +141,16 @@ class PipelineOptions:
     py_holopart: str | None = None
     holopart_root: str = DEFAULT_HOLOPART_ROOT
     holopart_weights: str = DEFAULT_HOLOPART_WEIGHTS
+    # complete=hybrid: how X-Part and HoloPart are chosen per instance (hybrid_complete.py)
+    holopart_large: str = DEFAULT_HOLOPART_LARGE
+    score_candidate: float = SCORE_CANDIDATE
+    score_candidate_small: float = SCORE_CANDIDATE_SMALL
+    score_floor: float = SCORE_FLOOR
+    # what counts as one prompt (xpart_complete.py)
+    part_min_area_share: str | None = None
+    fold_within_part: bool = False
+    merge_gap: float = 0.0
+    merge_max_share: float = DEFAULT_MERGE_MAX_SHARE
 
     def resolved_floors(self):
         return floors(self.granularity, self.min_atom_faces, self.min_unit_faces)
@@ -155,6 +169,7 @@ class PipelineOptions:
                 "granularity": {k: {"min_atom_faces": a, "min_unit_faces": u}
                                 for k, (a, u) in GRANULARITY.items()},
                 "mirror": list(MIRROR_MODES),
+                "holopart_large": list(HOLOPART_LARGE_MODES),
             },
             "defaults": {
                 **{f.name: getattr(self, f.name) for f in fields(self)
@@ -207,6 +222,14 @@ class PipelineOptions:
             "strict_parts": self.strict_parts,
             "with_texture": self.with_texture,
             "texture_size": self.texture_size,
+            "holopart_large": self.holopart_large,
+            "score_candidate": self.score_candidate,
+            "score_candidate_small": self.score_candidate_small,
+            "score_floor": self.score_floor,
+            "part_min_area_share": self.part_min_area_share,
+            "fold_within_part": self.fold_within_part,
+            "merge_gap": self.merge_gap,
+            "merge_max_share": self.merge_max_share,
         }
 
     def merge_kwargs(self):
@@ -285,6 +308,14 @@ class PipelineOptions:
             py_holopart=getattr(args, "py_holopart", None),
             holopart_root=getattr(args, "holopart_root", DEFAULT_HOLOPART_ROOT),
             holopart_weights=getattr(args, "holopart_weights", DEFAULT_HOLOPART_WEIGHTS),
+            holopart_large=getattr(args, "holopart_large", DEFAULT_HOLOPART_LARGE),
+            score_candidate=getattr(args, "score_candidate", SCORE_CANDIDATE),
+            score_candidate_small=getattr(args, "score_candidate_small", SCORE_CANDIDATE_SMALL),
+            score_floor=getattr(args, "score_floor", SCORE_FLOOR),
+            part_min_area_share=getattr(args, "part_min_area_share", None),
+            fold_within_part=bool(getattr(args, "fold_within_part", False)),
+            merge_gap=getattr(args, "merge_gap", 0.0),
+            merge_max_share=getattr(args, "merge_max_share", DEFAULT_MERGE_MAX_SHARE),
         )
 
 
@@ -338,6 +369,32 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
                              "into a neighbour. Smaller keeps more pieces.")
     parser.add_argument("--redraws", type=int, default=DEFAULT_REDRAWS,
                         help="Times to redraw an X-Part solid that overruns its box")
+    parser.add_argument("--holopart_large", default=DEFAULT_HOLOPART_LARGE,
+                        choices=HOLOPART_LARGE_MODES,
+                        help="complete=hybrid: escape = HoloPart only for a large solid that "
+                             "left its box; always = every large one; score = measure each "
+                             "X-Part solid against its open surface, draw HoloPart for the low "
+                             "scorers and keep the better one (default)")
+    parser.add_argument("--score_candidate", type=float, default=SCORE_CANDIDATE,
+                        help="holopart_large=score: a large instance below this also gets "
+                             "a HoloPart draw")
+    parser.add_argument("--score_candidate_small", type=float, default=SCORE_CANDIDATE_SMALL,
+                        help="holopart_large=score: the same for a small instance")
+    parser.add_argument("--score_floor", type=float, default=SCORE_FLOOR,
+                        help="holopart_large=score: both solids below this keep the open "
+                             "surface instead")
+    parser.add_argument("--part_min_area_share", default=None,
+                        help="Per-part --min_area_share as name=share[,name=share] "
+                             "(ornaments=0.001 keeps every bauble its own prompt)")
+    parser.add_argument("--fold_within_part", action="store_true",
+                        help="Fold a small component only into its own part (many small "
+                             "things stuck on a big one: ornaments on a tree)")
+    parser.add_argument("--merge_gap", type=float, default=0.0,
+                        help="Rejoin same-part pieces whose surfaces come within this share "
+                             "of the model diagonal (a hand the staff cut in two). 0 = off")
+    parser.add_argument("--merge_max_share", type=float, default=DEFAULT_MERGE_MAX_SHARE,
+                        help="merge_gap: only a piece under this share of the surface "
+                             "joins a neighbour")
     parser.add_argument("--no_reuse", action="store_true",
                         help="Re-run every stage instead of reusing cached intermediates")
     parser.add_argument("--allow_partial", action="store_true",

@@ -54,8 +54,10 @@ import segment_api
 import segment_parts
 from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, FLAT_PAINT_MODES, GRANULARITY,
-    MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
+    HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
 )
+
+from merge_parts import parse_part_floors
 
 _DEFAULTS = PipelineOptions()
 
@@ -440,6 +442,30 @@ async def segment(
         description="merge=fragments: fold a unit below this share of the surface. "
                     "Smaller keeps more pieces (default 0.01)."),
     redraws: int = Form(_DEFAULTS.redraws),
+    holopart_large: str = Form(
+        _DEFAULTS.holopart_large,
+        description="complete=hybrid: " + " | ".join(HOLOPART_LARGE_MODES)
+        + ". score = measure each X-Part solid, HoloPart the low scorers, keep the better"),
+    score_candidate: float = Form(
+        _DEFAULTS.score_candidate,
+        description="score: a large instance below this also gets a HoloPart draw"),
+    score_candidate_small: float = Form(
+        _DEFAULTS.score_candidate_small, description="score: the same for a small instance"),
+    score_floor: float = Form(
+        _DEFAULTS.score_floor,
+        description="score: both solids below this keep the open surface"),
+    part_min_area_share: OptionalStr = Form(
+        None, description="Per-part min_area_share: name=share[,name=share]"),
+    fold_within_part: bool = Form(
+        _DEFAULTS.fold_within_part,
+        description="Fold a small component only into its own part (ornaments on a tree)"),
+    merge_gap: float = Form(
+        _DEFAULTS.merge_gap,
+        description="Rejoin same-part pieces within this share of the model diagonal "
+                    "(a hand a staff cut in two); 0 = off"),
+    merge_max_share: float = Form(
+        _DEFAULTS.merge_max_share,
+        description="merge_gap: only a piece under this share of the surface joins"),
     octree_resolution: int = Form(_DEFAULTS.octree_resolution),
     seed: int = Form(_DEFAULTS.seed),
     with_texture: bool = Form(_DEFAULTS.with_texture),
@@ -465,6 +491,15 @@ async def segment(
         raise HTTPException(400, f"complete must be one of {COMPLETE_MODES}")
     if condition not in CONDITION_MODES:
         raise HTTPException(400, f"condition must be one of {CONDITION_MODES}")
+    if holopart_large not in HOLOPART_LARGE_MODES:
+        raise HTTPException(400, f"holopart_large must be one of {HOLOPART_LARGE_MODES}")
+    if part_min_area_share in ("", "string"):
+        part_min_area_share = None
+    if part_min_area_share is not None:
+        try:
+            parse_part_floors(part_min_area_share)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
     if flat_paint not in FLAT_PAINT_MODES:
         raise HTTPException(400, f"flat_paint must be one of {FLAT_PAINT_MODES}")
     if mirror not in MIRROR_MODES:
@@ -497,6 +532,14 @@ async def segment(
         "min_area_share": min_area_share,
         "fragment_share": fragment_share,
         "redraws": redraws,
+        "holopart_large": holopart_large,
+        "score_candidate": score_candidate,
+        "score_candidate_small": score_candidate_small,
+        "score_floor": score_floor,
+        "part_min_area_share": part_min_area_share,
+        "fold_within_part": fold_within_part,
+        "merge_gap": merge_gap,
+        "merge_max_share": merge_max_share,
         "octree_resolution": octree_resolution,
         "seed": seed,
         "with_texture": with_texture,

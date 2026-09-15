@@ -52,7 +52,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from merge_parts import (
-    canonical_prompts, complete_parts, export_labelled, guidance, merge_parts,
+    DEFAULT_HOLOPART_LARGE, canonical_prompts, complete_parts, export_labelled, guidance,
+    merge_parts,
 )
 from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public contract
     DEFAULT_AZIMUTH, DEFAULT_AZIMUTH_JITTER, DEFAULT_COMPLETE, DEFAULT_CONCEPT_BANK,
@@ -143,6 +144,14 @@ def segment_parts(
     strict_parts=False,
     with_texture=True,
     texture_size=DEFAULT_TEXTURE_SIZE,
+    holopart_large=DEFAULT_HOLOPART_LARGE,
+    score_candidate=None,
+    score_candidate_small=None,
+    score_floor=None,
+    part_min_area_share=None,
+    fold_within_part=False,
+    merge_gap=0.0,
+    merge_max_share=None,
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -300,6 +309,10 @@ def segment_parts(
             fragment_share=fragment_share, redraws=redraws,
             reuse=reuse, strict_parts=strict_parts,
             with_texture=with_texture, texture_size=texture_size,
+            holopart_large=holopart_large, score_candidate=score_candidate,
+            score_candidate_small=score_candidate_small, score_floor=score_floor,
+            part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
+            merge_gap=merge_gap, merge_max_share=merge_max_share,
         )
 
     if merge == "fragments":
@@ -322,7 +335,11 @@ def segment_parts(
     complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
                    py_xpart, xpart_root, xpart_weights, octree_resolution, seed,
                    condition, with_texture, texture_size, min_area_share, redraws,
-                   py_holopart, holopart_root, holopart_weights)
+                   py_holopart, holopart_root, holopart_weights,
+                   holopart_large=holopart_large, score_candidate=score_candidate,
+                   score_candidate_small=score_candidate_small, score_floor=score_floor,
+                   part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
+                   merge_gap=merge_gap, merge_max_share=merge_max_share)
     return manifest
 
 

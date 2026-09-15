@@ -35,7 +35,8 @@ from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, DEFAULT_COMPLETE, DEFAULT_CONDITION,
     DEFAULT_CONCEPT_BANK, DEFAULT_HOLOPART_ROOT, DEFAULT_HOLOPART_WEIGHTS,
     DEFAULT_FRAGMENT_SHARE, DEFAULT_MIN_AREA_SHARE, DEFAULT_OCTREE_RESOLUTION, DEFAULT_PY_HOLOPART,
-    DEFAULT_PY_XPART, DEFAULT_RADIUS, DEFAULT_REDRAWS, DEFAULT_RESOLUTION,
+    DEFAULT_HOLOPART_LARGE, DEFAULT_PY_XPART, DEFAULT_RADIUS, DEFAULT_REDRAWS,
+    DEFAULT_RESOLUTION,
     DEFAULT_SAM3_THRESHOLD, DEFAULT_TEXTURE_SIZE, DEFAULT_UNASSIGNED_TO,
     DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS, DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS,
     FLAT_PAINT_MODES, MERGE_MODES, PipelineOptions, add_cli_arguments, check_cli,
@@ -288,6 +289,14 @@ def merge_parts(
     strict_parts=False,
     with_texture=True,
     texture_size=DEFAULT_TEXTURE_SIZE,
+    holopart_large=DEFAULT_HOLOPART_LARGE,
+    score_candidate=None,
+    score_candidate_small=None,
+    score_floor=None,
+    part_min_area_share=None,
+    fold_within_part=False,
+    merge_gap=0.0,
+    merge_max_share=None,
 ):
     """Name the atoms in `split_dir` with `prompts` and write the parts into `out_glb`.
 
@@ -392,7 +401,11 @@ def merge_parts(
     complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
                    py_xpart, xpart_root, xpart_weights, octree_resolution, seed,
                    condition, with_texture, texture_size, min_area_share, redraws,
-                   py_holopart, holopart_root, holopart_weights)
+                   py_holopart, holopart_root, holopart_weights,
+                   holopart_large=holopart_large, score_candidate=score_candidate,
+                   score_candidate_small=score_candidate_small, score_floor=score_floor,
+                   part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
+                   merge_gap=merge_gap, merge_max_share=merge_max_share)
     return manifest
 
 
@@ -422,7 +435,10 @@ def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
                    with_texture=True, texture_size=DEFAULT_TEXTURE_SIZE,
                    min_area_share=DEFAULT_MIN_AREA_SHARE, redraws=DEFAULT_REDRAWS,
                    py_holopart=None, holopart_root=DEFAULT_HOLOPART_ROOT,
-                   holopart_weights=DEFAULT_HOLOPART_WEIGHTS):
+                   holopart_weights=DEFAULT_HOLOPART_WEIGHTS,
+                   part_min_area_share=None, fold_within_part=False,
+                   holopart_large="escape", score_candidate=None, score_floor=None,
+                   merge_gap=0.0, merge_max_share=None, score_candidate_small=None):
     """Close the open parts. Default is hybrid: X-Part, then HoloPart on large escapees.
 
     Splitting one shell leaves every part open where it was cut. X-Part regenerates each
@@ -450,9 +466,18 @@ def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
                     "--octree_resolution", octree_resolution, "--seed", seed,
                     "--condition", condition,
                     "--min_area_share", min_area_share, "--redraws", redraws]
+    for name, share in parse_part_floors(part_min_area_share).items():
+        command += ["--part_min_area_share", f"{name}={share}"]
+    if fold_within_part:
+        command.append("--fold_within_part")
+    if merge_gap:
+        command += ["--merge_gap", merge_gap]
+        if merge_max_share is not None:
+            command += ["--merge_max_share", merge_max_share]
     _run(command)
     if mode == "hybrid":
-        _hybrid_swap(out_dir, seed, py_holopart, holopart_root, holopart_weights)
+        _hybrid_swap(out_dir, seed, py_holopart, holopart_root, holopart_weights,
+                     holopart_large, score_candidate, score_floor, score_candidate_small)
     closed = os.path.join(out_dir, "xpart_parts.glb")
     if mode in ("full", "hybrid") and with_texture and os.path.isfile(closed):
         raw = os.path.join(out_dir, "xpart_parts_raw.glb")
@@ -469,9 +494,35 @@ def complete_parts(glb, parts_glb, out_dir, mode="boxes", py_xpart=None,
         return json.load(handle)
 
 
-def _hybrid_swap(out_dir, seed, py_holopart, holopart_root, holopart_weights):
-    """Run HoloPart only if a large X-Part solid left its box; assemble either way."""
-    from hybrid_complete import apply_hybrid, decisions_from_instances
+def parse_part_floors(value):
+    """{name: share} from a dict or a 'name=share,name=share' string (HTTP form)."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): float(v) for k, v in value.items()}
+    floors = {}
+    for item in str(value).split(","):
+        if not item.strip():
+            continue
+        name, sep, share = item.rpartition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"part_min_area_share expects name=share[,name=share], got {value!r}")
+        floors[name.strip()] = float(share)
+    return floors
+
+
+def _hybrid_swap(out_dir, seed, py_holopart, holopart_root, holopart_weights,
+                 holopart_large="escape", score_candidate=None, score_floor=None,
+                 score_candidate_small=None):
+    """Run HoloPart on the instances the hybrid rule picks (only those); assemble either way.
+
+    holopart_large: "escape" / "always" decide from box escape and size; "score" measures
+    every X-Part solid against its open surface, draws HoloPart for the low scorers and
+    keeps the better one (or the open surface when both are below the floor).
+    """
+    from hybrid_complete import (LARGE_POLICIES, apply_hybrid, apply_scored,
+                                 decisions_from_instances, instance_node_name,
+                                 score_candidates)
 
     instances = os.path.join(out_dir, "xpart_instances.glb")
     boxes_path = os.path.join(out_dir, "boxes.json")
@@ -479,23 +530,42 @@ def _hybrid_swap(out_dir, seed, py_holopart, holopart_root, holopart_weights):
         raise SystemExit("hybrid repair needs xpart_instances.glb and boxes.json")
     with open(boxes_path, "r", encoding="utf-8") as handle:
         boxes = json.load(handle)
-    decisions = decisions_from_instances(instances, boxes)
+    if holopart_large == "score":
+        thresholds = {k: v for k, v in (("candidate", score_candidate),
+                                        ("candidate_small", score_candidate_small))
+                      if v is not None}
+        decisions = score_candidates(out_dir, **thresholds)
+        wants = [decision["candidate"] for decision in decisions]
+    elif holopart_large in LARGE_POLICIES:
+        decisions = decisions_from_instances(instances, boxes, large_policy=holopart_large)
+        wants = [decision["backend"] == "holopart" for decision in decisions]
+    else:
+        raise ValueError(f"holopart_large must be one of {LARGE_POLICIES + ('score',)}, "
+                         f"got {holopart_large!r}")
     holopart_glb = None
-    if any(row["backend"] == "holopart" for row in decisions):
+    if any(wants):
         open_glb = os.path.join(out_dir, "open_instances.glb")
         if not os.path.isfile(open_glb):
             raise SystemExit("hybrid repair needs open_instances.glb from X-Part")
-        print("[complete] large box-escape; running HoloPart on the open instances ...")
-        _run([
+        chosen = [instance_node_name(row) for row, want in zip(boxes, wants) if want]
+        print(f"[complete] HoloPart ({holopart_large}) on {len(chosen)} open instance(s) ...")
+        command = [
             py_holopart or DEFAULT_PY_HOLOPART,
             os.path.join(ROOT, "holopart_complete.py"),
             "--parts", open_glb, "--out_dir", out_dir,
             "--holopart_root", holopart_root,
             "--weights", holopart_weights,
             "--seed", seed,
-        ])
+        ]
+        for name in chosen:
+            command += ["--only", name]
+        _run(command)
         holopart_glb = os.path.join(out_dir, "holopart_instances.glb")
-    apply_hybrid(out_dir, holopart_glb)
+    if holopart_large == "score":
+        apply_scored(out_dir, decisions, holopart_glb,
+                     **({} if score_floor is None else {"floor": score_floor}))
+    else:
+        apply_hybrid(out_dir, holopart_glb, large_policy=holopart_large)
 
 
 def main():
