@@ -35,8 +35,8 @@ from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, DEFAULT_COMPLETE, DEFAULT_CONDITION,
     DEFAULT_CONCEPT_BANK, DEFAULT_HOLOPART_ROOT, DEFAULT_HOLOPART_WEIGHTS,
     DEFAULT_FRAGMENT_SHARE, DEFAULT_MIN_AREA_SHARE, DEFAULT_OCTREE_RESOLUTION, DEFAULT_PY_HOLOPART,
-    DEFAULT_HOLOPART_LARGE, DEFAULT_PY_XPART, DEFAULT_RADIUS, DEFAULT_REDRAWS,
-    DEFAULT_RESOLUTION,
+    DEFAULT_EXPORT_FROM, DEFAULT_HOLOPART_LARGE, DEFAULT_PY_XPART, DEFAULT_RADIUS,
+    DEFAULT_REDRAWS, DEFAULT_REFINE, DEFAULT_REFINE_MIN_SHARE, DEFAULT_RESOLUTION,
     DEFAULT_SAM3_THRESHOLD, DEFAULT_TEXTURE_SIZE, DEFAULT_UNASSIGNED_TO,
     DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS, DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS,
     FLAT_PAINT_MODES, MERGE_MODES, PipelineOptions, add_cli_arguments, check_cli,
@@ -297,6 +297,9 @@ def merge_parts(
     fold_within_part=False,
     merge_gap=0.0,
     merge_max_share=None,
+    refine=DEFAULT_REFINE,
+    refine_min_share=DEFAULT_REFINE_MIN_SHARE,
+    export_from=DEFAULT_EXPORT_FROM,
 ):
     """Name the atoms in `split_dir` with `prompts` and write the parts into `out_glb`.
 
@@ -367,6 +370,21 @@ def merge_parts(
         min_unit_faces, min_recall, units=units,
     )
     print_report(rows, list(dict.fromkeys(mask_set.owners)))
+    if refine == "masks" and merge == "name":
+        from refine_units import refine_labels_by_masks
+
+        print("[refine] reading the masks per face to split a unit that fused two parts ...")
+        labels, changes = refine_labels_by_masks(
+            reference, units, labels, expected_names, mask_set, cameras,
+            float(manifest_views["camera_angle_x"]), int(manifest_views["resolution"]),
+            min_share=refine_min_share)
+        for change in changes:
+            print(f"  unit {change['unit']:>3}: {change['faces']} faces "
+                  f"({change['share_of_unit']:.0%} of it) {expected_names[change['from']]} "
+                  f"-> {expected_names[change['to']]}")
+        print(f"[refine] {len(changes)} patch(es) moved")
+        with open(os.path.join(split_dir, "refine_report.json"), "w", encoding="utf-8") as handle:
+            json.dump(changes, handle, ensure_ascii=False, indent=2)
     if merge == "fragments":
         names_by_unit = [row["name"] for row in rows]
         units, folded_names, absorbed = fold_fragment_units(
@@ -394,7 +412,7 @@ def merge_parts(
         json.dump(rows, handle, ensure_ascii=False, indent=2)
 
     manifest = export_labelled(mesh_path, glb, labels_npy, names_json, out_glb,
-                               with_texture, texture_size)
+                               with_texture, texture_size, export_from=export_from)
     if strict_parts and merge == "name":
         validate_named_rows(expected_names, manifest, key="name")
     print(f"saved {out_glb} ({len(manifest)} parts)")
@@ -410,8 +428,21 @@ def merge_parts(
 
 
 def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
-                    with_texture=True, texture_size=2048, step="[export]"):
-    """Cut the reference mesh by a face label array and write one node per label."""
+                    with_texture=True, texture_size=2048, step="[export]",
+                    export_from=DEFAULT_EXPORT_FROM):
+    """Cut the reference mesh by a face label array and write one node per label.
+
+    export_from="source" cuts the source model itself (labels carried over from the
+    remesh, its own texture kept) and falls back to the remesh + bake when the source is
+    not one textured mesh.
+    """
+    if export_from == "source" and with_texture and source_glb:
+        from source_export import export_from_source
+
+        manifest = export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
+                                      step=step)
+        if manifest is not None:
+            return manifest
     print(f"{step} exporting parts (texture={'on' if with_texture else 'off'}) ...")
     out_dir = os.path.dirname(out_glb) or "."
     # parts_rebake keeps its own bpy process: Cycles can access-violate on teardown, and

@@ -52,8 +52,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from merge_parts import (
-    DEFAULT_HOLOPART_LARGE, canonical_prompts, complete_parts, export_labelled, guidance,
-    merge_parts,
+    DEFAULT_EXPORT_FROM, DEFAULT_HOLOPART_LARGE, DEFAULT_REFINE, DEFAULT_REFINE_MIN_SHARE,
+    canonical_prompts, complete_parts, export_labelled, guidance, merge_parts,
 )
 from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public contract
     DEFAULT_AZIMUTH, DEFAULT_AZIMUTH_JITTER, DEFAULT_COMPLETE, DEFAULT_CONCEPT_BANK,
@@ -152,6 +152,9 @@ def segment_parts(
     fold_within_part=False,
     merge_gap=0.0,
     merge_max_share=None,
+    refine=DEFAULT_REFINE,
+    refine_min_share=DEFAULT_REFINE_MIN_SHARE,
+    export_from=DEFAULT_EXPORT_FROM,
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -313,6 +316,7 @@ def segment_parts(
             score_candidate_small=score_candidate_small, score_floor=score_floor,
             part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
             merge_gap=merge_gap, merge_max_share=merge_max_share,
+            refine=refine, refine_min_share=refine_min_share, export_from=export_from,
         )
 
     if merge == "fragments":
@@ -330,7 +334,7 @@ def segment_parts(
     with open(names_json, "w", encoding="utf-8") as handle:
         json.dump([f"unit_{unit:02d}" for unit in range(units.max() + 1)], handle, indent=2)
     manifest = export_labelled(sample_glbs[0], glb, labels_npy, names_json, out_glb,
-                               with_texture, texture_size)
+                               with_texture, texture_size, export_from=export_from)
     print(f"saved {out_glb} ({len(manifest)} units, unnamed)")
     complete_parts(glb, out_glb, os.path.join(out_dir, "complete"), complete,
                    py_xpart, xpart_root, xpart_weights, octree_resolution, seed,

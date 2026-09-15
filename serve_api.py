@@ -54,7 +54,8 @@ import segment_api
 import segment_parts
 from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, FLAT_PAINT_MODES, GRANULARITY,
-    HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
+    EXPORT_FROM_MODES, HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
+    REFINE_MODES,
 )
 
 from merge_parts import parse_part_floors
@@ -466,6 +467,17 @@ async def segment(
     merge_max_share: float = Form(
         _DEFAULTS.merge_max_share,
         description="merge_gap: only a piece under this share of the surface joins"),
+    refine: str = Form(
+        _DEFAULTS.refine,
+        description=" | ".join(REFINE_MODES) + ". masks: after the vote, cut a unit where "
+        "SAM3's per-face masks name a coherent patch of it differently"),
+    refine_min_share: float = Form(
+        _DEFAULTS.refine_min_share,
+        description="refine=masks: a patch is cut off only above this share of its unit"),
+    export_from: str = Form(
+        _DEFAULTS.export_from,
+        description=" | ".join(EXPORT_FROM_MODES) + ". source: cut the parts from the source "
+        "model with its own texture (full resolution); remesh: cut the remesh and bake"),
     octree_resolution: int = Form(_DEFAULTS.octree_resolution),
     seed: int = Form(_DEFAULTS.seed),
     with_texture: bool = Form(_DEFAULTS.with_texture),
@@ -493,6 +505,10 @@ async def segment(
         raise HTTPException(400, f"condition must be one of {CONDITION_MODES}")
     if holopart_large not in HOLOPART_LARGE_MODES:
         raise HTTPException(400, f"holopart_large must be one of {HOLOPART_LARGE_MODES}")
+    if refine not in REFINE_MODES:
+        raise HTTPException(400, f"refine must be one of {REFINE_MODES}")
+    if export_from not in EXPORT_FROM_MODES:
+        raise HTTPException(400, f"export_from must be one of {EXPORT_FROM_MODES}")
     if part_min_area_share in ("", "string"):
         part_min_area_share = None
     if part_min_area_share is not None:
@@ -540,6 +556,9 @@ async def segment(
         "fold_within_part": fold_within_part,
         "merge_gap": merge_gap,
         "merge_max_share": merge_max_share,
+        "refine": refine,
+        "refine_min_share": refine_min_share,
+        "export_from": export_from,
         "octree_resolution": octree_resolution,
         "seed": seed,
         "with_texture": with_texture,

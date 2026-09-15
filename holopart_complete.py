@@ -56,6 +56,10 @@ def main():
     parser.add_argument("--guidance_scale", type=float, default=3.5)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_chunks", type=int, default=20000)
+    parser.add_argument("--max_faces", type=int, default=200000,
+                        help="HoloPart's own script decimates every solid to 10,000 faces; "
+                             "that flattens a 25%-of-the-model breastplate to a smooth shell. "
+                             "Its marching cubes run at 505^3, so keep up to this many.")
     parser.add_argument("--only", action="append", default=[], metavar="NODE",
                         help="Generate only these instances (repeatable). Every instance "
                              "still describes the whole shape HoloPart conditions on.")
@@ -73,7 +77,13 @@ def main():
 
     import torch
     from holopart.pipelines.pipeline_holopart import HoloPartPipeline
+    import scripts.inference_holopart as inference_holopart
     from scripts.inference_holopart import prepare_data, run_holopart
+
+    # run_holopart calls simplify_mesh(mesh, 10000) from its module globals; raise the cap.
+    original_simplify = inference_holopart.simplify_mesh
+    inference_holopart.simplify_mesh = lambda mesh, n_faces: original_simplify(
+        mesh, max(int(n_faces), args.max_faces))
 
     weights = os.path.abspath(args.weights)
     if not os.path.isdir(weights):

@@ -67,6 +67,11 @@ DEFAULT_FRAGMENT_SHARE = 0.01
 DEFAULT_REDRAWS = 2
 DEFAULT_HOLOPART_LARGE = "score"   # escape | always | score; see hybrid_complete.py
 HOLOPART_LARGE_MODES = ("escape", "always", "score")
+DEFAULT_REFINE = "off"             # masks: cut a voted unit where its own masks name a patch differently
+REFINE_MODES = ("masks", "off")
+DEFAULT_REFINE_MIN_SHARE = 0.10
+DEFAULT_EXPORT_FROM = "source"     # cut parts from the source model (full resolution, no bake)
+EXPORT_FROM_MODES = ("source", "remesh")
 DEFAULT_OCTREE_RESOLUTION = 512
 DEFAULT_SEED = 42
 DEFAULT_TEXTURE_SIZE = 2048
@@ -151,6 +156,11 @@ class PipelineOptions:
     fold_within_part: bool = False
     merge_gap: float = 0.0
     merge_max_share: float = DEFAULT_MERGE_MAX_SHARE
+    # after the vote: split a unit where SAM3's per-face masks name a coherent patch of
+    # it differently (refine_units.py); cut parts from the source model (source_export.py)
+    refine: str = DEFAULT_REFINE
+    refine_min_share: float = DEFAULT_REFINE_MIN_SHARE
+    export_from: str = DEFAULT_EXPORT_FROM
 
     def resolved_floors(self):
         return floors(self.granularity, self.min_atom_faces, self.min_unit_faces)
@@ -170,6 +180,8 @@ class PipelineOptions:
                                 for k, (a, u) in GRANULARITY.items()},
                 "mirror": list(MIRROR_MODES),
                 "holopart_large": list(HOLOPART_LARGE_MODES),
+                "refine": list(REFINE_MODES),
+                "export_from": list(EXPORT_FROM_MODES),
             },
             "defaults": {
                 **{f.name: getattr(self, f.name) for f in fields(self)
@@ -230,6 +242,9 @@ class PipelineOptions:
             "fold_within_part": self.fold_within_part,
             "merge_gap": self.merge_gap,
             "merge_max_share": self.merge_max_share,
+            "refine": self.refine,
+            "refine_min_share": self.refine_min_share,
+            "export_from": self.export_from,
         }
 
     def merge_kwargs(self):
@@ -316,6 +331,9 @@ class PipelineOptions:
             fold_within_part=bool(getattr(args, "fold_within_part", False)),
             merge_gap=getattr(args, "merge_gap", 0.0),
             merge_max_share=getattr(args, "merge_max_share", DEFAULT_MERGE_MAX_SHARE),
+            refine=getattr(args, "refine", DEFAULT_REFINE),
+            refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
+            export_from=getattr(args, "export_from", DEFAULT_EXPORT_FROM),
         )
 
 
@@ -395,6 +413,18 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--merge_max_share", type=float, default=DEFAULT_MERGE_MAX_SHARE,
                         help="merge_gap: only a piece under this share of the surface "
                              "joins a neighbour")
+    parser.add_argument("--refine", default=DEFAULT_REFINE, choices=REFINE_MODES,
+                        help="masks (default): after the vote, cut a unit where SAM3's "
+                             "per-face masks name a coherent patch of it differently (the "
+                             "back of a hand fused with the gauntlet); off keeps one name "
+                             "per unit")
+    parser.add_argument("--refine_min_share", type=float, default=DEFAULT_REFINE_MIN_SHARE,
+                        help="refine=masks: a patch is cut off only above this share of "
+                             "its unit's area")
+    parser.add_argument("--export_from", default=DEFAULT_EXPORT_FROM, choices=EXPORT_FROM_MODES,
+                        help="source (default): cut the parts from the source model with "
+                             "its own UVs and texture (full resolution, no bake); remesh: "
+                             "cut the TRELLIS remesh and bake the texture back")
     parser.add_argument("--no_reuse", action="store_true",
                         help="Re-run every stage instead of reusing cached intermediates")
     parser.add_argument("--allow_partial", action="store_true",
