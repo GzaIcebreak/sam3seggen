@@ -11,6 +11,20 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 
 ## 📣 What's new
 
+- **Parts are cut from the source model** (`--export_from source`, default): the vote still
+  runs on the remesh, but the labels are carried over to the source's own faces and the
+  parts are cut from it with their UVs and texture, no bake. The monk's hands went from
+  1.3k to 5-7k faces; that is where the fingers were.
+- **Repair picks its backend by score** (`--holopart_large score`, default): every X-Part
+  solid is measured against its open surface (coverage x invented geometry x box escape x
+  biggest-shell share); low scorers get a HoloPart draw, the better one wins, and when both
+  are bad the open surface stays. Box escape alone let a 0%-escape blob through as the
+  tree trunk. HoloPart solids are no longer decimated to 10k faces
+  (`holopart_complete --max_faces`).
+- **Tidy the pieces before prompting**: `--merge_gap` rejoins same-part pieces another part
+  cut apart; `--fold_within_part` and `--part_min_area_share` stop small things on a big
+  thing from folding into it.
+
 The main line is no longer "steer generation with one 2D map". It over-segments by
 geometry, names the pieces, then optionally closes them and bakes the source albedo back
 on. The CLI, the Python call and HTTP share **one** config object
@@ -259,7 +273,15 @@ Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached
 | `--radius` / `--resolution` | | `2` / `512` | voting renders |
 | `--sam3_threshold` | float | `0.4` | concept-bank threshold (0.3 without a bank) |
 | `--min_area_share` | float | `0.005` | fold a tiny X-Part piece into its neighbour |
+| `--part_min_area_share` | `name=share,…` | none | per-part `--min_area_share` (`ornaments=0.001` keeps every bauble its own prompt) |
+| `--fold_within_part` | flag | off | fold a tiny piece only into its **own** part (ornaments stop vanishing into the branches) |
+| `--merge_gap` / `--merge_max_share` | float | `0` / `0.05` | rejoin same-part pieces another part's cut split apart (a hand cut in two by a staff); `0` = off |
 | `--redraws` | int | `2` | redraw a solid that overruns its box |
+| `--holopart_large` | `escape` / `always` / `score` | `score` | when hybrid repair swaps in HoloPart: large solid left its box / every large one / by score |
+| `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`: a large / small X-Part solid below this also gets a HoloPart draw; the better one wins |
+| `--score_floor` | float | `0.3` | `score`: both below this keeps the open surface instead |
+| `--refine` / `--refine_min_share` | `masks` / `off`, float | `off` / `0.1` | after the vote, cut a unit where the masks read per face name a coherent patch of it differently |
+| `--export_from` | `source` / `remesh` | `source` | cut the parts from the source model (full resolution, its own UVs, no bake) or from the remesh + bake |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part reconstruction |
 | `--texture_size` | int | `2048` | bake resolution |
 | `--no_texture` / `--no_reuse` | flag | off | skip bake / ignore cache |
@@ -511,8 +533,9 @@ these links:
 | `GET` | `/jobs/{id}/download` | `parts.glb` (open, named parts) |
 | `GET` | `/jobs/{id}/atoms` | over-segmented atoms before the vote |
 | `GET` | `/jobs/{id}/report` | per-unit vote table (absent when `merge=off`) |
-| `GET` | `/jobs/{id}/complete` | textured X-Part solids (`complete=full`) |
+| `GET` | `/jobs/{id}/complete` | textured closed solids (`complete=full` / `hybrid`) |
 | `GET` | `/jobs/{id}/complete_raw` | generated solids before the bake |
+| `GET` | `/jobs/{id}/complete_decisions` | per-instance scores and the final pick (X-Part / HoloPart / open surface) |
 | `GET` | `/jobs/{id}/guidance/{name}` | a review overlay from `work/guidance/` |
 | `GET` | `/jobs/{id}/map`, `/render` | legacy jobs only |
 

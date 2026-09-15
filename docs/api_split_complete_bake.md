@@ -1,6 +1,6 @@
 # 一条龙 API：拆分 → 修复 → 烘焙
 
-一条 HTTP / Python / CLI 调用走完整主线：几何过分割（开口的 `parts.glb`），提示词只负责取名、可以不写；再用混合修复把切口重生为封闭实体（先 X-Part，大件超框才换成 HoloPart），最后把源模型 albedo 烘回去。
+一条 HTTP / Python / CLI 调用走完整主线：几何过分割（开口的 `parts.glb`），提示词只负责取名、可以不写；再用混合修复把切口重生为封闭实体（先 X-Part，按评分决定换 HoloPart 还是退回开口面），最后把源模型 albedo 烘回封闭实体。开口件默认直接从原模型切出，带原贴图，不需要烘。
 
 三个入口读同一份契约：`pipeline.PipelineOptions`。`POST /segment` 的字段名与它对齐。改完代码必须重启 `run_serve.sh`，否则 `/health` 仍是旧进程。
 
@@ -16,11 +16,11 @@ paint → guidance → split → units → merge → complete → bake
 | 引导图 | 有提示词才跑 | `work/guidance/*.png`、SAM3 掩码 |
 | 拆分 | 是 | `work/atoms.glb`、多次 `full_seg` 求交 |
 | 单元 | 是 | 连通分量 + 双壳合并 |
-| 命名 | 有提示词且 `merge=name` | 开口、已命名、默认已烘贴图的 `parts.glb` |
+| 命名 | 有提示词且 `merge=name` | 开口、已命名的 `parts.glb`；默认从原模型切（`export_from=source`），原 UV / 贴图 |
 | 修复 | `complete=hybrid`（默认） | `complete/xpart_parts_raw.glb`、`xpart_instances.glb`、`decisions.json` |
 | 回烘 | 默认开，且 `with_texture=true` | `complete/xpart_parts.glb` |
 
-`complete` 默认就是 `hybrid`：先跑 X-Part，仅当某实例 **超框 > 50%** 且（面积占比 ≥ 8% 或某轴 ≥ 源模 55%）时，换成该实例的 HoloPart。不想修复时显式传 `complete=off`。`full` 仍是纯 X-Part，便于对照。
+`complete` 默认就是 `hybrid`：先跑 X-Part，再按 `holopart_large` 决定每个实例用谁。默认 `score`：把 X-Part 实体和它的开口面比对打分（0–1），大件低于 `score_candidate=0.8`、小件低于 `score_candidate_small=0.6` 的再跑一次 HoloPart，取分高的；两者都低于 `score_floor=0.3` 就保留开口面，不硬塞一个错的实体。`escape` 是旧规则（大件且超框 > 50% 才换），`always` 大件一律换。不想修复时显式传 `complete=off`。`full` 仍是纯 X-Part，便于对照。
 
 
 ## HTTP 一条龙
@@ -67,7 +67,7 @@ curl -X POST "$HOST/segment" --max-time 3600 \
 | `download` | 开口、已命名的 `parts.glb` |
 | `complete` | 烘过贴图的封闭实体；没跑修复则为 `null` |
 | `complete_raw` | 烘焙前的生成实体 |
-| `complete_decisions` | 每个实例用了 X-Part 还是 HoloPart |
+| `complete_decisions` | 每个实例的评分（`q_xpart` / `q_holopart`）和最终选择：X-Part / HoloPart / 开口面 |
 | `atoms` / `report` / `guidance` | 过分割原子、投票表、审阅叠加图 |
 
 | 方法 | 路径 | 内容 |
@@ -131,7 +131,7 @@ $JOBS_DIR/{job_id}/
   complete/xpart_parts_raw.glb       # GET /complete_raw
   complete/xpart_instances.glb       # 纯 X-Part 逐件实体
   complete/hybrid_instances.glb      # 混合后的逐件实体
-  complete/holopart_instances.glb    # 仅当有大件超框、跑过 HoloPart
+  complete/holopart_instances.glb    # 仅当评分挑出候选、跑过 HoloPart
   complete/open_instances.glb        # 交给生成器的开口实例
   complete/boxes.json
   complete/decisions.json            # GET /complete_decisions
@@ -197,7 +197,8 @@ python segment_parts.py --glb model.glb --out out/parts.glb --work_dir out/work
 | `merge` | `name` / `unit` / `fragments` / `off` | 同左 | `name` | `name`：每个提示词一个节点，同名大件会焊在一起。`unit`：每个投票单元一个节点，用来定位是谁取错名。`fragments`：按几何切开留下，只把碎屑折回邻件（门槛是 `fragment_share`）。`off`：不命名，每个几何单元一个节点，**仍然修复**。不传 `prompts` 时填 **主体、底座**，`merge` 保持请求值。 |
 | `fragment_share` | float | `--fragment_share` | `0.01` | 只在 `merge=fragments` 生效：面积低于表面这么多的单元才算碎屑。更小更碎、保留更多件；更大折得更狠。`0` 等于不折。独立名字的小件（按钮、耳朵）仍会留下。 |
 | `complete` | `off` / `boxes` / `full` / `hybrid` | 同左 | `hybrid` | `off`：不修复。`boxes`：只写盒子提示和预览，不占 GPU。`full`：只跑 X-Part 再烘。`hybrid`：X-Part 之后，大件超框换成 HoloPart，再烘。 |
-| `with_texture` | `true` / `false` | `--no_texture` 关掉 | `true` | 开口件和封闭实体都走 Blender 重 UV + selected-to-active 烘焙。关掉则部件只给占位色，不需要 bpy。**这不表示源模型有没有贴图**，只表示要不要烘。 |
+| `with_texture` | `true` / `false` | `--no_texture` 关掉 | `true` | 封闭实体走 Blender 重 UV + selected-to-active 烘焙；开口件在 `export_from=source` 时直接带原贴图，不烘，只有退回 `remesh` 时才烘。关掉则部件只给占位色，不需要 bpy。**这不表示源模型有没有贴图**，只表示要不要烘。 |
+| `export_from` | `source` / `remesh` | `--export_from` | `source` | `source`：标签从重建网格转到原模型的面上（最近面 + 多数平滑），部件直接从原模型切，原分辨率、原 UV、原贴图；源模型不是单网格单材质时自动退回 `remesh`。`remesh`：从重建网格切再烘，旧行为。 |
 | `texture_size` | int | `--texture_size` | `2048` | **小件**底图边长。面积 ≥ 8% 升到 2×（默认 4096），≥ 40% 升到 4×（默认 8192），封顶 8192。贴图按 PNG 打进 GLB。 |
 
 一条龙有提示词：`merge=name` + `complete=hybrid` + `with_texture=true`。觉得同名焊得太狠：`-F "merge=fragments"`，再用 `-F "fragment_share=0.02"` 调折回门槛。不写提示词：自动 **主体、底座**，`merge=name`，粒度仍是 `medium`。
@@ -228,6 +229,7 @@ python segment_parts.py --glb model.glb --out out/parts.glb --work_dir out/work
 | `allow_partial` | `true` | 某个提示词完全没有掩码时跳过该词，其余继续。 |
 | `strict_parts` | `false` | 反过来：缺掩码或缺面就整单失败。与 `allow_partial` 不要打架；HTTP 里 `strict_parts` 优先。 |
 | `reuse` | `true` | 复用 `work/` 里已有渲染和同提示词掩码。换源模型后应 `reuse=false`（CLI：`--no_reuse`）。 |
+| `refine` / `refine_min_share` | `off` / `0.1` | `masks`：投票后把掩码按面投影，单元里如果有一块连贯区域（≥ 单元面积的 `refine_min_share`）被别的名字认领，就沿这条边界把它切出来。给"几何没分开、掩码分得开"的情况用；猴子的手背和护腕在掩码里也是一体，它帮不上，所以默认关。 |
 
 ### 修复（混合：X-Part + 按需 HoloPart）
 
@@ -235,13 +237,21 @@ python segment_parts.py --glb model.glb --out out/parts.glb --work_dir out/work
 |---|---|---|
 | `condition` | `surface` | `surface`：从拆分归属面上采条件点（盒子里装着别人的腿也不会被当成躯干）。`box`：盒内裁剪，旧行为，只作对照。盒子始终会传，用来算 token / 超框。 |
 | `min_area_share` | `0.005` | 表面占比低于此值的连通分量折进最近大件，不单独生成。碎片上 X-Part 不可靠。占比在去掉 remesh 内壁之后算。 |
+| `part_min_area_share` | 无 | 按部件覆盖上面的门槛，写法 `名=占比,名=占比`（`装饰品=0.001`）。树上几百个彩球没有一个到 0.5%，不这样写会全部折进树枝。 |
+| `fold_within_part` | `false` | 过小件只折进**同名**部件里最近的那块；同名一块都没留下时才折进别的部件。 |
+| `merge_gap` / `merge_max_share` | `0` / `0.05` | 同一部件的两块表面距离小于模型对角线的 `merge_gap`、且至少一块面积低于 `merge_max_share` 时接成一件（传递合并）。猴子的手被棍子切成两个半只手，X-Part 把半只手生成成 3–5 倍大的板；接成整只手后一次修好。`0` 关。挨在一起的装饰品会被接成一件，圣诞树这类模型别开。 |
 | `redraws` | `2` | 生成实体超出自己的盒子时，用同样条件重抽这么多次；只有更贴盒子的那一抽才会被采用。身份嵌入是随机的，偶发巨型件是抽签，不是提示词坏了。 |
 | `octree_resolution` | `512` | X-Part 重建分辨率。 |
 | `seed` | `42` | 生成种子。不能消掉身份嵌入的随机，只能让可复现的那部分固定。 |
 | `py_xpart` / `xpart_root` / `xpart_weights` | 环境变量 | HTTP 不暴露路径；只在本机 CLI / Python 里改。 |
-| `py_holopart` / `holopart_root` / `holopart_weights` | 环境变量 | 同上。没有大件超框时不会启动 HoloPart。 |
+| `holopart_large` | `score` | `score`：按评分选后端（见下）。`escape`：大件且超框 > 50% 才换 HoloPart（旧规则）。`always`：大件一律换。 |
+| `score_candidate` / `score_candidate_small` | `0.8` / `0.6` | `score`：大件（面积 ≥ 8% 或某轴 ≥ 源模 55%）/ 小件的 X-Part 实体低于此分，再跑一次 HoloPart 对比。小件 X-Part 本来就在行，问得少一些。 |
+| `score_floor` | `0.3` | `score`：X-Part 和 HoloPart 都低于此分时保留开口面。 |
+| `py_holopart` / `holopart_root` / `holopart_weights` | 环境变量 | 同上。没有候选实例时不会启动 HoloPart。HoloPart 实体保留到 20 万面（`holopart_complete --max_faces`），它自带脚本的 1 万面上限会把护甲抹成光壳。 |
 
-换件门槛写死在 `hybrid_complete.py`：超框 `0.5`，面积 `0.08`，轴向 `0.55`。机器人实测只换躯干：腿/脚算「大」但没超框，手即使飘了也太小，不换。
+评分（`hybrid_complete.py`）：把生成实体和它的开口面双向比对，距离按盒子对角线归一化。分 = 覆盖率（开口面采样点落在实体 2% 距离内的比例）×（1 − 多余几何 p90 / 0.2）×（1 − 出框率）× 最大连通壳的面积占比。最后一项是必需的：HoloPart 曾把一只手生成成 3012 个碎片，碎片全贴在原表面上，只看距离反而比完整的拳头分高。评分看不见"细节丢失"——一个光滑的护甲只要贴着原表面就能拿高分，所以 HoloPart 的面数上限一定要放开。每个实例的分数写在 `decisions.json`。
+
+旧的 `escape` 规则只看超框：大件（面积 `0.08` / 轴向 `0.55`）超框 `0.5` 才换。圣诞树的树身 0% 出框却是个圆块（X-Part 0.70，HoloPart 0.89），它抓不到。
 
 封闭实体的笼子上限仍是 `0.05` / `0.15`，但会按该件到源表面的中位距离收紧：贴得近的用开口件那档（`0.02` / `0.05`），只有飘得远的才用满上限。`texture_size` 同时作用于开口烘焙和封闭回烘，大件自动加像素。
 
@@ -339,4 +349,21 @@ flat_paint=auto
 with_texture=true
 min_area_share=0.005
 redraws=2
+# holopart_large 默认 score，export_from 默认 source，不用写
+```
+
+主体上挂满小物件（圣诞树、挂饰）：
+
+```
+prompts=装饰品=bauble+star+bow+pinecone, 树=christmas tree
+unassigned_to=树
+part_min_area_share=装饰品=0.001
+fold_within_part=true
+# merge_gap 保持 0：挨着的装饰品不能接成一件
+```
+
+小件被别的部件切碎（握着棍子的手）：
+
+```
+merge_gap=0.01
 ```

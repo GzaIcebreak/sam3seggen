@@ -11,6 +11,14 @@ mesh，带真实贴图。
 
 ## 📣 近期更新
 
+- **部件从原模型切**（`--export_from source`，默认）：标签仍在重建网格上投票，但转到原模型的面上后
+  直接切原模型，保留原 UV 和贴图，不再回烘。猴子的手从 1.3k 面变成 5–7k 面，手指才保得住。
+- **修复按评分选后端**（`--holopart_large score`，默认）：每个 X-Part 实体和它的开口面比对（覆盖率 ×
+  多余几何 × 出框 × 最大壳占比），低分的再跑 HoloPart 取高分，两者都差就退回开口面。只看出框率会放过
+  0% 出框却修成圆块的树身。HoloPart 实体不再被减到 1 万面（`holopart_complete --max_faces`）。
+- **提示词前先整理碎块**：`--merge_gap` 把被别的部件切开的同名小块接回一件；`--fold_within_part`、
+  `--part_min_area_share` 让"主体上挂满小物件"的模型不把小物件折进主体。
+
 主线从「一张 2D 图去引导生成」换成「几何过分割再命名」，并接上封闭补全与贴图回烘。
 CLI、Python 和 HTTP **共用一份配置**（`pipeline.py` 的 `PipelineOptions`），开关不再各写各的。
 
@@ -223,7 +231,7 @@ python segment_parts.py \
 | 开关 | 取值 | 当前默认 | 作用 |
 |---|---|---|---|
 | `--merge` | `name` / `unit` / `off` | `name` | 命名；`off` 停在 units |
-| `--complete` | `off` / `boxes` / `full` | `off` | X-Part；`full` 再生成为实体后再烘贴图 |
+| `--complete` | `off` / `boxes` / `full` / `hybrid` | `hybrid` | 修复：`full` 只用 X-Part；`hybrid` 按 `--holopart_large` 在 X-Part / HoloPart / 开口面之间选；都会再烘贴图 |
 | `--condition` | `surface` / `box` | `surface` | X-Part 条件：拆分归属面，或盒内裁剪 |
 | `--flat_paint` | `auto` / `on` / `off` | `auto` | 渲染无色时先平涂 |
 | `--granularity` | `fine` / `medium` / `coarse` | `medium` | 原子/单元下限 150/300、300/600、800/1600 |
@@ -237,7 +245,15 @@ python segment_parts.py \
 | `--radius` / `--resolution` | | `2` / `512` | 投票渲染 |
 | `--sam3_threshold` | float | `0.4` | 概念库阈值（无库时画笔是 0.3） |
 | `--min_area_share` | float | `0.005` | 过小件折进最近大件 |
+| `--part_min_area_share` | `名=占比,…` | 无 | 按部件覆盖 `--min_area_share`（`装饰品=0.001` 让每个彩球都单独生成） |
+| `--fold_within_part` | flag | 关 | 过小件只折进**同名**部件（树上的装饰品不再被折进树枝） |
+| `--merge_gap` / `--merge_max_share` | float | `0` / `0.05` | 把被别的部件切开的同名小块重新接成一件（手被棍子切成两半）；`0` 关 |
 | `--redraws` | int | `2` | 超框实体重抽次数 |
+| `--holopart_large` | `escape` / `always` / `score` | `score` | 混合修复里何时换 HoloPart：大件超框才换 / 大件一律换 / 按评分 |
+| `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`：大件 / 小件的 X-Part 实体低于此分再跑 HoloPart 对比，取高分 |
+| `--score_floor` | float | `0.3` | `score`：两者都低于此分时退回开口面 |
+| `--refine` / `--refine_min_share` | `masks` / `off`、float | `off` / `0.1` | 投票后按面读掩码，把单元里一整块被别的名字认领的区域切出来 |
+| `--export_from` | `source` / `remesh` | `source` | 部件从原模型切（原分辨率、原 UV，不烘）；`remesh` 从重建网格切再烘 |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part 重建 |
 | `--texture_size` | int | `2048` | 烘焙分辨率 |
 | `--no_texture` / `--no_reuse` | flag | 关 | 跳过烘焙 / 不复用缓存 |
@@ -444,8 +460,9 @@ curl -X POST http://127.0.0.1:6006/segment \
 | `GET` | `/jobs/{id}/download` | `parts.glb`（开放、已命名的部件） |
 | `GET` | `/jobs/{id}/atoms` | 投票前的过分割原子 |
 | `GET` | `/jobs/{id}/report` | 逐单元投票表（`merge=off` 时没有） |
-| `GET` | `/jobs/{id}/complete` | 烘过贴图的 X-Part 实体（`complete=full`） |
+| `GET` | `/jobs/{id}/complete` | 烘过贴图的封闭实体（`complete=full` / `hybrid`） |
 | `GET` | `/jobs/{id}/complete_raw` | 烘焙前的生成实体 |
+| `GET` | `/jobs/{id}/complete_decisions` | 每个实例的评分和最终选择（X-Part / HoloPart / 开口面） |
 | `GET` | `/jobs/{id}/guidance/{name}` | `work/guidance/` 里的审阅叠加图 |
 | `GET` | `/jobs/{id}/map`、`/render` | 仅旧路线 |
 
