@@ -516,7 +516,7 @@ curl -X POST http://127.0.0.1:6006/segment \
   -F "granularity=coarse" -F "complete=full"
 ```
 
-`POST /segment` runs `segment_parts.py`. Multipart field names match `PipelineOptions`;
+`POST /pipeline` is the one-shot entry: model + prompts in, a ticket back at once, the job queued; when done, `GET /jobs/{id}/result` is the finished model itself. `POST /segment` is the synchronous form. Both run `segment_parts.py`. Multipart field names match `PipelineOptions`;
 anything omitted takes the table above. `prompts` is one comma-separated sentence
 (a concept may contain spaces). Empty is allowed only with `merge=off`.
 `sam3_threshold` defaults to **0.4**. `POST /segment_legacy` is the old 2D-map route.

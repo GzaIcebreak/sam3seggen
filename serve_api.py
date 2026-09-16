@@ -1,6 +1,9 @@
 """HTTP wrapper around segment_parts.segment_parts: upload a model, get its parts back.
 
-    POST /segment            multipart upload + options -> manifest and download links
+    POST /pipeline           one shot: model + prompts -> 202 {job_id, result url}; the job
+                             is queued and runs split -> name -> repair -> texture
+    GET  /jobs/{id}/result   the finished model itself (closed, textured parts), 409 until done
+    POST /segment            the same pipeline, synchronous: manifest and download links
                              `prompts` is one comma-separated sentence, e.g. "head, torso"
     POST /segment_legacy     the deprecated 2D-map pipeline (segment_api.segment)
     GET  /jobs/{id}/download the result (one glb, or a zip in separate mode)
@@ -29,6 +32,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -68,6 +72,11 @@ JOB_ID = re.compile(r"\A[0-9a-f]{32}\Z")
 
 _gpu = threading.Lock()
 _current = {"job_id": None}
+# POST /pipeline hands its job to this queue; one worker drains it under the GPU lock, so
+# a second one-shot request waits its turn instead of getting the 409 /segment gives.
+_queue: "queue.Queue[tuple[str, str, dict]]" = queue.Queue()
+_pending: list[str] = []
+_pending_lock = threading.Lock()
 app = FastAPI(title="SegviGen part splitter", version="1", description=__doc__)
 
 # Newest matching file/dir wins. AutoDL may drop the POST before we can reply,
@@ -215,15 +224,23 @@ def _job_links(job_id: str, path: str) -> dict:
     }
 
 
+def _queue_position(job_id: str):
+    with _pending_lock:
+        return _pending.index(job_id) + 1 if job_id in _pending else None
+
+
 def _summarize_job(job_id: str, include_result=False) -> dict:
     path = os.path.join(JOBS_DIR, job_id)
     meta = _read_json(os.path.join(path, "job.json")) or {}
     stage = _infer_stage(path)
     running = _gpu.locked() and _current["job_id"] == job_id
+    position = _queue_position(job_id)
     if meta.get("state") == "error":
         state = "error"
     elif running:
         state = "running"
+    elif position is not None:
+        state = "queued"
     elif stage == "done" or os.path.isfile(os.path.join(path, "result.json")):
         state = "done"
     elif stage == "accepted" and not meta:
@@ -238,8 +255,11 @@ def _summarize_job(job_id: str, include_result=False) -> dict:
         "started": meta.get("started"),
         "finished": meta.get("finished"),
         "error": meta.get("error"),
+        "position": position,
         "mtime": os.path.getmtime(path),
         "links": _job_links(job_id, path),
+        "status_url": f"/jobs/{job_id}",
+        "result_url": f"/jobs/{job_id}/result",
     }
     if include_result:
         summary["result"] = _read_json(os.path.join(path, "result.json"))
@@ -256,6 +276,56 @@ def _record_job(job_id: str, filename: str) -> None:
     }
     _write_json(os.path.join(JOBS_DIR, job_id, "job.json"), payload)
     _write_json(os.path.join(JOBS_DIR, "current.json"), {"job_id": job_id})
+
+
+def _enqueue_job(upload: bytes, filename: str, options: dict) -> dict:
+    """Store the upload, mark the job queued, hand it to the worker; return the ticket."""
+    job_id = uuid.uuid4().hex
+    job = os.path.join(JOBS_DIR, job_id)
+    os.makedirs(job, exist_ok=True)
+    with open(os.path.join(job, "input" + (os.path.splitext(filename)[1] or ".glb")), "wb") as file:
+        file.write(upload)
+    _write_json(os.path.join(job, "job.json"), {
+        "job_id": job_id, "filename": filename, "queued": time.time(), "state": "queued",
+    })
+    with _pending_lock:
+        _pending.append(job_id)
+        position = len(_pending)
+    _queue.put((job_id, filename, options))
+    return {
+        "job_id": job_id, "state": "queued", "position": position,
+        "status_url": f"/jobs/{job_id}", "result_url": f"/jobs/{job_id}/result",
+    }
+
+
+def _worker() -> None:
+    """Drain the one-shot queue, one job at a time, under the same GPU lock /segment uses."""
+    while True:
+        job_id, filename, options = _queue.get()
+        job = os.path.join(JOBS_DIR, job_id)
+        source = os.path.join(job, "input" + (os.path.splitext(filename)[1] or ".glb"))
+        try:
+            with open(source, "rb") as file:
+                upload = file.read()
+        except OSError as exc:
+            _finish_job(job_id, error=f"upload lost before the job ran: {exc}")
+            with _pending_lock:
+                if job_id in _pending:
+                    _pending.remove(job_id)
+            continue
+        with _gpu:
+            with _pending_lock:
+                if job_id in _pending:
+                    _pending.remove(job_id)
+            try:
+                _run_job(job_id, upload, filename, options)
+            except Exception as exc:  # _run_job already recorded the error on the job
+                print(f"[pipeline] job {job_id} failed: {exc}")
+            finally:
+                _current["job_id"] = None
+
+
+threading.Thread(target=_worker, name="segvigen-pipeline-worker", daemon=True).start()
 
 
 def _finish_job(job_id: str, *, result=None, error=None) -> None:
@@ -395,6 +465,85 @@ def latest_job() -> dict:
 def job_status(job_id: str) -> dict:
     _job_dir(job_id)
     return _summarize_job(job_id, include_result=True)
+
+
+def _check_switches(mapping: dict) -> None:
+    """Reject an option outside its switch's range with the same 400 /segment gives."""
+    checks = (
+        ("granularity", tuple(GRANULARITY)), ("merge", MERGE_MODES_ALL),
+        ("complete", COMPLETE_MODES), ("condition", CONDITION_MODES),
+        ("holopart_large", HOLOPART_LARGE_MODES), ("refine", REFINE_MODES),
+        ("export_from", EXPORT_FROM_MODES), ("flat_paint", FLAT_PAINT_MODES),
+        ("mirror", MIRROR_MODES),
+    )
+    for key, allowed in checks:
+        value = mapping.get(key)
+        if value is not None and value not in allowed:
+            raise HTTPException(400, f"{key} must be one of {tuple(allowed)}")
+    if mapping.get("part_min_area_share") is not None:
+        try:
+            parse_part_floors(mapping["part_min_area_share"])
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+
+
+@app.post("/pipeline", status_code=202)
+async def pipeline(
+    glb: UploadFile = File(..., description="The model to split and repair."),
+    prompts: str = Form(
+        default="",
+        description="One comma-separated sentence of part names, e.g. 'armor, staff, "
+                    "base, body=head+hand'. Empty = 主体, 底座."),
+    unassigned_to: OptionalStr = Form(
+        _DEFAULTS.unassigned_to,
+        description="Part that absorbs faces no prompt claimed; must be one of the prompts."),
+    options: OptionalStr = Form(
+        None,
+        description="Optional JSON object of PipelineOptions overrides, same names as the "
+                    "/segment form fields, e.g. {\"merge_gap\": 0.01, \"complete\": \"off\"}. "
+                    "Anything omitted takes GET /health defaults."),
+) -> dict:
+    """One shot: upload a model and its part names, get a ticket back at once.
+
+    The job is queued and runs split -> name -> repair -> texture on the worker; poll
+    `status_url` until `state` is `done`, then download `result_url`, which is the
+    finished model itself. Unlike /segment this never blocks past the gateway's patience
+    and never answers 409: a second request waits in line.
+    """
+    overrides = {}
+    if options:
+        try:
+            overrides = json.loads(options)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, f"options must be a JSON object: {exc}")
+        if not isinstance(overrides, dict):
+            raise HTTPException(400, "options must be a JSON object")
+    _check_switches(overrides)
+    merged = {"unassigned_to": unassigned_to, **overrides}
+    try:
+        resolved = PipelineOptions.from_mapping(merged)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"bad option: {exc}")
+    return _enqueue_job(await glb.read(), glb.filename or "input.glb",
+                        {"prompts": prompts, **resolved.segment_kwargs()})
+
+
+@app.get("/jobs/{job_id}/result")
+def job_result(job_id: str):
+    """The finished model: closed, textured parts when repair ran, else the open parts."""
+    path = _job_dir(job_id)
+    summary = _summarize_job(job_id)
+    if summary["state"] in ("queued", "running"):
+        raise HTTPException(409, {"state": summary["state"], "stage": summary["stage"],
+                                  "position": summary["position"], "status_url": summary["status_url"]})
+    if summary["state"] == "error":
+        raise HTTPException(500, summary["error"] or "job failed")
+    for relative, name in ((("complete", "xpart_parts.glb"), "repaired_parts.glb"),
+                           (("parts.glb",), "parts.glb")):
+        candidate = os.path.join(path, *relative)
+        if os.path.isfile(candidate):
+            return FileResponse(candidate, media_type="model/gltf-binary", filename=name)
+    raise HTTPException(404, f"job {job_id} finished without a model")
 
 
 @app.post("/segment")

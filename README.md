@@ -445,7 +445,7 @@ curl -X POST http://127.0.0.1:6006/segment \
   -F "granularity=coarse" -F "complete=full"
 ```
 
-`POST /segment` 走 `segment_parts.py`。multipart 字段名与 `PipelineOptions` 一致，未传的用上表
+`POST /pipeline` 是一条龙入口：模型 + 提示词进，立刻返回票据，排队跑完后 `GET /jobs/{id}/result` 直接给最终模型；`POST /segment` 是同步版本。两者都走 `segment_parts.py`。multipart 字段名与 `PipelineOptions` 一致，未传的用上表
 默认值。`prompts` 是**一句逗号分隔**的部件名（概念里可以有空格）；`merge=off` 时可以为空。
 `sam3_threshold` 默认 **0.4**。`POST /segment_legacy` 是旧的 2D 引导路线。
 

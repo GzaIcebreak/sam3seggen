@@ -12,91 +12,104 @@
 | 本机访问 | `http://127.0.0.1:6006` |
 | AutoDL 外网 | `https://<实例>.westb.seetacloud.com:8443`（自定义服务映射到 6006） |
 | 交互式文档 | `/docs`（Swagger） |
-| 并发 | **一次一单**。GPU 被占用时新的 `POST /segment` 立刻返回 **409**，不排队 |
+| 并发 | GPU 一次只跑一单。`POST /pipeline` 排队（返回 `position`）；同步的 `POST /segment` 在忙时返回 **409** |
 | 单次耗时 | 拆分 3–5 分钟；加修复通常 5–20 分钟，取决于部件数和有多少实例需要 HoloPart 对比 |
 | 上传 | `glb` 必须是 multipart **文件**字段；建议 ≤ 30 万面。超过约 50 万面会把内存撑爆，请先减面 |
 | 输出 | GLB（部件各一个节点，贴图内嵌 PNG）+ JSON 清单 |
 
-**AutoDL 网关会掐掉长 POST。** 浏览器或 curl 经外网提交后常在几分钟后收到 404 / 连接断开，这不是任务失败——后台还在跑。此时**不要重提**（会 409），改用 `GET /jobs/latest` 找回 `job_id` 并轮询。本机 `127.0.0.1:6006` 直连不受影响。
+**AutoDL 网关会掐掉长 POST**，所以对外请用 `POST /pipeline`：它 0.1 秒就返回票据，之后只有短请求。同步的 `POST /segment` 经外网常在几分钟后收到 404 / 连接断开——那不是任务失败，后台还在跑，用 `GET /jobs/latest` 找回。
 
-## 2. 三条命令跑通
+## 2. 一条龙：三条命令跑通
+
+输入模型和部件名，拿回拆分并修复好的模型。`POST /pipeline` **立刻**返回票据（202），任务排队在后台跑；轮询 `status_url`，`done` 后下载 `result_url`——那就是最终模型本身，不是链接清单。
 
 ```sh
 HOST=http://127.0.0.1:6006
 
-# 1) 提交：只上传 glb，其余默认（主体 / 底座 两个部件，X-Part+HoloPart 评分修复，原贴图）
-curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee result.json
-
-# 2) 断了就找回
-curl -sS "$HOST/jobs/latest"
-
-# 3) 下载
-JOB=$(python -c "import json;print(json.load(open('result.json'))['job_id'])")
-curl -o parts.glb        "$HOST/jobs/$JOB/download"    # 开口部件（拆分结果）
-curl -o xpart_parts.glb  "$HOST/jobs/$JOB/complete"    # 封闭实体（修复结果，已带贴图）
-```
-
-写自己的部件名：
-
-```sh
-curl -sS -X POST "$HOST/segment" --max-time 3600 \
+# 1) 提交（0.1 s 返回；不写 prompts 就按 主体 / 底座 拆）
+curl -sS -X POST "$HOST/pipeline" \
   -F "glb=@monk.glb" \
   -F "prompts=armor, staff, base, body=head+face+hand+boot+leg" \
-  -F "unassigned_to=body"
+  -F "unassigned_to=body" | tee ticket.json
+# {"job_id":"23a1…","state":"queued","position":1,
+#  "status_url":"/jobs/23a1…","result_url":"/jobs/23a1…/result"}
+
+# 2) 轮询，直到 state 为 done（拆分 + 修复通常 10–20 分钟）
+JOB=$(python -c "import json;print(json.load(open('ticket.json'))['job_id'])")
+watch -n 20 "curl -sS $HOST/jobs/$JOB | python -c \"import json,sys;d=json.load(sys.stdin);print(d['state'],d['stage'])\""
+
+# 3) 下载最终模型：每个部件一个节点，封闭实体，贴图内嵌
+curl -o repaired_parts.glb "$HOST/jobs/$JOB/result"
+```
+
+要改开关就加一个 `options` 字段，内容是 JSON，键名和 `/segment` 的表单字段一样（第 5 节）：
+
+```sh
+-F 'options={"merge_gap": 0.01}'                     # 手被棍子切开的模型
+-F 'options={"complete": "off"}'                     # 只拆不修，result 就是开口部件
+-F 'options={"part_min_area_share": "装饰品=0.001", "fold_within_part": true}'   # 挂满小物件
 ```
 
 ## 3. 调用流程
 
 ```
-POST /segment ──成功──▶ 响应里有 job_id 和各下载链接
-      │
-      └─网关断开/超时──▶ GET /jobs/latest ──▶ state=running 就隔 15–30 s 再问
-                                              state=done    ──▶ 按 links 下载
-                                              state=error   ──▶ 看 error 字段
+POST /pipeline ──202──▶ {job_id, state: queued, position, status_url, result_url}
+                              │
+        GET status_url ◀──────┘  每 15–30 s 一次
+              │ state=queued   排队中，position 是前面还有几单（含自己）
+              │ state=running  stage 给进度：guidance → split → units → merge → complete → bake
+              │ state=done  ──▶ GET result_url  ──▶ 最终 GLB
+              └ state=error ──▶ error 字段是失败原因；中间产物仍在任务目录
 ```
 
-- 同一时刻只有一单在跑，所以 `/jobs/latest` 找回的就是你刚提交的那单；多人共用时用 `GET /jobs` 按 `filename` / `started` 认领。
-- `stage` 是按盘上产物推出来的进度：`accepted → guidance → split → units → merge → complete → bake → done`。`links.complete` 只在 `done` 之后出现。
-- 任务目录在 `SEGVIGEN_JOBS_DIR`（默认系统临时目录下的 `segvigen_jobs/`），产物不会自动清理。
+- 任务**排队不拒绝**：GPU 忙时第二单返回 `queued` 和 `position`，按提交顺序执行。（旧的同步接口 `POST /segment` 在忙时仍然 409。）
+- `GET result_url` 在 `queued` / `running` 时返回 **409**，`detail` 里带 `state` / `stage` / `position`，可以直接把它当轮询接口用；`error` 时返回 500。
+- 提交后连接就结束了，网关超时的问题不再存在。丢了 `job_id` 就 `GET /jobs` 按 `filename` / `queued` 时间找。
+- `stage` 是按盘上产物推出来的进度。`result` 在有修复时是 `complete/xpart_parts.glb`（封闭、已烘），`complete=off` 时是 `parts.glb`（开口）。
+- 任务目录在 `SEGVIGEN_JOBS_DIR`，产物不会自动清理。
 
 ### Python 示例
 
 ```python
-import time, requests
+import json, time, requests
 
 HOST = "http://127.0.0.1:6006"
 
-def submit(glb_path, **fields):
+def split_and_repair(glb_path, prompts="", unassigned_to=None, poll=20, **options):
+    """上传 -> 排队 -> 轮询 -> 返回最终 GLB 的字节。"""
+    data = {"prompts": prompts, "options": json.dumps(options)}
+    if unassigned_to:
+        data["unassigned_to"] = unassigned_to
     with open(glb_path, "rb") as f:
-        try:
-            r = requests.post(f"{HOST}/segment", files={"glb": f},
-                              data={k: str(v).lower() if isinstance(v, bool) else v
-                                    for k, v in fields.items()},
-                              timeout=3600)
-        except requests.RequestException:
-            return None                      # 网关掐了：去 /jobs/latest 找
-    if r.status_code == 409:
-        raise RuntimeError("GPU 被占用，稍后再提")
-    r.raise_for_status()
-    return r.json()
-
-def wait(job_id=None, poll=20):
+        ticket = requests.post(f"{HOST}/pipeline", files={"glb": f}, data=data, timeout=120)
+    ticket.raise_for_status()                      # 400 = 选项写错，看 detail
+    ticket = ticket.json()
     while True:
-        s = requests.get(f"{HOST}/jobs/{job_id}" if job_id else f"{HOST}/jobs/latest").json()
-        if s["state"] == "done":
-            return s
-        if s["state"] == "error":
-            raise RuntimeError(s["error"])
+        status = requests.get(HOST + ticket["status_url"], timeout=30).json()
+        if status["state"] == "done":
+            break
+        if status["state"] == "error":
+            raise RuntimeError(f"job {ticket['job_id']} failed: {status['error']}")
+        print(status["state"], status["stage"], status.get("position"))
         time.sleep(poll)
+    model = requests.get(HOST + ticket["result_url"], timeout=300)
+    model.raise_for_status()
+    return model.content, status
 
-result = submit("monk.glb", prompts="armor, staff, base, body=head+face+hand+boot+leg",
-                unassigned_to="body")
-job = wait(result["job_id"] if result else None)
-for key in ("download", "complete", "complete_decisions"):
-    href = job["links"].get(key)
-    if href:
-        data = requests.get(HOST + href).content
-        open(href.rsplit("/", 1)[-1] + (".glb" if key != "complete_decisions" else ".json"), "wb").write(data)
+glb, status = split_and_repair("monk.glb",
+                               prompts="armor, staff, base, body=head+face+hand+boot+leg",
+                               unassigned_to="body", merge_gap=0.01)
+open("repaired_parts.glb", "wb").write(glb)
+# 想看每个实例用了 X-Part 还是 HoloPart：
+decisions = requests.get(HOST + status["links"]["complete_decisions"]).json()
+```
+
+### 同步接口 `POST /segment`（保留）
+
+同一条管线，但请求会一直挂到跑完才返回 JSON（含 `parts` 清单和各下载链接），GPU 忙时 409。经 AutoDL 网关调用时长连接常被掐断，页面上显示 404 但任务仍在跑——此时用 `GET /jobs/latest` 找回。新接入请用 `/pipeline`。
+
+```sh
+curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee result.json
 ```
 
 ## 4. 端点参考
@@ -119,9 +132,24 @@ for key in ("download", "complete", "complete_decisions"):
 }
 ```
 
-### `POST /segment`
+### `POST /pipeline`（一条龙，推荐）
 
-`multipart/form-data`。字段见第 5 节；只有 `glb` 必填。成功返回 **200** 和结果对象（第 6.1 节）。
+`multipart/form-data`：`glb`（必填）、`prompts`、`unassigned_to`、`options`（JSON 对象，键为第 5 节任意字段）。立刻返回 **202**：
+
+```json
+{"job_id": "23a1…", "state": "queued", "position": 1,
+ "status_url": "/jobs/23a1…", "result_url": "/jobs/23a1…/result"}
+```
+
+选项写错返回 400，此时不会入队。
+
+### `GET /jobs/{job_id}/result`
+
+最终模型文件（`model/gltf-binary`）。有修复时是封闭、已烘贴图的部件（文件名 `repaired_parts.glb`），`complete=off` 时是开口部件（`parts.glb`）。任务未完成返回 **409**，`detail` = `{state, stage, position, status_url}`；任务失败返回 **500**。
+
+### `POST /segment`（同步）
+
+`multipart/form-data`。字段见第 5 节；只有 `glb` 必填。请求挂到跑完，成功返回 **200** 和结果对象（第 6.1 节）；GPU 忙时 409。
 
 ### `GET /jobs?limit=20`
 
@@ -142,6 +170,7 @@ for key in ("download", "complete", "complete_decisions"):
 
 | 方法 | 路径 | 内容 | 什么时候有 |
 |---|---|---|---|
+| `GET` | `/jobs/{id}/result` | **最终模型**：有修复时同 `/complete`，否则同 `/download`；未完成 409 | `done` |
 | `GET` | `/jobs/{id}/download` | `parts.glb`，开口部件，每个部件一个节点，节点名 `part_00_<名字>` | 命名阶段之后 |
 | `GET` | `/jobs/{id}/complete` | `complete/xpart_parts.glb`，修复后的封闭实体，已烘贴图，节点名与 `parts.glb` 对齐 | `complete≠off`，烘焙完成后 |
 | `GET` | `/jobs/{id}/complete_raw` | 烘焙前的生成几何（看形状不看贴图） | 同上，早一步 |
@@ -281,13 +310,15 @@ for key in ("download", "complete", "complete_decisions"):
 |---|---|---|
 | **400** | 枚举值不在范围内（`merge` / `complete` / `condition` / `holopart_large` / `refine` / `export_from` / `flat_paint` / `mirror` / `granularity`）、数字字段填了非数字、`part_min_area_share` 写法不对、`concept_bank` 与 `no_concept_bank` 同传 | 看 `detail`，对照 `/health` 的 `switches` |
 | **404** | `job_id` 不存在；或该任务没有请求的产物（`detail` 会说缺哪个文件） | 用 `/jobs` 核对；修复类产物要等 `stage=done` |
-| **409** | GPU 上已有任务在跑 | 等 `/health` 的 `busy` 变 `false` 再提；**不要**因为网关断开就重提 |
+| **409** | `POST /segment`：GPU 上已有任务在跑；`GET /jobs/{id}/result`：任务还没完成（`detail` 里有 `state` / `stage` / `position`） | 用 `/pipeline` 就不会因为忙而被拒；`/result` 的 409 当轮询继续等 |
 | **422** | `glb` 不是文件字段（当成文本提交了） | `curl -F "glb=@file.glb"`；Swagger 用 Choose File |
 | **500** | 某个阶段的子进程失败 | `detail` 是子进程的最后几行；任务目录里的中间产物会保留；`/jobs/{id}` 的 `error` 同样能看到 |
 
 管线内部在提示词没有任何掩码时默认**跳过该词继续**（`allow_partial=true`），不报错；输出里就少那个部件，`/report` 和 `guidance` 能看出来。
 
 ## 8. 常见场景
+
+下面的开关在 `/pipeline` 里都放进 `options` JSON；在 `/segment` 里是同名表单字段。
 
 | 场景 | 传什么 |
 |---|---|
