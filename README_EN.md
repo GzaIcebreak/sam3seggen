@@ -504,7 +504,7 @@ manifest = segment(
 
 ### `serve_api.py` — the same pipeline over HTTP
 
-One-shot split → X-Part repair → bake (Chinese): [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md).
+How to call it -- endpoints, flow, fields, errors, examples (Chinese): [docs/api_reference.md](docs/api_reference.md). Why each switch has its value and when to change it: [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md).
 
 ```sh
 ./run_serve.sh --port 6006          # AutoDL custom service; interactive docs at /docs

@@ -433,7 +433,7 @@ manifest = segment(
 
 ### `serve_api.py` —— HTTP 接口
 
-一条龙（拆分 → X-Part 修复 → 烘焙）的调用示例、开关说明、以及如何分辨输入有无贴图，见 [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md)。
+怎么调（地址、流程、每个端点的输入输出、错误码、示例代码）见 [docs/api_reference.md](docs/api_reference.md)；每个开关为什么是这个值、什么时候该改，见 [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md)。
 
 ```sh
 ./run_serve.sh --port 6006          # AutoDL 自定义服务；交互式文档在 /docs
