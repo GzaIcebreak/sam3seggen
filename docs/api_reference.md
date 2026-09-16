@@ -42,6 +42,13 @@ watch -n 20 "curl -sS $HOST/jobs/$JOB | python -c \"import json,sys;d=json.load(
 curl -o repaired_parts.glb "$HOST/jobs/$JOB/result"
 ```
 
+### 结果存在哪
+
+- `curl -o repaired_parts.glb …` 存到**运行命令时的当前目录**（`-o` 是相对路径；在服务器终端里就是那个终端的 `pwd`，在本机跑就是本机当前目录）。要放到固定位置写绝对路径：`curl -o /root/autodl-tmp/out/repaired_parts.glb …`。
+- 浏览器直接打开 `…/jobs/{id}/result`：响应头是 `Content-Disposition: attachment; filename="repaired_parts.glb"`，浏览器存进默认下载文件夹。`complete=off` 的任务文件名是 `parts.glb`。
+- 不下载也能用：文件一直在服务器的任务目录里（第 9 节），`$SEGVIGEN_JOBS_DIR/{job_id}/complete/xpart_parts.glb` 就是 `/result` 返回的那个文件；开口部件是同目录下的 `parts.glb`。`job_id` 在票据里，丢了就 `GET /jobs`。
+- 外网调用时地址换成 AutoDL 映射的 `https://<实例>.westb.seetacloud.com:8443`，路径不变。
+
 要改开关就加一个 `options` 字段，内容是 JSON，键名和 `/segment` 的表单字段一样（第 5 节）：
 
 ```sh
@@ -349,7 +356,7 @@ curl -sS http://127.0.0.1:6006/health | python -c "import json,sys;print(json.lo
 | `SEGVIGEN_XPART_ROOT` / `SEGVIGEN_HOLOPART_ROOT` 及 `_WEIGHTS` | 生成模型代码与权重位置 |
 | `SEGVIGEN_SAM3` / `SEGVIGEN_DINOV3` / `SEGVIGEN_CONCEPT_BANK` | SAM3 权重与概念库 |
 
-任务目录布局：
+任务目录布局（`/health` 的 `jobs_dir` 就是当前部署的 `$SEGVIGEN_JOBS_DIR`，本机部署是 `/root/autodl-tmp/christmas_tree_jobs`）：
 
 ```
 $SEGVIGEN_JOBS_DIR/{job_id}/
@@ -367,5 +374,7 @@ $SEGVIGEN_JOBS_DIR/{job_id}/
     xpart_instances.glb  holopart_instances.glb
     hybrid_instances.glb  decisions.json  # GET /complete_decisions
     xpart_parts_raw.glb                    # GET /complete_raw
-    xpart_parts.glb                        # GET /complete
+    xpart_parts.glb                        # GET /complete = GET /result（有修复时）
 ```
+
+产物不会自动清理；一单连中间产物约 100–300 MB，定期删旧的 `{job_id}/` 目录即可，服务不依赖它们。
