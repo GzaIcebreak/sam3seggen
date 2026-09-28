@@ -1,6 +1,6 @@
 # 接口调用说明（`serve_api.py`）
 
-上传一个 GLB，得到按语义拆开、可选修复成封闭实体、带贴图的部件 GLB。本文只讲**怎么调**：地址、流程、每个端点的输入输出、错误码、示例代码。每个开关为什么是这个值、什么时候该改，见 [api_split_complete_bake.md](api_split_complete_bake.md) 的「开关说明」和「推荐的一条龙取值」。
+上传一个 GLB，得到按语义拆开、可选修复成封闭实体、带贴图的部件 GLB。本文是全部端点的参考。只接一条龙 `POST /pipeline` 的话看更短的 [pipeline_api.md](pipeline_api.md)。这里讲**怎么调**：地址、流程、每个端点的输入输出、错误码、示例代码。每个开关为什么是这个值、什么时候该改，见 [api_split_complete_bake.md](api_split_complete_bake.md) 的「开关说明」和「推荐的一条龙取值」。
 
 三个入口读同一份契约 `pipeline.PipelineOptions`：HTTP 表单字段、Python 关键字参数、CLI 参数同名同义。改完代码要重启 `run_serve.sh`，否则 `/health` 还是旧进程。
 

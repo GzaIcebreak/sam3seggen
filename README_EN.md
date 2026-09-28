@@ -504,7 +504,7 @@ manifest = segment(
 
 ### `serve_api.py` — the same pipeline over HTTP
 
-How to call it -- endpoints, flow, fields, errors, examples (Chinese): [docs/api_reference.md](docs/api_reference.md). Why each switch has its value and when to change it: [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md).
+Just the one-shot endpoint (Chinese): [docs/pipeline_api.md](docs/pipeline_api.md). Every endpoint, fields, errors, examples: [docs/api_reference.md](docs/api_reference.md). Why each switch has its value and when to change it: [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md).
 
 ```sh
 ./run_serve.sh --port 6006          # AutoDL custom service; interactive docs at /docs

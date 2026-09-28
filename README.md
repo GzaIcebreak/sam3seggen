@@ -433,7 +433,7 @@ manifest = segment(
 
 ### `serve_api.py` —— HTTP 接口
 
-怎么调（地址、流程、每个端点的输入输出、错误码、示例代码）见 [docs/api_reference.md](docs/api_reference.md)；每个开关为什么是这个值、什么时候该改，见 [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md)。
+只想接一条龙接口：[docs/pipeline_api.md](docs/pipeline_api.md)（三步、字段、状态、错误、Python / JS 示例）。全部端点见 [docs/api_reference.md](docs/api_reference.md)；每个开关为什么是这个值、什么时候该改，见 [docs/api_split_complete_bake.md](docs/api_split_complete_bake.md)。
 
 ```sh
 ./run_serve.sh --port 6006          # AutoDL 自定义服务；交互式文档在 /docs
