@@ -58,16 +58,22 @@ def part_names(specs: Sequence[PartSpec]) -> list[str]:
 
 
 def resolve_unassigned_to(target: str | None, expected_names: Sequence[str]) -> str | None:
-    """Keep `target` only when it names a requested component.
+    """The part that absorbs faces no prompt claimed.
 
-    The default is `body`. Requests whose prompts do not include that name
-    (or a Swagger leftover like `string`) drop the catch-all instead of failing.
+    `target` is kept when it names a requested component. A name that is not among the
+    prompts -- the default `body` against Chinese prompts, or a typo -- falls back to the
+    first prompt rather than to nothing: on a grey model where SAM3 recognised neither
+    主体 nor 底座, "nothing" meant every face was dropped and the export was empty. An
+    explicit empty string (or a Swagger leftover like `string`) still means "drop them".
     """
     if not target or target == "string":
         return None
     if target not in expected_names:
-        print(f"[split] unassigned_to={target!r} is not in {list(expected_names)}; ignored")
-        return None
+        if not expected_names:
+            return None
+        print(f"[split] unassigned_to={target!r} is not in {list(expected_names)}; "
+              f"using {expected_names[0]!r} for the unclaimed faces")
+        return expected_names[0]
     return target
 
 

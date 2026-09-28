@@ -411,6 +411,11 @@ def merge_parts(
     with open(os.path.join(split_dir, "vote_report.json"), "w", encoding="utf-8") as handle:
         json.dump(rows, handle, ensure_ascii=False, indent=2)
 
+    if merge == "name" and not (np.asarray(labels) >= 0).any():
+        raise ValueError(
+            "no part received any faces: SAM3 recognised none of the prompts and nothing "
+            "absorbs the unclaimed faces. Try other words, pass unassigned_to, or "
+            "merge=off for the geometric units.")
     manifest = export_labelled(mesh_path, glb, labels_npy, names_json, out_glb,
                                with_texture, texture_size, export_from=export_from)
     if strict_parts and merge == "name":

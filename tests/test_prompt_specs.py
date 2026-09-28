@@ -71,11 +71,14 @@ class PromptSpecsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unassigned_to"):
             validate_target_name("body", ["roof", "opening", "wall"])
 
-    def test_default_body_is_kept_only_when_prompted(self):
+    def test_unassigned_to_falls_back_to_the_first_prompt_but_empty_means_drop(self):
         self.assertEqual(resolve_unassigned_to("body", ["head", "body", "leg"]), "body")
-        self.assertIsNone(resolve_unassigned_to("body", ["主体", "底座"]))
+        # the default `body` against the default Chinese prompts: unclaimed faces go to 主体
+        self.assertEqual(resolve_unassigned_to("body", ["主体", "底座"]), "主体")
+        self.assertEqual(resolve_unassigned_to("torsoo", ["head", "torso"]), "head")
         self.assertIsNone(resolve_unassigned_to("string", ["head", "tail", "legs"]))
         self.assertIsNone(resolve_unassigned_to("", ["head", "body"]))
+        self.assertIsNone(resolve_unassigned_to("body", []))
 
     def test_named_rows_must_match_dynamic_request_exactly(self):
         validate_named_rows(

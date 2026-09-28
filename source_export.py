@@ -109,6 +109,11 @@ def export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
     with open(names_json, "r", encoding="utf-8") as handle:
         names = json.load(handle)
     labels, fit = transfer_labels(remesh, remesh_labels, source, smooth_iterations)
+    if not (labels >= 0).any():
+        raise ValueError(
+            "no part received any faces: SAM3 recognised none of the prompts and nothing "
+            "absorbs the unclaimed faces. Try other words, pass unassigned_to, or "
+            "merge=off for the geometric units.")
     print(f"{step} cutting the source model ({len(source.faces)} faces) by labels carried "
           f"over from the remesh ({len(remesh.faces)} faces; frame {fit['frame']}, "
           f"scale {fit['scale']:.4f}, fit {fit['mean_distance']:.4f})")
