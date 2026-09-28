@@ -211,6 +211,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `allow_partial` | bool | `true` | 与上面相反的写法；两者同传时 `strict_parts` 优先 |
 | `reuse` | bool | `true` | 复用任务目录里已有的渲染和同提示词掩码（同一单内） |
 | `auto_prompts` | bool | `true` | 没传 `prompts` 时：SAM3 过一遍概念库 280 个词（8 视角，约 1 分钟），挑主体名 + 2–6 个互不重叠的部件名，再走正常投票。`merge=off` 时不提名 |
+| `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段把候选词和 4 张渲染图交给 Kimi（Moonshot API），由它判断物体类别、剔除不属于该物体的词、给出主体名和部件名；只保留概念库里有的词。需要服务器上有 `MOONSHOT_API_KEY`（环境变量或仓库根目录 `.env`），没有则 400。每单多约 1 分钟 |
 
 ### 5.2 拆分（几何边界）
 
@@ -330,7 +331,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 
 | 场景 | 传什么 |
 |---|---|
-| 不知道怎么填 | 只传 `glb`。部件名自动从概念库提出（如 `head, leg, body`），默认评分修复 |
+| 不知道怎么填 | 只传 `glb`。部件名自动从概念库提出（如 `head, leg, body`），默认评分修复；加 `mode=smart` 让 Kimi 复核命名（更准，多 1 分钟） |
 | 人形 / 道具，想按语义拆 | `prompts=armor, staff, base, body=head+face+hand+boot+leg`，`unassigned_to=body` |
 | 手握着棍子、被切成两半 | 上一行再加 `merge_gap=0.01` |
 | 主体上挂满小物件（圣诞树） | `prompts=装饰品=bauble+star+bow+pinecone, 树=christmas tree`，`unassigned_to=树`，`part_min_area_share=装饰品=0.001`，`fold_within_part=true`；`merge_gap` 保持 `0` |
@@ -356,6 +357,7 @@ curl -sS http://127.0.0.1:6006/health | python -c "import json,sys;print(json.lo
 | `SEGVIGEN_PY_SAM3` / `SEGVIGEN_PY_XPART` / `SEGVIGEN_PY_HOLOPART` | 三个子环境的 Python |
 | `SEGVIGEN_XPART_ROOT` / `SEGVIGEN_HOLOPART_ROOT` 及 `_WEIGHTS` | 生成模型代码与权重位置 |
 | `SEGVIGEN_SAM3` / `SEGVIGEN_DINOV3` / `SEGVIGEN_CONCEPT_BANK` | SAM3 权重与概念库 |
+| `MOONSHOT_API_KEY`（也可放仓库根目录 `.env`，已 gitignore）、`SEGVIGEN_VLM_BASE_URL`、`SEGVIGEN_VLM_MODEL` | 智能分割模式用的 Kimi；不设模型名时自动选该 key 可用的、支持图片的非 code 模型（当前 `kimi-k3`） |
 
 任务目录布局（`/health` 的 `jobs_dir` 就是当前部署的 `$SEGVIGEN_JOBS_DIR`，本机部署是 `/root/autodl-tmp/christmas_tree_jobs`）：
 

@@ -43,6 +43,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 | `glb` | 是 | 模型文件。单网格、单材质的 GLB 效果最好（部件直接保留原 UV / 贴图）；多网格或多材质会自动退回「重建网格 + 烘焙」。建议 ≤ 30 万面，超过约 50 万面请先减面 |
 | `prompts` | 否 | 部件名，**一句逗号分隔**：`armor, staff, base, body`。**不传则自动提名**：SAM3 过一遍概念库的 280 个词，挑出主体名和 2–6 个部件名（小狗 → `head, leg, body`；椅子 → `backrest, chair leg, seat cushion, body`），结果写在任务目录 `work/auto_prompts.json`。想回到 `主体, 底座` 传 `{"auto_prompts": false}`。名字里可以有空格；`名=概念+概念` 把多个概念收成一个部件：`body=head+face+hand+boot+leg` 输出一个叫 `body` 的部件。输出部件数 = 名字数 |
 | `unassigned_to` | 否 | 没有任何提示词认领的面并进这个部件。**必须是 `prompts` 里的名字**，否则被忽略、这些面从输出丢掉。默认 `body`；用中文名时要显式传，如 `unassigned_to=主体`。一般给最大的那个部件 |
+| `mode` | 否 | `auto`（默认）或 `smart`。**`smart` = 智能分割模式**：不传 `prompts` 时，把概念库的候选词和 4 张渲染图交给 Kimi，由它判断物体是什么、给出主体名和部件名（跑车 → `hood, door, wheel, bumper, window, windshield`；长剑 → `blade` + `handle`）。服务器上要配 `MOONSHOT_API_KEY`，否则提交时 400 |
 | `options` | 否 | JSON 对象，任何其他开关都放这里，键名见第 5 节：`{"merge_gap": 0.01}` |
 
 提示词用 SAM3 认得的**常见英文名词**：`head`、`torso`、`arm`、`leg`、`wheel`、`window`、`leaves`、`fruit`、`base`。它认不出方位和序数（`left arm`、`upper blade`、`middle fruit`）——这类需求目前做不到，见第 7 节。
@@ -129,6 +130,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 | `texture_size` | `2048` | 修复实体的烘焙贴图边长（小件；大件自动加倍） |
 
 ```sh
+-F "mode=smart"                                       # 智能分割模式：不给提示词，Kimi 命名
 -F 'options={"merge_gap": 0.01}'
 -F 'options={"complete": "off", "merge": "off"}'
 -F 'options={"part_min_area_share": "装饰品=0.001", "fold_within_part": true}'
@@ -138,7 +140,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 
 | 码 | 在哪一步 | 原因 | 处理 |
 |---|---|---|---|
-| 400 | 提交 | `options` 不是 JSON 对象；某个开关值不在范围内；`part_min_area_share` 写法不对 | 看 `detail`；对照 `GET /health` 的 `switches` |
+| 400 | 提交 | `options` 不是 JSON 对象；某个开关值不在范围内；`part_min_area_share` 写法不对；`mode=smart` 但服务器没配 Kimi 的 key | 看 `detail`；对照 `GET /health` 的 `switches` |
 | 422 | 提交 | `glb` 当成文本字段传了 | `curl -F "glb=@file.glb"`（带 `@`）；Swagger 用 Choose File |
 | 404 | 轮询 / 下载 | `job_id` 不存在 | `GET /jobs` 列出最近任务找回 |
 | 409 | 下载 | 任务还没完成 | `detail.state` 就是当前状态，继续等 |
@@ -156,7 +158,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 - **方位 / 序数**：`left arm` / `right arm`、`upper blade`、`front left wheel`、`fruit 上中下三段`。SAM3 只认概念，左右手在它看来是同一个东西。会在几何层面另做（对称面、主轴等分），提示词里写了也没用。
 - **同名多实例分开编号**：四个车轮都叫 `wheel`，现在出一个 `wheel` 节点。
 - **细长薄件**：剑刃、横撑、螺旋桨这类渲染只有几像素宽的东西，掩码经常拿不到。
-- **无提示词时的命名不总是对**：自动提名在 10 个测试模型上 7 个合理；形状像别的东西时会错（跑车被提出 `wing`，机甲被提出 `engine`），细长薄件（长剑）几乎提不出词。提名结果在 `work/auto_prompts.json`，不满意就把里面的词改好后作为 `prompts` 再提一单。
+- **无提示词时的命名不总是对**：`mode=auto` 的规则提名在 10 个测试模型上 7 个合理，形状像别的东西时会错（跑车被提出 `wing`）；**`mode=smart` 让 Kimi 看图复核**，跑车变成 `hood, door, wheel, bumper, window, windshield`，长剑变成 `blade` + `handle`，每单多花约 1 分钟。词表仍限于概念库的 280 个词（剑的 `guard`、`pommel` 不在里面，会被丢掉）。提名结果和 Kimi 的原话都在 `work/auto_prompts.json`，不满意就把词改好后作为 `prompts` 再提一单。
 
 ## 8. 客户端示例
 

@@ -338,6 +338,7 @@ for mesh in meshes:
 | 命名 | `prompts` | 空 → 自动提名（`auto_prompts=true`） | 不写提示词时 SAM3 过一遍概念库 280 个词，挑主体名 + 2–6 个部件名（小狗 `head, leg, body`，椅子 `backrest, chair leg, seat cushion`）。`auto_prompts=false` 回到 `主体, 底座` |
 | 命名 | `merge` | `name` | 每个提示词一个节点，同名件焊在一起，输出部件数和提示词数一致 |
 | 命名 | `unassigned_to` | `body` | 没有掩码认领的单元并进这个名字。**必须是提示词里的名字**，否则被忽略、无票面从输出丢掉（日志 `unassigned_to=... ignored`）；用中文或别的主体名时要显式传，如 `unassigned_to=主体` |
+| 命名 | `mode` | `auto` | `smart`（智能分割模式）让 Kimi 看图复核自动提名：形状词误认（跑车的 `wing`）靠它剔除。多 1 分钟、需要 key；有 key 就建议开 |
 | 命名 | `refine` | `off` | 按面切分单元只在"几何没分开、掩码分得开"时有用；猴子的手背在掩码里也是护腕，它帮不上，还会挪错小块 |
 | 拆分 | `granularity` | `medium`（300 / 600 面） | 小件（螺栓、按钮）才降到 `fine`，大件被切成面板才升 `coarse` |
 | 拆分 | `samples` / `mirror` | `7` / `auto` | 多采样买到的是少靠运气；对称求交免费 |
