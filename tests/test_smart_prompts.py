@@ -34,6 +34,12 @@ class ParseReplyTest(unittest.TestCase):
         out = parse_reply(reply, self.allowed)
         self.assertEqual(out["parts"], ["wheel", "door"])
 
+    def test_generic_shape_words_are_dropped_from_the_picks(self):
+        out = parse_reply('{"main": "frame", "parts": ["shelf", "plank", "panel"]}',
+                          ["frame", "shelf", "plank", "panel"], generic={"plank", "panel"})
+        self.assertEqual(out["parts"], ["shelf"])
+        self.assertEqual(out["dropped"], ["plank", "panel"])
+
     def test_no_json_is_an_error(self):
         with self.assertRaises(ValueError):
             parse_reply("I think it is a car.", self.allowed)

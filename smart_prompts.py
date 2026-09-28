@@ -15,8 +15,11 @@ gitignored repo .env):
     SEGVIGEN_VLM_API_KEY    the key (MOONSHOT_API_KEY is still read as a fallback)
     SEGVIGEN_VLM_BASE_URL   e.g. https://dashscope.aliyuncs.com/compatible-mode/v1 (Qwen)
                             or https://api.moonshot.cn/v1 (Kimi, the default)
-    SEGVIGEN_VLM_MODEL      e.g. qwen3-vl-plus; on Moonshot it may be left unset and a
+    SEGVIGEN_VLM_MODEL      e.g. qwen3.8-max; on Moonshot it may be left unset and a
                             vision-capable model the key can use is picked from /models
+    SEGVIGEN_VLM_THINKING   off | on: Qwen (DashScope) thinks for ~100 s and 5k tokens on
+                            this prompt unless told not to; off sends enable_thinking=false
+                            (default off on DashScope, ignored elsewhere)
 
 No key -> the request is refused up front (serve_api), never silently degraded.
 """
@@ -30,6 +33,7 @@ import re
 import urllib.request
 
 from data_toolkit.front_view import _env_or_dotenv, build_grid
+from auto_prompts import GENERIC_WORDS
 
 DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
 KEY_VARS = ("SEGVIGEN_VLM_API_KEY", "MOONSHOT_API_KEY")
@@ -58,6 +62,13 @@ def vlm_config():
     """(base_url, model or None) as configured; what /health reports for mode=smart."""
     base_url = (_env_or_dotenv("SEGVIGEN_VLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
     return base_url, _env_or_dotenv("SEGVIGEN_VLM_MODEL") or None
+
+
+def provider_params(base_url):
+    """Request fields a provider needs beyond the OpenAI shape."""
+    if "dashscope" in base_url and (_env_or_dotenv("SEGVIGEN_VLM_THINKING") or "off").lower() != "on":
+        return {"enable_thinking": False}
+    return {}
 
 
 def resolve_model(api_key, base_url, timeout=30):
@@ -129,8 +140,13 @@ def _last_json_object(text):
             return None
 
 
-def parse_reply(text, allowed):
-    """{"object","main","parts","dropped"} from Kimi's reply, keeping only allowed words."""
+def parse_reply(text, allowed, generic=()):
+    """{"object","main","parts","dropped"} from the VLM reply.
+
+    Keeps only `allowed` (bank) words, and drops `generic` shape words (plank, panel,
+    column, ...) that a model reaches for on furniture; the rule-based path never
+    offers them either.
+    """
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
     data = _last_json_object(text)
@@ -144,7 +160,7 @@ def parse_reply(text, allowed):
         if not word or word in seen:
             continue
         seen.add(word)
-        (parts if word in allowed else dropped).append(word)
+        (parts if word in allowed and word not in generic else dropped).append(word)
     main = clean(data.get("main") or "")
     if main and main not in allowed:
         dropped.append(main)
@@ -183,7 +199,7 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
     last_error = None
     for budget in TOKEN_BUDGETS:
         payload = {
-            "model": model, "max_tokens": budget,
+            "model": model, "max_tokens": budget, **provider_params(base_url),
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": data_url}},
                 {"type": "text", "text": build_question(candidates)},
@@ -202,7 +218,7 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
             last_error = RuntimeError(f"VLM reply cut off at {budget} tokens before the answer")
             continue
         try:
-            result = parse_reply(reply, allowed_words)
+            result = parse_reply(reply, allowed_words, GENERIC_WORDS)
         except ValueError as error:
             last_error = error
             continue
