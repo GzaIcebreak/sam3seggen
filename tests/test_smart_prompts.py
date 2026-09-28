@@ -28,6 +28,12 @@ class ParseReplyTest(unittest.TestCase):
         out = parse_reply('{"main": "body", "parts": ["body", "wheel"]}', self.allowed)
         self.assertEqual(out["parts"], ["wheel"])
 
+    def test_reasoning_text_with_stray_braces_before_the_answer_is_fine(self):
+        reply = ("We need {parts} for this. The shares {12%} suggest wheels matter. "
+                 "Final: {\"object\": \"car\", \"main\": \"body\", \"parts\": [\"wheel\", \"door\"]} done")
+        out = parse_reply(reply, self.allowed)
+        self.assertEqual(out["parts"], ["wheel", "door"])
+
     def test_no_json_is_an_error(self):
         with self.assertRaises(ValueError):
             parse_reply("I think it is a car.", self.allowed)
