@@ -41,7 +41,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `glb` | 是 | 模型文件。单网格、单材质的 GLB 效果最好（部件直接保留原 UV / 贴图）；多网格或多材质会自动退回「重建网格 + 烘焙」。建议 ≤ 30 万面，超过约 50 万面请先减面 |
-| `prompts` | 否 | 部件名，**一句逗号分隔**：`armor, staff, base, body`。不传 = `主体, 底座`。名字里可以有空格；`名=概念+概念` 把多个概念收成一个部件：`body=head+face+hand+boot+leg` 输出一个叫 `body` 的部件。输出部件数 = 名字数 |
+| `prompts` | 否 | 部件名，**一句逗号分隔**：`armor, staff, base, body`。**不传则自动提名**：SAM3 过一遍概念库的 280 个词，挑出主体名和 2–6 个部件名（小狗 → `head, leg, body`；椅子 → `backrest, chair leg, seat cushion, body`），结果写在任务目录 `work/auto_prompts.json`。想回到 `主体, 底座` 传 `{"auto_prompts": false}`。名字里可以有空格；`名=概念+概念` 把多个概念收成一个部件：`body=head+face+hand+boot+leg` 输出一个叫 `body` 的部件。输出部件数 = 名字数 |
 | `unassigned_to` | 否 | 没有任何提示词认领的面并进这个部件。**必须是 `prompts` 里的名字**，否则被忽略、这些面从输出丢掉。默认 `body`；用中文名时要显式传，如 `unassigned_to=主体`。一般给最大的那个部件 |
 | `options` | 否 | JSON 对象，任何其他开关都放这里，键名见第 5 节：`{"merge_gap": 0.01}` |
 
@@ -115,6 +115,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 
 | 键 | 默认 | 什么时候改 |
 |---|---|---|
+| `auto_prompts` | `true` | `false`：不传 `prompts` 时不自动提名，直接叫 `主体, 底座` |
 | `complete` | `"hybrid"` | `"off"` 只拆不修；`"full"` 只用 X-Part 不比对 |
 | `merge_gap` | `0` | 小件被别的部件穿过、切成几段（握着棍子的手）：`0.01` |
 | `part_min_area_share` | 无 | 主体上挂满小物件（圣诞树上的球）：`"装饰品=0.001"`，否则小物件全被并进主体 |
@@ -155,7 +156,7 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 - **方位 / 序数**：`left arm` / `right arm`、`upper blade`、`front left wheel`、`fruit 上中下三段`。SAM3 只认概念，左右手在它看来是同一个东西。会在几何层面另做（对称面、主轴等分），提示词里写了也没用。
 - **同名多实例分开编号**：四个车轮都叫 `wheel`，现在出一个 `wheel` 节点。
 - **细长薄件**：剑刃、横撑、螺旋桨这类渲染只有几像素宽的东西，掩码经常拿不到。
-- **无提示词的语义拆分**：不传 `prompts` 只会得到 `主体, 底座`；要拆细用 `{"merge": "off"}` 拿几何单元。
+- **无提示词时的命名不总是对**：自动提名在 10 个测试模型上 7 个合理；形状像别的东西时会错（跑车被提出 `wing`，机甲被提出 `engine`），细长薄件（长剑）几乎提不出词。提名结果在 `work/auto_prompts.json`，不满意就把里面的词改好后作为 `prompts` 再提一单。
 
 ## 8. 客户端示例
 

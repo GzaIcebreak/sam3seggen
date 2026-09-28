@@ -203,13 +203,14 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `glb` | 文件 | **必填** | 源模型。单网格单材质时部件保留原 UV / 贴图；多网格或多材质会自动退回「重建网格 + 烘焙」 |
-| `prompts` | 文本 | 空 → `主体, 底座` | 一句逗号分隔的部件名（中文逗号、顿号也行）。`名=概念+概念` 把多个概念收成一个部件，如 `body=head+face+hand+boot+leg`。输出部件数 = 名字数 |
+| `prompts` | 文本 | 空 → 自动提名 | 一句逗号分隔的部件名（中文逗号、顿号也行）。不传时由 `auto_prompts` 从概念库自动提出主体名和 2–6 个部件名（见 `work/auto_prompts.json`）；`auto_prompts=false` 时回到 `主体, 底座`。`名=概念+概念` 把多个概念收成一个部件，如 `body=head+face+hand+boot+leg`。输出部件数 = 名字数 |
 | `unassigned_to` | 文本 | `body` | 没有掩码认领的单元并进这个部件。**必须是 `prompts` 里的名字**，否则被忽略、这些面从输出丢掉。用中文提示词时要显式传，如 `主体` |
 | `merge` | `name` / `unit` / `fragments` / `off` | `name` | `name` 每个名字一个节点；`unit` 每个投票单元一个节点（排查取错名）；`fragments` 按几何留碎块只折回碎屑；`off` 不命名，按几何单元出匿名件 |
 | `fragment_share` | float | `0.01` | 仅 `merge=fragments`：低于表面这么多的单元算碎屑 |
 | `strict_parts` | bool | `false` | 某个名字完全没有掩码或没有面时整单失败；默认跳过该词继续 |
 | `allow_partial` | bool | `true` | 与上面相反的写法；两者同传时 `strict_parts` 优先 |
 | `reuse` | bool | `true` | 复用任务目录里已有的渲染和同提示词掩码（同一单内） |
+| `auto_prompts` | bool | `true` | 没传 `prompts` 时：SAM3 过一遍概念库 280 个词（8 视角，约 1 分钟），挑主体名 + 2–6 个互不重叠的部件名，再走正常投票。`merge=off` 时不提名 |
 
 ### 5.2 拆分（几何边界）
 
@@ -329,12 +330,12 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 
 | 场景 | 传什么 |
 |---|---|
-| 不知道怎么填 | 只传 `glb`。得到 `主体`、`底座`，默认评分修复 |
+| 不知道怎么填 | 只传 `glb`。部件名自动从概念库提出（如 `head, leg, body`），默认评分修复 |
 | 人形 / 道具，想按语义拆 | `prompts=armor, staff, base, body=head+face+hand+boot+leg`，`unassigned_to=body` |
 | 手握着棍子、被切成两半 | 上一行再加 `merge_gap=0.01` |
 | 主体上挂满小物件（圣诞树） | `prompts=装饰品=bauble+star+bow+pinecone, 树=christmas tree`，`unassigned_to=树`，`part_min_area_share=装饰品=0.001`，`fold_within_part=true`；`merge_gap` 保持 `0` |
 | 只要拆分，不要修复 | `complete=off` |
-| 只看几何单元，不命名 | `merge=off`（可以不传 `prompts`） |
+| 只看几何单元，不命名 | `merge=off`（可以不传 `prompts`；此时不自动提名） |
 | 白模 / 灰模 | 默认 `flat_paint=auto` 会平涂；还不行传 `flat_paint=on` |
 | 修复太慢 | `score_candidate_small=0.5` 或 `holopart_large=escape` |
 | 模型 > 50 万面 | 先减面到 30 万左右再上传 |

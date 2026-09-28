@@ -335,7 +335,7 @@ for mesh in meshes:
 
 | 阶段 | 开关 | 默认 | 为什么 |
 |---|---|---|---|
-| 命名 | `prompts` | 空 → `主体, 底座` | 语言只取名，边界来自几何；两个词能覆盖大多数带底座的单体模型 |
+| 命名 | `prompts` | 空 → 自动提名（`auto_prompts=true`） | 不写提示词时 SAM3 过一遍概念库 280 个词，挑主体名 + 2–6 个部件名（小狗 `head, leg, body`，椅子 `backrest, chair leg, seat cushion`）。`auto_prompts=false` 回到 `主体, 底座` |
 | 命名 | `merge` | `name` | 每个提示词一个节点，同名件焊在一起，输出部件数和提示词数一致 |
 | 命名 | `unassigned_to` | `body` | 没有掩码认领的单元并进这个名字。**必须是提示词里的名字**，否则被忽略、无票面从输出丢掉（日志 `unassigned_to=... ignored`）；用中文或别的主体名时要显式传，如 `unassigned_to=主体` |
 | 命名 | `refine` | `off` | 按面切分单元只在"几何没分开、掩码分得开"时有用；猴子的手背在掩码里也是护腕，它帮不上，还会挪错小块 |
@@ -371,11 +371,12 @@ for mesh in meshes:
 
 ### 三组写法
 
-只上传 glb（主体 / 底座 + 评分修复）：
+只上传 glb（自动提名 + 评分修复）：
 
 ```
-# 实际生效：prompts=主体, 底座，merge=name，granularity=medium，complete=hybrid，
-#           holopart_large=score，export_from=source
+# 实际生效：prompts=概念库自动提出（work/auto_prompts.json 里能看到），merge=name，
+#           granularity=medium，complete=hybrid，holopart_large=score，export_from=source
+# 不想自动提名：options={"auto_prompts": false} -> 主体, 底座
 ```
 
 有名字的人形 / 道具（猴子这类）：

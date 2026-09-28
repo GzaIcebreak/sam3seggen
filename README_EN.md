@@ -11,6 +11,12 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 
 ## 📣 What's new
 
+- **Parts get named without prompts** (`auto_prompts`, default on): SAM3 is asked for all 280
+  bank concepts at once and a main-body word plus 2-6 disjoint part words are picked before
+  the vote. The old test's no-prompt column scored 0 on eight of ten models; the dog now
+  comes back as head / leg / body, the chair as backrest / chair leg / seat cushion. Shape
+  words on the wrong object (a car's "wing") and thin parts (a sword) remain weak.
+
 - **Parts are cut from the source model** (`--export_from source`, default): the vote still
   runs on the remesh, but the labels are carried over to the source's own faces and the
   parts are cut from it with their UVs and texture, no bake. The monk's hands went from
