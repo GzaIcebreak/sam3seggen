@@ -132,9 +132,16 @@ def parse_reply(text, allowed):
             "parts": parts, "dropped": dropped}
 
 
+TOKEN_BUDGETS = (8000, 16000)   # kimi-k3 reasons for ~2-3k tokens before the answer; retry once if cut
+
+
 def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=None,
-                model=None, timeout=180):
-    """Ask Kimi for object / main / parts. Raises on a missing key or an unusable reply."""
+                model=None, timeout=300):
+    """Ask Kimi for object / main / parts. Raises on a missing key or an unusable reply.
+
+    The reasoning models answer after thinking out loud; a reply cut off by max_tokens
+    (finish_reason "length", empty content) is retried once with double the budget.
+    """
     api_key = api_key or _env_or_dotenv("MOONSHOT_API_KEY")
     if not api_key:
         raise RuntimeError("智能分割模式 (mode=smart) needs MOONSHOT_API_KEY (env var or the repo .env file)")
@@ -146,22 +153,34 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
     data_url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
     # These models reject any temperature but 1, and a reasoning model spends tokens before
     # the answer: leave temperature alone and give it room.
-    payload = {
-        "model": model, "max_tokens": 1500,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": data_url}},
-            {"type": "text", "text": build_question(candidates)},
-        ]}],
-    }
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions", data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = json.load(response)
-    message = body["choices"][0]["message"]
-    reply = message.get("content") or message.get("reasoning_content") or ""
-    result = parse_reply(reply, allowed_words)
-    result["model"] = model
-    result["raw"] = reply
-    return result
+    last_error = None
+    for budget in TOKEN_BUDGETS:
+        payload = {
+            "model": model, "max_tokens": budget,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": build_question(candidates)},
+            ]}],
+        }
+        request = urllib.request.Request(
+            f"{base_url}/chat/completions", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.load(response)
+        choice = body["choices"][0]
+        message = choice["message"]
+        reply = message.get("content") or ""
+        if choice.get("finish_reason") == "length" or not reply.strip():
+            last_error = RuntimeError(f"VLM reply cut off at {budget} tokens before the answer")
+            continue
+        try:
+            result = parse_reply(reply, allowed_words)
+        except ValueError as error:
+            last_error = error
+            continue
+        result["model"] = model
+        result["raw"] = reply
+        result["tokens"] = body.get("usage", {}).get("completion_tokens")
+        return result
+    raise last_error

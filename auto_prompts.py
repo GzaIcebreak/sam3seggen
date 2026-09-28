@@ -171,17 +171,22 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
             views = json.load(handle)["views"]
         images = [os.path.join(prompt_dir, view["image"]) for view in views][::2][:4]
         print(f"[smart] asking Kimi to review {len(proposal['candidates'])} candidate words ...")
-        chosen = kimi_select(images, proposal["candidates"], concepts)
         proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
-        proposal["kimi"] = chosen
-        print(f"[smart] Kimi: object={chosen['object']!r} main={chosen['main']!r} "
-              f"parts={chosen['parts']}" + (f" (dropped, not in bank: {chosen['dropped']})"
-                                            if chosen["dropped"] else ""))
-        if len(chosen["parts"]) >= 2:
-            proposal["parts"] = chosen["parts"][:max_parts]
-            proposal["main"] = chosen["main"] or proposal["main"]
+        try:
+            chosen = kimi_select(images, proposal["candidates"], concepts)
+        except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
+            proposal["kimi_error"] = f"{type(error).__name__}: {error}"
+            print(f"[smart] Kimi failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
         else:
-            print("[smart] Kimi returned fewer than two usable parts; keeping the rule-based pick")
+            proposal["kimi"] = chosen
+            print(f"[smart] Kimi: object={chosen['object']!r} main={chosen['main']!r} "
+                  f"parts={chosen['parts']}" + (f" (dropped, not in bank: {chosen['dropped']})"
+                                                if chosen["dropped"] else ""))
+            if len(chosen["parts"]) >= 2:
+                proposal["parts"] = chosen["parts"][:max_parts]
+                proposal["main"] = chosen["main"] or proposal["main"]
+            else:
+                print("[smart] Kimi returned fewer than two usable parts; keeping the rule-based pick")
     prompts = list(proposal["parts"])
     main = proposal["main"]
     if main and main not in prompts:
