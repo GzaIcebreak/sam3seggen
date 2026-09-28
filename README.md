@@ -11,8 +11,9 @@ mesh，带真实贴图。
 
 ## 📣 近期更新
 
-- **智能分割模式**（`mode=smart`）：不写提示词时由 Kimi 看渲染图复核概念库的候选词并命名——跑车从 `wing` 变成
-  `hood, door, wheel, bumper, window, windshield`，长剑变成 `blade + handle`。需要 `MOONSHOT_API_KEY`。
+- **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）看渲染图
+  复核概念库的候选词并命名——跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
+  需要 `SEGVIGEN_VLM_API_KEY`。
 - **不写提示词也能命名**（`auto_prompts`，默认开）：SAM3 一次过概念库的 280 个词，选出主体名和 2–6 个
   互不重叠的部件名再投票。旧测试里"无需求"一列 10 个模型 8 个 0 分；现在小狗自动得到 head / leg / body，
   椅子 backrest / chair leg / seat cushion。形状词误认（跑车→wing）和薄件（长剑）仍是短板。

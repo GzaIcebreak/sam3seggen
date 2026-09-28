@@ -11,9 +11,10 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 
 ## 📣 What's new
 
-- **Smart split mode** (`mode=smart`): with no prompts, Kimi looks at the renders and reviews the
-  bank's candidate words -- the car goes from `wing` to `hood, door, wheel, bumper, window,
-  windshield`, the sword to `blade + handle`. Needs `MOONSHOT_API_KEY`.
+- **Smart split mode** (`mode=smart`): with no prompts, a vision model (Qwen `qwen3.8-max` as
+  deployed; Kimi works too) looks at the renders and reviews the bank's candidate words -- the car
+  goes from `wing` to `hood, door, wheel, window, bumper`, the sword to `blade + handle`. Needs
+  `SEGVIGEN_VLM_API_KEY`.
 - **Parts get named without prompts** (`auto_prompts`, default on): SAM3 is asked for all 280
   bank concepts at once and a main-body word plus 2-6 disjoint part words are picked before
   the vote. The old test's no-prompt column scored 0 on eight of ten models; the dog now
