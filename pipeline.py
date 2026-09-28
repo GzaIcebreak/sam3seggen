@@ -72,6 +72,8 @@ REFINE_MODES = ("masks", "off")
 DEFAULT_REFINE_MIN_SHARE = 0.10
 DEFAULT_EXPORT_FROM = "source"     # cut parts from the source model (full resolution, no bake)
 DEFAULT_AUTO_PROMPTS = True        # no prompts: propose part names from the concept bank
+DEFAULT_MODE = "auto"              # auto: rule-based pick; smart (智能分割): Kimi reviews the candidates
+MODES = ("auto", "smart")
 EXPORT_FROM_MODES = ("source", "remesh")
 DEFAULT_OCTREE_RESOLUTION = 512
 DEFAULT_SEED = 42
@@ -164,6 +166,7 @@ class PipelineOptions:
     export_from: str = DEFAULT_EXPORT_FROM
     # empty prompts: ask SAM3 for every bank concept and pick the part names (auto_prompts.py)
     auto_prompts: bool = DEFAULT_AUTO_PROMPTS
+    mode: str = DEFAULT_MODE
 
     def resolved_floors(self):
         return floors(self.granularity, self.min_atom_faces, self.min_unit_faces)
@@ -185,6 +188,7 @@ class PipelineOptions:
                 "holopart_large": list(HOLOPART_LARGE_MODES),
                 "refine": list(REFINE_MODES),
                 "export_from": list(EXPORT_FROM_MODES),
+                "mode": list(MODES),
             },
             "defaults": {
                 **{f.name: getattr(self, f.name) for f in fields(self)
@@ -249,12 +253,13 @@ class PipelineOptions:
             "refine_min_share": self.refine_min_share,
             "export_from": self.export_from,
             "auto_prompts": self.auto_prompts,
+            "mode": self.mode,
         }
 
     def merge_kwargs(self):
         """kwargs for merge_parts.merge_parts, minus glb / prompts / split_dir / out_glb."""
         skip = {"samples", "azimuth", "azimuth_jitter", "color_tol",
-                "granularity", "min_atom_faces", "mirror", "auto_prompts"}
+                "granularity", "min_atom_faces", "mirror", "auto_prompts", "mode"}
         return {k: v for k, v in self.segment_kwargs().items() if k not in skip}
 
     @classmethod
@@ -339,6 +344,7 @@ class PipelineOptions:
             refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
             export_from=getattr(args, "export_from", DEFAULT_EXPORT_FROM),
             auto_prompts=not getattr(args, "no_auto_prompts", False),
+            mode=getattr(args, "mode", DEFAULT_MODE),
         )
 
 
@@ -426,6 +432,10 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--refine_min_share", type=float, default=DEFAULT_REFINE_MIN_SHARE,
                         help="refine=masks: a patch is cut off only above this share of "
                              "its unit's area")
+    parser.add_argument("--mode", default=DEFAULT_MODE, choices=MODES,
+                        help="auto: pick the part names from the bank candidates by rule; "
+                             "smart (智能分割模式): Kimi reviews the candidates and the renders "
+                             "and picks them (needs MOONSHOT_API_KEY)")
     parser.add_argument("--no_auto_prompts", action="store_true",
                         help="Without prompts, name the parts 主体 / 底座 instead of asking "
                              "SAM3 for every concept in the bank and picking the part names")

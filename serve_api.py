@@ -58,11 +58,12 @@ import segment_api
 import segment_parts
 from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, FLAT_PAINT_MODES, GRANULARITY,
-    EXPORT_FROM_MODES, HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, PipelineOptions,
-    REFINE_MODES,
+    EXPORT_FROM_MODES, HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, MODES,
+    PipelineOptions, REFINE_MODES,
 )
 
 from merge_parts import parse_part_floors
+from smart_prompts import vlm_key_available
 
 _DEFAULTS = PipelineOptions()
 
@@ -474,7 +475,7 @@ def _check_switches(mapping: dict) -> None:
         ("complete", COMPLETE_MODES), ("condition", CONDITION_MODES),
         ("holopart_large", HOLOPART_LARGE_MODES), ("refine", REFINE_MODES),
         ("export_from", EXPORT_FROM_MODES), ("flat_paint", FLAT_PAINT_MODES),
-        ("mirror", MIRROR_MODES),
+        ("mirror", MIRROR_MODES), ("mode", MODES),
     )
     for key, allowed in checks:
         value = mapping.get(key)
@@ -485,6 +486,9 @@ def _check_switches(mapping: dict) -> None:
             parse_part_floors(mapping["part_min_area_share"])
         except ValueError as error:
             raise HTTPException(400, str(error))
+    if mapping.get("mode") == "smart" and not vlm_key_available():
+        raise HTTPException(400, "mode=smart (智能分割模式) needs MOONSHOT_API_KEY on the server "
+                                 "(env var or the repo .env file)")
 
 
 @app.post("/pipeline", status_code=202)
@@ -497,6 +501,10 @@ async def pipeline(
     unassigned_to: OptionalStr = Form(
         _DEFAULTS.unassigned_to,
         description="Part that absorbs faces no prompt claimed; must be one of the prompts."),
+    mode: str = Form(
+        _DEFAULTS.mode,
+        description=" | ".join(MODES) + ". smart = 智能分割模式: with no prompts, Kimi reviews "
+        "the concept candidates and the renders and names the parts (needs MOONSHOT_API_KEY)"),
     options: OptionalStr = Form(
         None,
         description="Optional JSON object of PipelineOptions overrides, same names as the "
@@ -518,8 +526,8 @@ async def pipeline(
             raise HTTPException(400, f"options must be a JSON object: {exc}")
         if not isinstance(overrides, dict):
             raise HTTPException(400, "options must be a JSON object")
-    _check_switches(overrides)
-    merged = {"unassigned_to": unassigned_to, **overrides}
+    merged = {"unassigned_to": unassigned_to, "mode": mode, **overrides}
+    _check_switches(merged)
     try:
         resolved = PipelineOptions.from_mapping(merged)
     except (TypeError, ValueError) as exc:
@@ -631,6 +639,10 @@ async def segment(
         _DEFAULTS.auto_prompts,
         description="Empty prompts: ask SAM3 for every bank concept and pick the part names "
                     "(default). false: name the parts 主体 / 底座 instead."),
+    mode: str = Form(
+        _DEFAULTS.mode,
+        description=" | ".join(MODES) + ". smart = 智能分割模式 (Kimi names the parts; needs "
+        "MOONSHOT_API_KEY)"),
     octree_resolution: int = Form(_DEFAULTS.octree_resolution),
     seed: int = Form(_DEFAULTS.seed),
     with_texture: bool = Form(_DEFAULTS.with_texture),
@@ -662,6 +674,10 @@ async def segment(
         raise HTTPException(400, f"refine must be one of {REFINE_MODES}")
     if export_from not in EXPORT_FROM_MODES:
         raise HTTPException(400, f"export_from must be one of {EXPORT_FROM_MODES}")
+    if mode not in MODES:
+        raise HTTPException(400, f"mode must be one of {MODES}")
+    if mode == "smart" and not vlm_key_available():
+        raise HTTPException(400, "mode=smart (智能分割模式) needs MOONSHOT_API_KEY on the server")
     if part_min_area_share in ("", "string"):
         part_min_area_share = None
     if part_min_area_share is not None:
@@ -713,6 +729,7 @@ async def segment(
         "refine_min_share": refine_min_share,
         "export_from": export_from,
         "auto_prompts": auto_prompts,
+        "mode": mode,
         "octree_resolution": octree_resolution,
         "seed": seed,
         "with_texture": with_texture,

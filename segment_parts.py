@@ -156,6 +156,7 @@ def segment_parts(
     refine_min_share=DEFAULT_REFINE_MIN_SHARE,
     export_from=DEFAULT_EXPORT_FROM,
     auto_prompts=True,
+    mode="auto",
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -275,10 +276,11 @@ def segment_parts(
     if propose:
         from auto_prompts import propose_prompts
 
-        print("[auto] no prompts; proposing part names from the concept bank ...")
+        print("[auto] no prompts; proposing part names from the concept bank"
+              + (" with Kimi review (智能分割模式) ..." if mode == "smart" else " ..."))
         proposed = propose_prompts(
             glb, work_dir, sample_glbs[0], py_sam3, sam3_model, concept_bank,
-            flat_paint, reuse, radius, resolution)
+            flat_paint, reuse, radius, resolution, mode=mode)
         if len(proposed["prompts"]) >= 2:      # one name would be the whole object again
             prompts, unassigned_to = proposed["prompts"], proposed["unassigned_to"]
         else:

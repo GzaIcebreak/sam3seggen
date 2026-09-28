@@ -131,11 +131,14 @@ def bank_concepts(py_sam3, bank_path, cache_dir):
 def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     flat_paint="auto", reuse=True, radius=2.0, resolution=512,
                     azimuths=AUTO_AZIMUTHS, elevations=AUTO_ELEVATIONS,
-                    max_parts=DEFAULT_MAX_PARTS):
+                    max_parts=DEFAULT_MAX_PARTS, mode="auto"):
     """Render a view ring, ask SAM3 for every bank concept, and pick the part names.
 
-    Writes work_dir/auto_prompts.json. Returns {"prompts": [...], "unassigned_to": str | None,
-    "proposal": {...}}; "prompts" is empty when SAM3 recognised nothing usable.
+    mode="auto" picks by the rules above; mode="smart" (智能分割模式) hands the candidates
+    and four renders to Kimi, which knows what the object is and drops words that do not
+    belong to it. Writes work_dir/auto_prompts.json. Returns {"prompts": [...],
+    "unassigned_to": str | None, "proposal": {...}}; "prompts" is empty when nothing usable
+    was recognised.
     """
     from data_toolkit.lift_sam3 import load_masks
     from merge_parts import flat_paint_stage, render_views
@@ -160,6 +163,25 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     mask_set = load_masks(masks_npz)
     proposal = propose_from_masks(mask_set.masks, mask_set.foreground, mask_set.scores,
                                   mask_set.concepts, max_parts=max_parts)
+    proposal["mode"] = mode
+    if mode == "smart":
+        from smart_prompts import kimi_select
+
+        with open(os.path.join(prompt_dir, "cameras.json"), encoding="utf-8") as handle:
+            views = json.load(handle)["views"]
+        images = [os.path.join(prompt_dir, view["image"]) for view in views][::2][:4]
+        print(f"[smart] asking Kimi to review {len(proposal['candidates'])} candidate words ...")
+        chosen = kimi_select(images, proposal["candidates"], concepts)
+        proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
+        proposal["kimi"] = chosen
+        print(f"[smart] Kimi: object={chosen['object']!r} main={chosen['main']!r} "
+              f"parts={chosen['parts']}" + (f" (dropped, not in bank: {chosen['dropped']})"
+                                            if chosen["dropped"] else ""))
+        if len(chosen["parts"]) >= 2:
+            proposal["parts"] = chosen["parts"][:max_parts]
+            proposal["main"] = chosen["main"] or proposal["main"]
+        else:
+            print("[smart] Kimi returned fewer than two usable parts; keeping the rule-based pick")
     prompts = list(proposal["parts"])
     main = proposal["main"]
     if main and main not in prompts:
