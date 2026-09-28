@@ -71,6 +71,7 @@ DEFAULT_REFINE = "off"             # masks: cut a voted unit where its own masks
 REFINE_MODES = ("masks", "off")
 DEFAULT_REFINE_MIN_SHARE = 0.10
 DEFAULT_EXPORT_FROM = "source"     # cut parts from the source model (full resolution, no bake)
+DEFAULT_AUTO_PROMPTS = True        # no prompts: propose part names from the concept bank
 EXPORT_FROM_MODES = ("source", "remesh")
 DEFAULT_OCTREE_RESOLUTION = 512
 DEFAULT_SEED = 42
@@ -161,6 +162,8 @@ class PipelineOptions:
     refine: str = DEFAULT_REFINE
     refine_min_share: float = DEFAULT_REFINE_MIN_SHARE
     export_from: str = DEFAULT_EXPORT_FROM
+    # empty prompts: ask SAM3 for every bank concept and pick the part names (auto_prompts.py)
+    auto_prompts: bool = DEFAULT_AUTO_PROMPTS
 
     def resolved_floors(self):
         return floors(self.granularity, self.min_atom_faces, self.min_unit_faces)
@@ -245,12 +248,13 @@ class PipelineOptions:
             "refine": self.refine,
             "refine_min_share": self.refine_min_share,
             "export_from": self.export_from,
+            "auto_prompts": self.auto_prompts,
         }
 
     def merge_kwargs(self):
         """kwargs for merge_parts.merge_parts, minus glb / prompts / split_dir / out_glb."""
         skip = {"samples", "azimuth", "azimuth_jitter", "color_tol",
-                "granularity", "min_atom_faces", "mirror"}
+                "granularity", "min_atom_faces", "mirror", "auto_prompts"}
         return {k: v for k, v in self.segment_kwargs().items() if k not in skip}
 
     @classmethod
@@ -334,6 +338,7 @@ class PipelineOptions:
             refine=getattr(args, "refine", DEFAULT_REFINE),
             refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
             export_from=getattr(args, "export_from", DEFAULT_EXPORT_FROM),
+            auto_prompts=not getattr(args, "no_auto_prompts", False),
         )
 
 
@@ -421,6 +426,9 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--refine_min_share", type=float, default=DEFAULT_REFINE_MIN_SHARE,
                         help="refine=masks: a patch is cut off only above this share of "
                              "its unit's area")
+    parser.add_argument("--no_auto_prompts", action="store_true",
+                        help="Without prompts, name the parts 主体 / 底座 instead of asking "
+                             "SAM3 for every concept in the bank and picking the part names")
     parser.add_argument("--export_from", default=DEFAULT_EXPORT_FROM, choices=EXPORT_FROM_MODES,
                         help="source (default): cut the parts from the source model with "
                              "its own UVs and texture (full resolution, no bake); remesh: "

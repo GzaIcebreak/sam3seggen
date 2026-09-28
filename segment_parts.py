@@ -155,6 +155,7 @@ def segment_parts(
     refine=DEFAULT_REFINE,
     refine_min_share=DEFAULT_REFINE_MIN_SHARE,
     export_from=DEFAULT_EXPORT_FROM,
+    auto_prompts=True,
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -214,8 +215,13 @@ def segment_parts(
 
     if samples < 1:
         raise ValueError(f"samples must be at least 1, got {samples}")
-    prompts, merge, granularity = resolve_unprompted(
-        prompts, merge, granularity, min_atom_faces, min_unit_faces)
+    # Without prompts the part names are proposed from the concept bank once the first
+    # sample exists (it feeds the flat paint). merge=off never names anything, so it
+    # keeps the old 主体 / 底座 placeholders and skips the proposal.
+    propose = bool(auto_prompts) and merge != "off" and not split_prompt_entries(prompts)
+    if not propose:
+        prompts, merge, granularity = resolve_unprompted(
+            prompts, merge, granularity, min_atom_faces, min_unit_faces)
     if split_prompt_entries(prompts):
         unassigned_to = resolve_unassigned_to(
             unassigned_to, part_names(normalize_part_specs(prompts)))
@@ -266,6 +272,20 @@ def segment_parts(
     # the temporary flat colour, so the guidance overlays can be drawn -- and looked at --
     # before paying for the remaining samples.
     sample_glbs = [full_seg(0)]
+    if propose:
+        from auto_prompts import propose_prompts
+
+        print("[auto] no prompts; proposing part names from the concept bank ...")
+        proposed = propose_prompts(
+            glb, work_dir, sample_glbs[0], py_sam3, sam3_model, concept_bank,
+            flat_paint, reuse, radius, resolution)
+        if len(proposed["prompts"]) >= 2:      # one name would be the whole object again
+            prompts, unassigned_to = proposed["prompts"], proposed["unassigned_to"]
+        else:
+            prompts, merge, granularity = resolve_unprompted(
+                "", merge, granularity, min_atom_faces, min_unit_faces)
+            unassigned_to = resolve_unassigned_to(
+                unassigned_to, part_names(normalize_part_specs(prompts)))
     if prompts:
         guidance(
             glb, work_dir, sample_glbs[0], canonical_prompts(normalize_part_specs(prompts)),

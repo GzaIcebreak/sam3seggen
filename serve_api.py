@@ -627,6 +627,10 @@ async def segment(
         _DEFAULTS.export_from,
         description=" | ".join(EXPORT_FROM_MODES) + ". source: cut the parts from the source "
         "model with its own texture (full resolution); remesh: cut the remesh and bake"),
+    auto_prompts: bool = Form(
+        _DEFAULTS.auto_prompts,
+        description="Empty prompts: ask SAM3 for every bank concept and pick the part names "
+                    "(default). false: name the parts 主体 / 底座 instead."),
     octree_resolution: int = Form(_DEFAULTS.octree_resolution),
     seed: int = Form(_DEFAULTS.seed),
     with_texture: bool = Form(_DEFAULTS.with_texture),
@@ -708,6 +712,7 @@ async def segment(
         "refine": refine,
         "refine_min_share": refine_min_share,
         "export_from": export_from,
+        "auto_prompts": auto_prompts,
         "octree_resolution": octree_resolution,
         "seed": seed,
         "with_texture": with_texture,
