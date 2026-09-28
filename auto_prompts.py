@@ -116,7 +116,10 @@ def propose_from_masks(masks, foreground, scores, concepts, max_parts=DEFAULT_MA
 
 def bank_concepts(py_sam3, bank_path, cache_dir):
     """The bank's concept names, read once through the SAM3 venv (torch lives there)."""
-    cache = os.path.join(cache_dir, "concept_bank_names.txt")
+    # Keyed by the bank file's mtime: a retrained bank dropped in at the same path must not
+    # keep proposing from the old word list.
+    stamp = int(os.path.getmtime(bank_path))
+    cache = os.path.join(cache_dir, f"concept_bank_names.{stamp}.txt")
     if not os.path.isfile(cache):
         code = ("import sys, torch; b = torch.load(sys.argv[1], map_location='cpu', "
                 "weights_only=False); print('\\n'.join(b['names']))")
