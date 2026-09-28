@@ -9,9 +9,16 @@ preferring the candidates so that what it picks is something SAM3 has already sh
 can find on this model. Words outside the bank are dropped: the bank is what SAM3's
 decoder LoRA was trained against.
 
-Configuration is the same as the front-view VLM: MOONSHOT_API_KEY (env or repo .env),
-SEGVIGEN_VLM_BASE_URL, SEGVIGEN_VLM_MODEL. No key -> the request is refused up front
-(serve_api), never silently degraded to the heuristic.
+Any OpenAI-compatible chat API with image input works. Configuration (environment or the
+gitignored repo .env):
+
+    SEGVIGEN_VLM_API_KEY    the key (MOONSHOT_API_KEY is still read as a fallback)
+    SEGVIGEN_VLM_BASE_URL   e.g. https://dashscope.aliyuncs.com/compatible-mode/v1 (Qwen)
+                            or https://api.moonshot.cn/v1 (Kimi, the default)
+    SEGVIGEN_VLM_MODEL      e.g. qwen3-vl-plus; on Moonshot it may be left unset and a
+                            vision-capable model the key can use is picked from /models
+
+No key -> the request is refused up front (serve_api), never silently degraded.
 """
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ import urllib.request
 from data_toolkit.front_view import _env_or_dotenv, build_grid
 
 DEFAULT_BASE_URL = "https://api.moonshot.cn/v1"
+KEY_VARS = ("SEGVIGEN_VLM_API_KEY", "MOONSHOT_API_KEY")
 # The key decides which models exist: this one returns 404 for `kimi-latest` and lists
 # kimi-k2.6 / kimi-k2.7-code instead. Without SEGVIGEN_VLM_MODEL the first vision-capable,
 # non-code model the account can see is used.
@@ -34,8 +42,22 @@ MAX_CANDIDATES = 30
 MAX_VIEWS = 4
 
 
+def vlm_api_key():
+    for name in KEY_VARS:
+        value = _env_or_dotenv(name)
+        if value:
+            return value
+    return None
+
+
 def vlm_key_available():
-    return bool(_env_or_dotenv("MOONSHOT_API_KEY"))
+    return bool(vlm_api_key())
+
+
+def vlm_config():
+    """(base_url, model or None) as configured; what /health reports for mode=smart."""
+    base_url = (_env_or_dotenv("SEGVIGEN_VLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+    return base_url, _env_or_dotenv("SEGVIGEN_VLM_MODEL") or None
 
 
 def resolve_model(api_key, base_url, timeout=30):
@@ -142,11 +164,16 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
     The reasoning models answer after thinking out loud; a reply cut off by max_tokens
     (finish_reason "length", empty content) is retried once with double the budget.
     """
-    api_key = api_key or _env_or_dotenv("MOONSHOT_API_KEY")
+    api_key = api_key or vlm_api_key()
     if not api_key:
-        raise RuntimeError("智能分割模式 (mode=smart) needs MOONSHOT_API_KEY (env var or the repo .env file)")
-    base_url = (base_url or _env_or_dotenv("SEGVIGEN_VLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-    model = model or _env_or_dotenv("SEGVIGEN_VLM_MODEL") or resolve_model(api_key, base_url)
+        raise RuntimeError("智能分割模式 (mode=smart) needs SEGVIGEN_VLM_API_KEY (env var or the repo .env file)")
+    default_base, default_model = vlm_config()
+    base_url = (base_url or default_base).rstrip("/")
+    model = model or default_model
+    if not model:
+        if "moonshot" not in base_url:
+            raise RuntimeError(f"set SEGVIGEN_VLM_MODEL: {base_url} does not advertise image support per model")
+        model = resolve_model(api_key, base_url)
     grid, _ = build_grid(list(image_paths)[:MAX_VIEWS])
     buffer = io.BytesIO()
     grid.save(buffer, format="JPEG", quality=88)

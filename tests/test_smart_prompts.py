@@ -53,7 +53,7 @@ class SmartModeFormTest(unittest.TestCase):
             files = {"glb": ("toy.glb", io.BytesIO(b"glb"), "model/gltf-binary")}
             response = client.post("/pipeline", data={"mode": "smart"}, files=files)
             self.assertEqual(response.status_code, 400, response.text)
-            self.assertIn("MOONSHOT_API_KEY", response.json()["detail"])
+            self.assertIn("SEGVIGEN_VLM_API_KEY", response.json()["detail"])
             response = client.post("/pipeline", data={"mode": "clever"}, files=files)
             self.assertEqual(response.status_code, 400)
         finally:
@@ -64,6 +64,8 @@ class SmartModeFormTest(unittest.TestCase):
         health = client.get("/health").json()
         self.assertEqual(health["switches"]["mode"], ["auto", "smart"])
         self.assertEqual(health["defaults"]["mode"], "auto")
+        self.assertIn("base_url", health["smart_mode"])
+        self.assertIn("key_configured", health["smart_mode"])
 
 
 if __name__ == "__main__":

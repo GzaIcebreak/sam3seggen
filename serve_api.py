@@ -63,7 +63,7 @@ from pipeline import (
 )
 
 from merge_parts import parse_part_floors
-from smart_prompts import vlm_key_available
+from smart_prompts import vlm_config, vlm_key_available
 
 _DEFAULTS = PipelineOptions()
 
@@ -428,6 +428,8 @@ def health() -> dict:
         "jobs_dir": JOBS_DIR,
         "pipeline": "segment_parts",
         "checkpoint": segment_parts.DEFAULT_CKPT,
+        "smart_mode": {"key_configured": vlm_key_available(),
+                       "base_url": vlm_config()[0], "model": vlm_config()[1] or "auto"},
         **_DEFAULTS.public(),
         "legacy_defaults": {
             "assign": "paint",
@@ -487,7 +489,7 @@ def _check_switches(mapping: dict) -> None:
         except ValueError as error:
             raise HTTPException(400, str(error))
     if mapping.get("mode") == "smart" and not vlm_key_available():
-        raise HTTPException(400, "mode=smart (智能分割模式) needs MOONSHOT_API_KEY on the server "
+        raise HTTPException(400, "mode=smart (智能分割模式) needs SEGVIGEN_VLM_API_KEY on the server "
                                  "(env var or the repo .env file)")
 
 
@@ -677,7 +679,7 @@ async def segment(
     if mode not in MODES:
         raise HTTPException(400, f"mode must be one of {MODES}")
     if mode == "smart" and not vlm_key_available():
-        raise HTTPException(400, "mode=smart (智能分割模式) needs MOONSHOT_API_KEY on the server")
+        raise HTTPException(400, "mode=smart (智能分割模式) needs SEGVIGEN_VLM_API_KEY on the server")
     if part_min_area_share in ("", "string"):
         part_min_area_share = None
     if part_min_area_share is not None:
