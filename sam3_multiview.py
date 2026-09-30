@@ -88,6 +88,10 @@ def main():
                         help="v3 bank.pt; the maps.png stain. Empty string = raw SAM3.")
     parser.add_argument("--raw", action="store_true",
                         help="Keep overlapping unions instead of the v3 smallest-first overlay")
+    parser.add_argument("--extra_views_dir", default=None,
+                        help="A second render of the same cameras (the unpainted grey views when "
+                             "--views_dir is flat-painted). Each prompt keeps, per view, whichever of "
+                             "the two images gave it the higher score. --assign paint only.")
     parser.add_argument("--require_masks", action="store_true",
                         help="Exit if a prompt (other than --unassigned_to) is unseen in every view")
     parser.add_argument("--assign", choices=["paint", "rank", "auto"],
@@ -124,6 +128,10 @@ def main():
             print("--assign rank/auto needs the concept bank the ranker was trained with; "
                   "painting with the plain overlay")
             assign, rank_model = "paint", None
+    extra_dir = os.path.abspath(args.extra_views_dir) if args.extra_views_dir else None
+    if extra_dir and assign != "paint":
+        print(f"--extra_views_dir is only read with --assign paint; ignoring it for {assign}")
+        extra_dir = None
     device = "cuda" if torch.cuda.is_available() else "cpu"
     overlay = "raw" if args.raw else ("v3" if assign == "paint" else assign)
     print(f"SAM3 device={device} views={len(manifest['views'])} concepts={concepts} "
@@ -142,6 +150,19 @@ def main():
         print(f"[{view['name']}]")
         if assign == "paint":
             parts = segment_prompts(processor, model, image, concepts, threshold, device, bank=bank)
+            if extra_dir:
+                extra = segment_prompts(processor, model, Image.open(os.path.join(extra_dir, view["image"])),
+                                        concepts, threshold, device, bank=bank)
+                best = {part["prompt"]: part for part in parts}
+                taken = []
+                for part in extra:
+                    mine = best.get(part["prompt"])
+                    if mine is None or float(part["score"]) > float(mine["score"]):
+                        best[part["prompt"]] = part
+                        taken.append(part["prompt"])
+                if taken:
+                    print(f"  from the unpainted render: {sorted(taken)}")
+                parts = list(best.values())
         else:
             # One SAM3 forward pass; the ranker weighs each prompt's top-K candidates against
             # each other and edits v3's overlay set. rank_parts already returns disjoint,

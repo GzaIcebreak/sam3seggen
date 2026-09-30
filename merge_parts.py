@@ -160,7 +160,7 @@ def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
                model=DEFAULT_SAM3, threshold=DEFAULT_SAM3_THRESHOLD, reuse=True,
                concept_bank=DEFAULT_CONCEPT_BANK, raw=False, require_masks=False,
                assign=DEFAULT_ASSIGN, rank_model=DEFAULT_RANK_MODEL,
-               rank_drop=DEFAULT_RANK_DROP, rank_add=DEFAULT_RANK_ADD):
+               rank_drop=DEFAULT_RANK_DROP, rank_add=DEFAULT_RANK_ADD, extra_views_dir=None):
     if reuse and os.path.isfile(out_npz):
         print(f"[guidance] reusing masks for {prompts} ({os.path.basename(out_npz)})")
         return out_npz
@@ -174,6 +174,8 @@ def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
     ]
     if rank_model:
         command += ["--rank_model", rank_model]
+    if extra_views_dir:
+        command += ["--extra_views_dir", extra_views_dir]
     if raw:
         command.append("--raw")
     if require_masks:
@@ -240,6 +242,11 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
     overlay = "v3" if assign == "paint" else (
         f"{assign}-d{float(rank_drop):g}-a{float(rank_add):g}-"
         f"{os.path.basename(rank_model) if rank_model else 'none'}")
+    # A painted run also reads the grey render (see sam3_multiview --extra_views_dir); the
+    # key says so, so masks from the paint-only reader are not reused.
+    dual = painted and assign == "paint"
+    if dual:
+        overlay += "+grey"
     masks_npz = sam3_masks(
         prompt_dir, prompts,
         os.path.join(work_dir, masks_name(
@@ -247,7 +254,8 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
             view_azimuths, view_elevations, bank, overlay, painted)),
         unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse, concept_bank=bank,
         require_masks=require_masks, assign=assign, rank_model=rank_model,
-        rank_drop=rank_drop, rank_add=rank_add)
+        rank_drop=rank_drop, rank_add=rank_add,
+        extra_views_dir=views_dir if dual else None)
     # Overlay on the real render even when SAM3 read the painted one: they are rasterised
     # through the same camera, and a reviewer needs to see the actual model under a mask.
     paint_guidance(views_dir, masks_npz, os.path.join(work_dir, "guidance"))

@@ -153,7 +153,7 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     prompt_dir, painted = flat_paint_stage(
         seg_glb, views_dir, os.path.join(work_dir, "views_auto_flat"), flat_paint, reuse)
     concepts = bank_concepts(py_sam3, concept_bank, os.path.dirname(os.path.abspath(concept_bank)))
-    masks_npz = os.path.join(work_dir, "auto_concepts.npz")
+    masks_npz = os.path.join(work_dir, "auto_concepts_grey.npz" if painted else "auto_concepts.npz")
     if not (reuse and os.path.isfile(masks_npz)):
         print(f"[auto] asking SAM3 for all {len(concepts)} bank concepts over "
               f"{len(azimuths.split(','))} views ...")
@@ -161,6 +161,7 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
             py_sam3, os.path.join(ROOT, "sam3_multiview.py"),
             "--views_dir", prompt_dir, "--out", masks_npz, "--raw",
             "--model", sam3_model, "--concept_bank", concept_bank,
+            *(["--extra_views_dir", views_dir] if painted else []),
             "--prompts", *concepts,
         ], check=True, stdout=subprocess.DEVNULL)
     mask_set = load_masks(masks_npz)
