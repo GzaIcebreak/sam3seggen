@@ -82,6 +82,15 @@ DEFAULT_MIN_RECALL = 0.5
 
 DEFAULT_CONCEPT_BANK = os.environ.get(
     "SEGVIGEN_CONCEPT_BANK", "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt")
+# How the per-view SAM3 masks become one disjoint map (sam3_multiview.py): paint = the v3
+# score-threshold overlay; rank = that overlay edited by the EASE Mask RankGNN (drop a mask
+# it scores below rank_drop, add one it scores at least rank_add); auto = rank unless the
+# ranker deletes a prompt outright. rank/auto fall back to paint when no ranker is installed.
+ASSIGN_MODES = ("paint", "rank", "auto")
+DEFAULT_ASSIGN = os.environ.get("SEGVIGEN_ASSIGN", "paint")
+DEFAULT_RANK_MODEL = os.environ.get("SEGVIGEN_RANK_MODEL", "")
+DEFAULT_RANK_DROP = 0.2
+DEFAULT_RANK_ADD = 0.9
 DEFAULT_PY_XPART = os.environ.get(
     "SEGVIGEN_PY_XPART", "/root/autodl-tmp/envs/xpart/bin/python")
 DEFAULT_XPART_ROOT = os.environ.get(
@@ -143,6 +152,10 @@ class PipelineOptions:
     strict_parts: bool = False
     sam3_threshold: float = DEFAULT_SAM3_THRESHOLD
     concept_bank: str = DEFAULT_CONCEPT_BANK
+    assign: str = DEFAULT_ASSIGN
+    rank_model: str = DEFAULT_RANK_MODEL
+    rank_drop: float = DEFAULT_RANK_DROP
+    rank_add: float = DEFAULT_RANK_ADD
     py_xpart: str | None = None
     xpart_root: str = DEFAULT_XPART_ROOT
     xpart_weights: str = DEFAULT_XPART_WEIGHTS
@@ -221,6 +234,10 @@ class PipelineOptions:
             "resolution": self.resolution,
             "sam3_threshold": self.sam3_threshold,
             "concept_bank": self.concept_bank,
+            "assign": self.assign,
+            "rank_model": self.rank_model,
+            "rank_drop": self.rank_drop,
+            "rank_add": self.rank_add,
             "flat_paint": self.flat_paint,
             "unassigned_to": self.unassigned_to,
             "merge": self.merge,
@@ -268,6 +285,10 @@ class PipelineOptions:
         known = {item.name for item in fields(cls)}
         payload = dict(data)
         kwargs = {}
+        if payload.get("assign") is not None and payload["assign"] not in ASSIGN_MODES:
+            raise ValueError(f"assign must be one of {ASSIGN_MODES}, got {payload['assign']!r}")
+        if "rank_model" in payload and payload.get("rank_model") in ("", "string", None):
+            payload.pop("rank_model")
         if payload.pop("no_concept_bank", False):
             kwargs["concept_bank"] = ""
         if payload.get("strict_parts") is not None:
@@ -326,6 +347,10 @@ class PipelineOptions:
             and not getattr(args, "allow_partial", False),
             sam3_threshold=getattr(args, "sam3_threshold", DEFAULT_SAM3_THRESHOLD),
             concept_bank=concept_bank,
+            assign=getattr(args, "assign", DEFAULT_ASSIGN),
+            rank_model=getattr(args, "rank_model", DEFAULT_RANK_MODEL),
+            rank_drop=getattr(args, "rank_drop", DEFAULT_RANK_DROP),
+            rank_add=getattr(args, "rank_add", DEFAULT_RANK_ADD),
             py_xpart=getattr(args, "py_xpart", None),
             xpart_root=getattr(args, "xpart_root", DEFAULT_XPART_ROOT),
             xpart_weights=getattr(args, "xpart_weights", DEFAULT_XPART_WEIGHTS),
@@ -460,6 +485,16 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
                         help="SAM3 v3 bank.pt. Empty = raw SAM3.")
     parser.add_argument("--no_concept_bank", action="store_true",
                         help="Disable the v3 bank and fall back to raw SAM3 scores")
+    parser.add_argument("--assign", default=DEFAULT_ASSIGN, choices=ASSIGN_MODES,
+                        help="paint = v3 score-threshold overlay; rank = overlay edited by the "
+                             "EASE Mask RankGNN; auto = rank unless it deletes a prompt")
+    parser.add_argument("--rank_model", default=DEFAULT_RANK_MODEL,
+                        help="mask_rank.py checkpoint for --assign rank/auto "
+                             "(default: $SEGVIGEN_RANK_MODEL; empty = fall back to paint)")
+    parser.add_argument("--rank_drop", type=float, default=DEFAULT_RANK_DROP,
+                        help="--assign rank: drop an overlaid mask the ranker scores below this")
+    parser.add_argument("--rank_add", type=float, default=DEFAULT_RANK_ADD,
+                        help="--assign rank: add a mask the overlay skipped that scores at least this")
     parser.add_argument("--py_xpart", default=None, help=f"default: {DEFAULT_PY_XPART}")
     parser.add_argument("--xpart_root", default=DEFAULT_XPART_ROOT)
     parser.add_argument("--xpart_weights", default=DEFAULT_XPART_WEIGHTS)

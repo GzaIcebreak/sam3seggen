@@ -34,6 +34,7 @@ if ROOT not in sys.path:
 from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, DEFAULT_COMPLETE, DEFAULT_CONDITION,
     DEFAULT_CONCEPT_BANK, DEFAULT_HOLOPART_ROOT, DEFAULT_HOLOPART_WEIGHTS,
+    DEFAULT_ASSIGN, DEFAULT_RANK_MODEL, DEFAULT_RANK_DROP, DEFAULT_RANK_ADD,
     DEFAULT_FRAGMENT_SHARE, DEFAULT_MIN_AREA_SHARE, DEFAULT_OCTREE_RESOLUTION, DEFAULT_PY_HOLOPART,
     DEFAULT_EXPORT_FROM, DEFAULT_HOLOPART_LARGE, DEFAULT_PY_XPART, DEFAULT_RADIUS,
     DEFAULT_REDRAWS, DEFAULT_REFINE, DEFAULT_REFINE_MIN_SHARE, DEFAULT_RESOLUTION,
@@ -157,17 +158,22 @@ def render_views(glb, views_dir, azimuths=DEFAULT_VIEW_AZIMUTHS,
 
 def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
                model=DEFAULT_SAM3, threshold=DEFAULT_SAM3_THRESHOLD, reuse=True,
-               concept_bank=DEFAULT_CONCEPT_BANK, raw=False, require_masks=False):
+               concept_bank=DEFAULT_CONCEPT_BANK, raw=False, require_masks=False,
+               assign=DEFAULT_ASSIGN, rank_model=DEFAULT_RANK_MODEL,
+               rank_drop=DEFAULT_RANK_DROP, rank_add=DEFAULT_RANK_ADD):
     if reuse and os.path.isfile(out_npz):
         print(f"[guidance] reusing masks for {prompts} ({os.path.basename(out_npz)})")
         return out_npz
-    print(f"[guidance] SAM3 v3 prompts {prompts} over the view grid ...")
+    print(f"[guidance] SAM3 prompts {prompts} over the view grid (assign={assign}) ...")
     command = [
         py_sam3 or DEFAULT_PY_SAM3, os.path.join(ROOT, "sam3_multiview.py"),
         "--views_dir", views_dir, "--out", out_npz,
         "--model", model, "--threshold", threshold,
         "--concept_bank", concept_bank or "",
+        "--assign", assign, "--rank_drop", rank_drop, "--rank_add", rank_add,
     ]
+    if rank_model:
+        command += ["--rank_model", rank_model]
     if raw:
         command.append("--raw")
     if require_masks:
@@ -215,7 +221,8 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
              radius=DEFAULT_RADIUS, resolution=DEFAULT_RESOLUTION, py_sam3=None,
              sam3_model=DEFAULT_SAM3, sam3_threshold=DEFAULT_SAM3_THRESHOLD,
              concept_bank=DEFAULT_CONCEPT_BANK, flat_paint="auto", reuse=True,
-             require_masks=False):
+             require_masks=False, assign=DEFAULT_ASSIGN, rank_model=DEFAULT_RANK_MODEL,
+             rank_drop=DEFAULT_RANK_DROP, rank_add=DEFAULT_RANK_ADD):
     """Render, flat-paint if needed, run SAM3, and draw the overlays a human reviews.
 
     Returns (views_dir, masks_npz). Cheap to call twice: everything downstream of the
@@ -228,13 +235,19 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
     prompt_dir, painted = flat_paint_stage(
         seg_glb, views_dir, os.path.join(work_dir, "views_flat"), flat_paint, reuse)
     bank = os.path.abspath(concept_bank) if concept_bank else ""
+    # The cache key names the painter: masks painted by the ranker must not be reused for
+    # a plain run and vice versa.
+    overlay = "v3" if assign == "paint" else (
+        f"{assign}-d{float(rank_drop):g}-a{float(rank_add):g}-"
+        f"{os.path.basename(rank_model) if rank_model else 'none'}")
     masks_npz = sam3_masks(
         prompt_dir, prompts,
         os.path.join(work_dir, masks_name(
             prompts, unassigned_to, sam3_threshold, sam3_model,
-            view_azimuths, view_elevations, bank, "v3", painted)),
+            view_azimuths, view_elevations, bank, overlay, painted)),
         unassigned_to, py_sam3, sam3_model, sam3_threshold, reuse, concept_bank=bank,
-        require_masks=require_masks)
+        require_masks=require_masks, assign=assign, rank_model=rank_model,
+        rank_drop=rank_drop, rank_add=rank_add)
     # Overlay on the real render even when SAM3 read the painted one: they are rasterised
     # through the same camera, and a reviewer needs to see the actual model under a mask.
     paint_guidance(views_dir, masks_npz, os.path.join(work_dir, "guidance"))
@@ -270,6 +283,10 @@ def merge_parts(
     sam3_model=DEFAULT_SAM3,
     sam3_threshold=DEFAULT_SAM3_THRESHOLD,
     concept_bank=DEFAULT_CONCEPT_BANK,
+    assign=DEFAULT_ASSIGN,
+    rank_model=DEFAULT_RANK_MODEL,
+    rank_drop=DEFAULT_RANK_DROP,
+    rank_add=DEFAULT_RANK_ADD,
     flat_paint="auto",
     units=None,
     complete=DEFAULT_COMPLETE,
@@ -355,7 +372,8 @@ def merge_parts(
         glb, split_dir, mesh_path, prompt_list, unassigned_to,
         view_azimuths, view_elevations, radius, resolution,
         py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
-        require_masks=strict_parts)
+        require_masks=strict_parts, assign=assign, rank_model=rank_model,
+        rank_drop=rank_drop, rank_add=rank_add)
 
     print("[merge] naming units by multi-view SAM3 voting ...")
     reference = load_single_mesh(mesh_path)

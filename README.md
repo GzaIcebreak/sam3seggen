@@ -402,9 +402,18 @@ python segment_api.py \
 - `--no_texture`：跳过 Blender 重展开 UV + 烘焙（更快）；默认保留真实贴图。
 - `--sam3_only`：在渲染 + SAM3 之后停止，保留 `render.png` / `sam3_2d_map.png` / 图例用于审核。
 
-2D 图默认由概念库 v3 的文本偏移 + 阈值 0.4 的小掩码优先叠涂生成。
+2D 图默认由概念库的文本偏移 + 阈值 0.4 的小掩码优先叠涂生成。2026-09-30 起部署的概念库是 v6
+（`weights/concept_bank_v6/bank.pt`，5928 个训练物体，`min_count 5`，884 个名字；HF
+[`Zaun1996/sam3-concept-bank`](https://huggingface.co/Zaun1996/sam3-concept-bank) 的 `v6_all/bank.pt`），
+由 `env.sh` 的 `SEGVIGEN_CONCEPT_BANK` 指定；同一留出集 mIoU 0.409 → 0.424，误检率 0.124 → 0.061。
 
-- `--assign rank`：让 EASE Mask RankGNN 编辑叠涂集合（keep<0.1 丢弃、keep>=0.9 补入）。
+多视角主线（`segment_parts.py` / `POST /pipeline`）也接了 EASE Mask RankGNN，参数 `assign` /
+`rank_model` / `rank_drop` / `rank_add`（`PipelineOptions`，可作 `/pipeline` 的 `options` 覆盖）。
+默认仍是 `paint`：在 3 个外部资产（机器人、椅子、飞机）上 `rank` 与 `paint` 的投票结果完全相同，
+飞机上排序器还把 `float` 的掩码整组删掉（`auto` 会在这种情况下回退到 `paint`）。留出集上的像素级
+增益没有传导到面级投票，所以排序器只作可选项，权重在 `weights/mask_rank_v6/`（`SEGVIGEN_RANK_MODEL`）。
+
+- `--assign rank`：让 EASE Mask RankGNN 编辑叠涂集合（keep<0.2 丢弃、keep>=0.9 补入；`--rank_drop` / `--rank_add`）。
   它在同分布上更好，但会把某个提示词的掩码整组删掉，所以默认不开。
 - `--assign auto`：同一次前向里把两张图都画出来，只有排序器没丢掉任何提示词时才采用它的结果，
   决策写在 `<map>_auto.json`。代价是多画一遍，不是多跑一遍 SAM3。

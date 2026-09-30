@@ -26,6 +26,10 @@ export SEGVIGEN_PY_HOLOPART=/root/autodl-tmp/envs/holopart/bin/python
 export SEGVIGEN_HOLOPART_ROOT=/root/autodl-tmp/HoloPart
 export SEGVIGEN_HOLOPART_WEIGHTS=/root/autodl-tmp/HoloPart/pretrained_weights/HoloPart
 export SEGVIGEN_SAM3="$ROOT/weights/facebook/sam3"
+# 2026-09-30: concept bank v6 (5928 objects, min_count 5). Comment out to fall back to v3 (datasets/concept_bank_v3/bank.pt).
+export SEGVIGEN_CONCEPT_BANK="$ROOT/weights/concept_bank_v6/bank.pt"
+# Optional EASE ranker for assign=rank/auto (trained with the v6 bank above). assign stays paint by default.
+export SEGVIGEN_RANK_MODEL="$ROOT/weights/mask_rank_v6/rank_ease_mc5_epoch6.pt"
 export SEGVIGEN_DINOV3="$ROOT/weights/facebook/dinov3-vitl16-pretrain-lvd1689m"
 # briaai/RMBG-2.0 is gated; public BiRefNet is a drop-in via SEGVIGEN_RMBG
 export SEGVIGEN_RMBG="$ROOT/weights/ZhengPeng7/BiRefNet"

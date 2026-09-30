@@ -57,6 +57,7 @@ from merge_parts import (
 )
 from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public contract
     DEFAULT_AZIMUTH, DEFAULT_AZIMUTH_JITTER, DEFAULT_COMPLETE, DEFAULT_CONCEPT_BANK,
+    DEFAULT_ASSIGN, DEFAULT_RANK_MODEL, DEFAULT_RANK_DROP, DEFAULT_RANK_ADD,
     DEFAULT_CONDITION, DEFAULT_FLAT_PAINT, DEFAULT_GRANULARITY, DEFAULT_MERGE,
     DEFAULT_PROMPTS, DEFAULT_UNASSIGNED_TO,
     DEFAULT_FRAGMENT_SHARE, DEFAULT_MIN_AREA_SHARE, DEFAULT_MIRROR, DEFAULT_OCTREE_RESOLUTION, DEFAULT_RADIUS,
@@ -124,6 +125,10 @@ def segment_parts(
     sam3_model=DEFAULT_SAM3,
     sam3_threshold=DEFAULT_SAM3_THRESHOLD,
     concept_bank=DEFAULT_CONCEPT_BANK,
+    assign=DEFAULT_ASSIGN,
+    rank_model=DEFAULT_RANK_MODEL,
+    rank_drop=DEFAULT_RANK_DROP,
+    rank_add=DEFAULT_RANK_ADD,
     flat_paint=DEFAULT_FLAT_PAINT,
     unassigned_to=DEFAULT_UNASSIGNED_TO,
     merge=DEFAULT_MERGE,
@@ -293,7 +298,8 @@ def segment_parts(
             glb, work_dir, sample_glbs[0], canonical_prompts(normalize_part_specs(prompts)),
             unassigned_to, view_azimuths, view_elevations, radius, resolution,
             py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
-            require_masks=strict_parts)
+            require_masks=strict_parts, assign=assign, rank_model=rank_model,
+            rank_drop=rank_drop, rank_add=rank_add)
     sample_glbs += [full_seg(index) for index in range(1, samples)]
 
     print(f"[split] intersecting {samples} partitions into atoms ...")
@@ -325,7 +331,8 @@ def segment_parts(
             view_azimuths=view_azimuths, view_elevations=view_elevations,
             radius=radius, resolution=resolution,
             py_sam3=py_sam3, sam3_model=sam3_model, sam3_threshold=sam3_threshold,
-            concept_bank=concept_bank, flat_paint=flat_paint, units=units,
+            concept_bank=concept_bank, assign=assign, rank_model=rank_model,
+            rank_drop=rank_drop, rank_add=rank_add, flat_paint=flat_paint, units=units,
             complete=complete, py_xpart=py_xpart, xpart_root=xpart_root,
             xpart_weights=xpart_weights, py_holopart=py_holopart,
             holopart_root=holopart_root, holopart_weights=holopart_weights,
