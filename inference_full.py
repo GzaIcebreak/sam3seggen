@@ -659,11 +659,40 @@ def prepare_input(m, glb, vxz_path, reuse_vxz=True):
     return {"shape_slat": shape_slat, "meshes": meshes, "subs": subs, "tex_slat": tex_slat}
 
 
+def prerender_conditions(items):
+    """Render every distinct conditioning azimuth in ONE Blender scene.
+
+    Each sample used to import the model into a fresh scene (~5 s) and render its view
+    (~8 s); the default jitter repeats azimuths (0, 30, -30, 15, -15, 0, 30), so seven
+    samples meant seven imports for five distinct pictures. The renderer already orbits
+    one camera through a list of azimuths; each item then gets a copy of its view.
+    """
+    import shutil
+
+    todo = [item for item in items if not item['2d_map'] and not item.get('prerendered')]
+    if len(todo) < 2:
+        return
+    azimuths = list(dict.fromkeys(float(item.get('azimuth', 0.0)) for item in todo))
+    cache_dir = os.path.join(os.path.dirname(todo[0]['input_vxz']), "cond_views")
+    os.makedirs(cache_dir, exist_ok=True)
+    template = os.path.join(cache_dir, "cond.png")
+    print("-"*100)
+    print(f"Rendering {len(azimuths)} conditioning view(s) for {len(todo)} samples ............")
+    written = render_from_transforms(todo[0]['glb'], todo[0]['transforms'], template, azimuths=azimuths)
+    if not written or len(written) != len(azimuths):
+        written = [template] if len(azimuths) == 1 else [
+            f"{os.path.splitext(template)[0]}_{az:g}.png" for az in azimuths]
+    by_azimuth = dict(zip(azimuths, written))
+    for item in todo:
+        shutil.copyfile(by_azimuth[float(item.get('azimuth', 0.0))], item['img'])
+        item['prerendered'] = True
+
+
 def run_sample(m, prepared, item):
     """Render the conditioning view, sample one segmentation and export it."""
     print("-"*100)
     print("Getting cond ............")
-    if not item['2d_map']:
+    if not item['2d_map'] and not item.get('prerendered'):
         # transforms.json holds a single calibrated camera; without an azimuth offset that
         # camera can easily land on the model's back, and the conditioning view decides
         # which side of the model the part colours are inferred from.
@@ -706,6 +735,7 @@ def inference(ckpt_path, items):
     if isinstance(items, dict):
         items = [items]
     m = load_models(ckpt_path)
+    prerender_conditions(items)
     first = items[0]
     prepared = prepare_input(m, first['glb'], first['input_vxz'], first.get('reuse_vxz', True))
     for index, item in enumerate(items):

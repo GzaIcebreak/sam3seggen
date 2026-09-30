@@ -333,6 +333,69 @@ def _reset_bpy_scene():
 TEXTURE_AREA_MEDIUM = 0.08
 TEXTURE_AREA_LARGE = 0.40
 TEXTURE_SIZE_MAX = 8192
+# A part this dense would put most of its faces under one texel at 2048 and sample the black
+# background between islands (mesh-forge-3d measured 1549 black faces at 2048, 381 at 4096).
+BAKE_LARGE_PART_FACES = 500_000
+BAKE_LARGE_PART_MIN_SIZE = 4096
+# Pack Islands after Smart UV: Smart UV's own packing fills ~20 % of the atlas on dense
+# meshes, AABB packing ~47 % in about two seconds (mesh-forge-3d).
+PACK_ISLANDS_MARGIN = 0.0005
+
+
+def source_flat_material(source_glb):
+    """The source's one flat material when it carries no texture and no per-element colour.
+
+    Baking "the source albedo" off such a model paints every texel the same colour, so the
+    Blender bake (minutes on a big split) can be replaced by that material. Returns
+    {base_color, metallic, roughness} or None when there is anything to bake: a textured
+    mesh, vertex/face colours, or meshes whose flat materials differ.
+    """
+    from trimesh.visual.material import PBRMaterial, SimpleMaterial
+
+    scene = trimesh.load(source_glb, force="scene")
+    found = []
+    for geom in scene.geometry.values():
+        if not isinstance(geom, trimesh.Trimesh) or not len(geom.faces):
+            continue
+        visual = geom.visual
+        if isinstance(visual, trimesh.visual.ColorVisuals):
+            if visual.kind in ("vertex", "face"):
+                return None
+            found.append({"base_color": [255, 255, 255, 255], "metallic": 0.0, "roughness": 0.5})
+            continue
+        material = getattr(visual, "material", None)
+        if isinstance(material, PBRMaterial):
+            if material.baseColorTexture is not None and visual.uv is not None:
+                return None
+            color = material.baseColorFactor
+            found.append({
+                "base_color": [int(c) for c in (color if color is not None else [255, 255, 255, 255])],
+                "metallic": float(material.metallicFactor if material.metallicFactor is not None else 0.0),
+                "roughness": float(material.roughnessFactor if material.roughnessFactor is not None else 0.5),
+            })
+        elif isinstance(material, SimpleMaterial):
+            if getattr(material, "image", None) is not None and visual.uv is not None:
+                return None
+            color = getattr(material, "diffuse", None)
+            found.append({"base_color": [int(c) for c in (color if color is not None else [255, 255, 255, 255])],
+                          "metallic": 0.0, "roughness": 0.5})
+        else:
+            return None
+    if not found or any(f != found[0] for f in found[1:]):
+        return None
+    return found[0]
+
+
+def _flat_visual(material):
+    """A trimesh visual carrying one PBR material and no UVs (exports as baseColorFactor)."""
+    from trimesh.visual.material import PBRMaterial
+
+    return trimesh.visual.TextureVisuals(material=PBRMaterial(
+        baseColorFactor=list(material["base_color"]),
+        metallicFactor=float(material["metallic"]),
+        roughnessFactor=float(material["roughness"]),
+        doubleSided=True,
+    ))
 TIGHT_CAGE = (0.02, 0.05)
 LOOSE_CAGE = (0.05, 0.15)
 
@@ -531,6 +594,13 @@ def _smart_project(obj, uv_angle_limit, uv_margin):
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
     bpy.ops.uv.smart_project(angle_limit=math.radians(uv_angle_limit), island_margin=uv_margin)
+    bpy.ops.uv.select_all(action="SELECT")
+    try:
+        bpy.ops.uv.pack_islands(udim_source="CLOSEST_UDIM", rotate=True, rotate_method="ANY",
+                                scale=True, merge_overlap=False, margin_method="FRACTION",
+                                margin=PACK_ISLANDS_MARGIN, shape_method="AABB")
+    except (TypeError, RuntimeError) as exc:   # older bpy without these keywords
+        print(f"  pack_islands skipped: {exc}")
     bpy.ops.object.mode_set(mode="OBJECT")
 
 
@@ -681,6 +751,8 @@ def bake_parts(parts, source_glb, out_dir, texture_size, uv_angle_limit, uv_marg
         name = f"part_{part['label']:02d}" + (f"_{suffix}" if suffix else "")
         share = float(part["area"]) / total_area
         size = part_texture_size(share, texture_size)
+        if len(part["faces"]) > BAKE_LARGE_PART_FACES and size < BAKE_LARGE_PART_MIN_SIZE:
+            size = BAKE_LARGE_PART_MIN_SIZE
         island_margin = max(0.0004, uv_margin * (2048.0 / size))
         part_obj = _make_part_object(name, part["vertices"], part["faces"])
         _smart_project(part_obj, uv_angle_limit, island_margin)
@@ -900,9 +972,209 @@ def completed_part_geometries(completed_glb):
     return parts
 
 
+def export_completed_flat(completed_glb, out_dir, material, combined_name="xpart_parts.glb"):
+    """Closed solids with the untextured source's flat material; same nodes as bake_completed."""
+    parts = completed_part_geometries(completed_glb)
+    print(f"{len(parts)} closed solids from {os.path.basename(completed_glb)} "
+          f"(untextured source: flat material, no bake)")
+    os.makedirs(out_dir, exist_ok=True)
+    scene = trimesh.Scene()
+    manifest = []
+    for part in parts:
+        suffix = "".join(c if c.isalnum() else "_" for c in part["name"]) if part["name"] else ""
+        name = f"part_{part['label']:02d}" + (f"_{suffix}" if suffix else "")
+        mesh = trimesh.Trimesh(vertices=part["vertices"], faces=part["faces"], process=False)
+        mesh.visual = _flat_visual(material)
+        scene.add_geometry(mesh, node_name=name, geom_name=name)
+        print(f"  {name}: {len(part['faces'])} faces")
+        manifest.append({"label": part["label"], "name": part["name"], "node": name,
+                         "part_color": part["part_color"], "faces": int(len(part["faces"])),
+                         "area": part["area"], "texture": "flat"})
+    combined_path = os.path.join(out_dir, combined_name)
+    scene.export(combined_path)
+    print(f"combined {len(parts)} parts -> {combined_path}")
+    with open(os.path.join(out_dir, "parts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return manifest
+
+
+# Reprojection gates, relative to the source's bounding-box diagonal. A face nearer than
+# REPROJECT_NEAR gets affine UVs from its source triangle; a farther one (an X-Part cap)
+# the nearest surface point's UV on all corners. A part whose median distance exceeds
+# REPROJECT_PART_MEDIAN was reshaped and is baked instead.
+REPROJECT_NEAR = 2e-3
+REPROJECT_PART_MEDIAN = 2e-3
+
+
+def _textured_source(source_glb):
+    """(mesh, material) of a single-mesh source with UVs and a base-colour texture, else None."""
+    from trimesh.visual.material import PBRMaterial
+
+    scene = trimesh.load(source_glb, force="scene")
+    geoms = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh) and len(g.faces)]
+    if len(geoms) != 1:
+        return None
+    mesh = geoms[0]
+    node = scene.graph.geometry_nodes.get(next(k for k, g in scene.geometry.items() if g is mesh), [None])[0]
+    if node is not None:
+        transform, _ = scene.graph.get(node)
+        if not np.allclose(transform, np.eye(4)):
+            mesh = mesh.copy()
+            mesh.apply_transform(transform)
+    visual = mesh.visual
+    if not isinstance(visual, trimesh.visual.TextureVisuals) or visual.uv is None:
+        return None
+    material = visual.material
+    if not isinstance(material, PBRMaterial) or material.baseColorTexture is None:
+        return None
+    # trimesh drops the PIL format on load and would re-encode JPEG textures as PNG (8K: ~23 MB each)
+    if _glb_image_mimes(source_glb) == {"image/jpeg"}:
+        for key in ("baseColorTexture", "metallicRoughnessTexture", "normalTexture",
+                    "emissiveTexture", "occlusionTexture"):
+            image = getattr(material, key, None)
+            if image is not None and getattr(image, "format", None) is None:
+                image.format = "JPEG"
+    return mesh, material
+
+
+def _glb_image_mimes(path):
+    """Set of image mime types declared in a .glb's JSON chunk (empty for other files)."""
+    import struct
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(20)
+            if header[:4] != b"glTF":
+                return set()
+            length = struct.unpack("<I", header[12:16])[0]
+            tree = json.loads(f.read(length))
+    except (OSError, ValueError):
+        return set()
+    return {image.get("mimeType") for image in tree.get("images", [])}
+
+
+def _weld_corners(faces, corner_uv, texel):
+    """(vertices_index, uv, faces) welding corners of one part vertex whose UVs agree within `texel`."""
+    corners = np.asarray(faces, np.int64).reshape(-1)
+    uv = corner_uv.reshape(-1, 2)
+    key = np.column_stack([corners, np.round(uv / texel).astype(np.int64)])
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    return corners[first], uv[first], inverse.reshape(-1, 3)
+
+
+def reproject_uv(part_vertices, part_faces, src_vertices, src_faces, src_uv, bvh, diag,
+                 near=REPROJECT_NEAR):
+    """Per-corner UVs for a part from the nearest source triangle. Returns (corner_uv, stats)."""
+    import torch
+
+    V = np.asarray(part_vertices, np.float64)
+    F = np.asarray(part_faces, np.int64)
+    centroids = torch.tensor(V[F].mean(axis=1), dtype=torch.float32, device="cuda")
+    dist, fid, uvw = bvh.unsigned_distance(centroids, return_uvw=True)
+    dist = dist.cpu().numpy().astype(np.float64) / diag
+    fid = fid.cpu().numpy().astype(np.int64)
+    uvw = uvw.cpu().numpy().astype(np.float64)
+    tri = src_faces[fid]
+    A, B, C = src_vertices[tri[:, 0]], src_vertices[tri[:, 1]], src_vertices[tri[:, 2]]
+    uv_t = src_uv[tri]                                                   # (F,3,2)
+    e0, e1 = B - A, C - A
+    d00 = np.einsum("ij,ij->i", e0, e0)
+    d01 = np.einsum("ij,ij->i", e0, e1)
+    d11 = np.einsum("ij,ij->i", e1, e1)
+    den = d00 * d11 - d01 * d01
+    good = den > 1e-24 * np.maximum(d00 * d11, 1e-300)
+    den = np.where(good, den, 1.0)
+    corner_uv = np.zeros((len(F), 3, 2), np.float64)
+    for k in range(3):
+        d = V[F[:, k]] - A
+        d20 = np.einsum("ij,ij->i", d, e0)
+        d21 = np.einsum("ij,ij->i", d, e1)
+        b1 = (d11 * d20 - d01 * d21) / den
+        b2 = (d00 * d21 - d01 * d20) / den
+        b0 = 1.0 - b1 - b2
+        corner_uv[:, k] = b0[:, None] * uv_t[:, 0] + b1[:, None] * uv_t[:, 1] + b2[:, None] * uv_t[:, 2]
+    point_uv = (uvw[:, :, None] * uv_t).sum(axis=1)                       # nearest surface point
+    far = (dist > near) | ~good
+    corner_uv[far] = point_uv[far][:, None, :]
+    stats = {"median": float(np.median(dist)), "p99": float(np.percentile(dist, 99)),
+             "far_faces": int(far.sum()), "faces": int(len(F))}
+    return corner_uv.astype(np.float32), stats
+
+
+def reproject_completed(completed_glb, source_glb, out_dir, texture_size=2048,
+                        combined_name="xpart_parts.glb", **bake_kwargs):
+    """Texture the closed solids from the source's own UVs/texture; bake only reshaped parts.
+
+    Returns the manifest, or None when the source is not one textured mesh (caller bakes).
+    """
+    import torch
+    import cumesh
+
+    found = _textured_source(source_glb)
+    if found is None:
+        return None
+    src, material = found
+    src_vertices = np.asarray(src.vertices, np.float64)
+    src_faces = np.asarray(src.faces, np.int64)
+    src_uv = np.asarray(src.visual.uv, np.float64)
+    diag = float(np.linalg.norm(src.bounds[1] - src.bounds[0])) or 1.0
+    bvh = cumesh.cuBVH(torch.tensor(src_vertices, dtype=torch.float32, device="cuda"),
+                       torch.tensor(src_faces, dtype=torch.int32, device="cuda"))
+
+    texel = 0.5 / max(material.baseColorTexture.size)
+    parts = completed_part_geometries(completed_glb)
+    print(f"{len(parts)} closed solids from {os.path.basename(completed_glb)}; "
+          f"reprojecting the source texture ({src_faces.shape[0]} source faces)")
+    os.makedirs(out_dir, exist_ok=True)
+    scene = trimesh.Scene()
+    manifest, to_bake = [], []
+    for part in parts:
+        suffix = "".join(c if c.isalnum() else "_" for c in part["name"]) if part["name"] else ""
+        name = f"part_{part['label']:02d}" + (f"_{suffix}" if suffix else "")
+        corner_uv, stats = reproject_uv(part["vertices"], part["faces"], src_vertices, src_faces,
+                                        src_uv, bvh, diag)
+        if stats["median"] > REPROJECT_PART_MEDIAN:
+            print(f"  {name}: median {stats['median']:.1e} x diagonal, reshaped -> bake")
+            to_bake.append(part)
+            continue
+        index, uv, faces = _weld_corners(part["faces"], corner_uv, texel)
+        mesh = trimesh.Trimesh(vertices=np.asarray(part["vertices"])[index], faces=faces, process=False)
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+        scene.add_geometry(mesh, node_name=name, geom_name=name)
+        print(f"  {name}: {stats['faces']} faces reprojected, median {stats['median']:.1e} "
+              f"p99 {stats['p99']:.1e}, {stats['far_faces']} far faces take the nearest colour")
+        manifest.append({"label": part["label"], "name": part["name"], "node": name,
+                         "part_color": part["part_color"], "faces": stats["faces"],
+                         "area": part["area"], "texture": "reproject",
+                         "reproject": {k: v for k, v in stats.items() if k != "faces"}})
+    if to_bake:
+        tmp_dir = os.path.join(out_dir, "_bake_subset")
+        baked_manifest = bake_parts(
+            to_bake, source_glb, tmp_dir, texture_size,
+            bake_kwargs.get("uv_angle_limit", 66.0), bake_kwargs.get("uv_margin", 0.003),
+            bake_kwargs.get("cage_extrusion", 0.05), bake_kwargs.get("max_ray_distance", 0.15),
+            bake_kwargs.get("samples", 1), bake_kwargs.get("margin", 2),
+            combined_name="baked.glb", source_frame=True, adapt_cage=True)
+        baked = trimesh.load(os.path.join(tmp_dir, "baked.glb"), force="scene")
+        for node in baked.graph.nodes_geometry:
+            transform, geom = baked.graph.get(node)
+            mesh = baked.geometry[geom].copy()
+            mesh.apply_transform(transform)
+            scene.add_geometry(mesh, node_name=node, geom_name=node)
+        manifest += baked_manifest
+    manifest.sort(key=lambda row: row["label"])
+    combined_path = os.path.join(out_dir, combined_name)
+    scene.export(combined_path)
+    print(f"combined {len(manifest)} parts -> {combined_path} "
+          f"({len(manifest) - len(to_bake)} reprojected, {len(to_bake)} baked)")
+    with open(os.path.join(out_dir, "parts.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    return manifest
+
+
 def bake_completed(completed_glb, source_glb, out_dir, texture_size=2048,
                    uv_angle_limit=66.0, uv_margin=0.003, cage_extrusion=0.05,
-                   max_ray_distance=0.15, samples=16, margin=2,
+                   max_ray_distance=0.15, samples=1, margin=2,
                    combined_name="xpart_parts.glb", save_textures=False):
     """Re-UV X-Part's closed solids and bake the source albedo onto them.
 
@@ -926,8 +1198,12 @@ def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_are
                           two_d_map=None, transforms=None, azimuth=0.0,
                           labels_npy=None, label_names=None,
                           split_mode="stain", min_fragment_faces=100,
-                          weld_min_visible=0.25, weld_min_agreement=0.6):
+                          weld_min_visible=0.25, weld_min_agreement=0.6, material=None):
     """Split into parts without Blender: no re-UV, no texture bake, no bpy dependency.
+
+    With `material` (source_flat_material of an untextured source) every part carries the
+    source's own flat material instead of its placeholder part colour: exactly what a bake
+    of that source would have produced, without Blender.
 
     Each part keeps its own flat "part colour" (the same colour it was assigned in the
     2D/clustering map) as a placeholder vertex colour instead of the source model's real
@@ -947,7 +1223,8 @@ def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_are
         weld_min_visible=weld_min_visible, weld_min_agreement=weld_min_agreement,
     )
 
-    print(f"{len(parts)} parts from {len(mesh.faces)} faces (no texture bake)")
+    print(f"{len(parts)} parts from {len(mesh.faces)} faces (no texture bake"
+          + (", source material" if material is not None else "") + ")")
     os.makedirs(out_dir, exist_ok=True)
     manifest = []
     scene = trimesh.Scene()
@@ -955,11 +1232,15 @@ def export_parts_no_bake(seg_glb, out_dir, palette=None, color_tol=40.0, min_are
         suffix = "".join(c if c.isalnum() else "_" for c in part["name"]) if part["name"] else ""
         name = f"part_{part['label']:02d}" + (f"_{suffix}" if suffix else "")
         vertices = _undo_to_glb_rotation_np(part["vertices"])
-        rgba = np.array(part["part_color"] + [255], dtype=np.uint8)
-        vertex_colors = np.tile(rgba, (len(vertices), 1))
-        part_mesh = trimesh.Trimesh(
-            vertices=vertices, faces=part["faces"], vertex_colors=vertex_colors, process=False,
-        )
+        if material is not None:
+            part_mesh = trimesh.Trimesh(vertices=vertices, faces=part["faces"], process=False)
+            part_mesh.visual = _flat_visual(material)
+        else:
+            rgba = np.array(part["part_color"] + [255], dtype=np.uint8)
+            vertex_colors = np.tile(rgba, (len(vertices), 1))
+            part_mesh = trimesh.Trimesh(
+                vertices=vertices, faces=part["faces"], vertex_colors=vertex_colors, process=False,
+            )
         scene.add_geometry(part_mesh, node_name=name, geom_name=name)
         print(f"  {name}: {len(part['faces'])} faces colour={part['part_color']}")
         manifest.append({
@@ -1022,7 +1303,12 @@ def main():
     parser.add_argument("--uv_margin", type=float, default=0.003)
     parser.add_argument("--cage_extrusion", type=float, default=0.02)
     parser.add_argument("--max_ray_distance", type=float, default=0.05)
-    parser.add_argument("--samples", type=int, default=16)
+    parser.add_argument("--samples", type=int, default=1,
+                        help="Cycles samples; 1 is enough for a base-colour-only bake (no lighting)")
+    parser.add_argument("--no_reproject", action="store_true",
+                        help="--completed: bake every solid instead of reprojecting the source texture")
+    parser.add_argument("--always_bake", action="store_true",
+                        help="Bake even when the source has no texture (default: copy its flat material)")
     parser.add_argument("--margin", type=int, default=2,
                         help="Bake edge-extend margin in px; keep small since Smart Project "
                              "packs many tiny islands close together (large margins bleed "
@@ -1058,6 +1344,27 @@ def main():
     if not args.completed and not args.seg_glb and not args.blender_reuv:
         parser.error("one of --seg_glb, --completed or --blender_reuv is required")
 
+    flat = None
+    if args.source_glb and not args.always_bake and not args.no_bake and not args.blender_reuv:
+        flat = source_flat_material(os.path.abspath(args.source_glb))
+        if flat is not None:
+            print(f"source has no texture (flat material {flat}); skipping the Blender bake")
+
+    if args.completed and flat is not None:
+        export_completed_flat(os.path.abspath(args.completed), os.path.abspath(args.out_dir), flat,
+                              combined_name=args.combined_name)
+        return
+
+    if args.completed and not args.no_reproject and not args.always_bake:
+        manifest = reproject_completed(
+            os.path.abspath(args.completed), os.path.abspath(args.source_glb),
+            os.path.abspath(args.out_dir), texture_size=args.texture_size,
+            combined_name=args.combined_name, uv_angle_limit=args.uv_angle_limit,
+            uv_margin=args.uv_margin, cage_extrusion=args.cage_extrusion,
+            max_ray_distance=args.max_ray_distance, samples=args.samples, margin=args.margin)
+        if manifest is not None:
+            return
+
     if args.completed:
         bake_completed(
             os.path.abspath(args.completed), os.path.abspath(args.source_glb),
@@ -1092,7 +1399,7 @@ def main():
         print(f"saved {out}")
         return
 
-    if args.no_bake:
+    if args.no_bake or flat is not None:
         export_parts_no_bake(
             args.seg_glb, args.out_dir,
             palette=args.palette,
@@ -1110,6 +1417,7 @@ def main():
             min_fragment_faces=args.min_fragment_faces,
             weld_min_visible=args.weld_min_visible,
             weld_min_agreement=args.weld_min_agreement,
+            material=flat,
         )
         return
 

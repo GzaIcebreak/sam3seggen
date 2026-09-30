@@ -299,10 +299,10 @@ def segment_parts(
                     json.dump({"azimuth": azimuths[index]}, handle)
         return [sample_paths(index)[1] for index in indices]
 
-    # Sample 0 first, on its own: it is the split's reference mesh and also the source of
-    # the temporary flat colour, so the guidance overlays can be drawn -- and looked at --
-    # before paying for the remaining samples.
-    sample_glbs = full_seg([0])
+    # All samples in one process (one model load, one voxelisation, one Blender scene for
+    # the conditioning views). Sample 0 is still the split's reference mesh and the source
+    # of the temporary flat colour; the guidance overlays are drawn right after.
+    sample_glbs = full_seg(range(samples))
     if propose:
         from auto_prompts import propose_prompts
 
@@ -325,7 +325,6 @@ def segment_parts(
             py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
             require_masks=strict_parts, assign=assign, rank_model=rank_model,
             rank_drop=rank_drop, rank_add=rank_add)
-    sample_glbs += full_seg(range(1, samples))
 
     print(f"[split] intersecting {samples} partitions into atoms ...")
     reference, atoms, report = meet_samples(sample_glbs, color_tol, min_atom_faces, mirror)
