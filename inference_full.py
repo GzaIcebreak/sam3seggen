@@ -513,7 +513,104 @@ def maybe_blender_reuv(mesh, item):
         texture_size=item.get("rebake_texture_size", 2048),
     )
 
-def inference(ckpt_path, item):
+def slat_to_labels_glb(meshes, tex_voxels, resolution=512, decimation_target=100000,
+                       remesh_band=1, remesh_project=0):
+    """Same remesh + simplify as slat_to_glb, but one colour per face instead of a texture.
+
+    The split only ever reads a sample's colour at each face centroid
+    (data_toolkit.parts_rebake.face_base_colors), so the UV unwrap and the 4K bake that
+    o_voxel.postprocess.to_glb does after simplifying -- most of a sample's export time --
+    buy nothing here. The attribute volume is sampled at the face centroids instead, mapped
+    back onto the pre-remesh surface exactly as the bake does. Vertices are un-shared on
+    export because glTF only carries vertex colours, and a shared vertex would average the
+    colours of the parts meeting at it.
+    """
+    import cumesh
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+
+    pbr_attr_layout = {
+        'base_color': slice(0, 3),
+        'metallic': slice(3, 4),
+        'roughness': slice(4, 5),
+        'alpha': slice(5, 6),
+    }
+    m, v = meshes[0], tex_voxels[0]
+    m.fill_holes()
+    mesh = MeshWithVoxel(
+        m.vertices, m.faces,
+        origin=[-0.5, -0.5, -0.5],
+        voxel_size=1 / resolution,
+        coords=v.coords[:, 1:],
+        attrs=v.feats,
+        voxel_shape=torch.Size([*v.shape, *v.spatial_shape]),
+        layout=pbr_attr_layout,
+    )
+    mesh.simplify(10000000)
+    vertices, faces = mesh.vertices.cuda(), mesh.faces.cuda()
+    attr_volume, coords = mesh.attrs, mesh.coords
+    aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=torch.float32, device='cuda')
+    grid_size = torch.tensor([resolution] * 3, dtype=torch.int32, device='cuda')
+    voxel_size = (aabb[1] - aabb[0]) / grid_size
+    print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+
+    cm = cumesh.CuMesh()
+    cm.init(vertices, faces)
+    cm.fill_holes(max_hole_perimeter=3e-2)
+    print(f"After filling holes: {cm.num_vertices} vertices, {cm.num_faces} faces")
+    vertices, faces = cm.read()
+    bvh = cumesh.cuBVH(vertices, faces)
+    center = aabb.mean(dim=0)
+    scale = (aabb[1] - aabb[0]).max().item()
+    cm.init(*cumesh.remeshing.remesh_narrow_band_dc(
+        vertices, faces,
+        center=center,
+        scale=(resolution + 3 * remesh_band) / resolution * scale,
+        resolution=resolution,
+        band=remesh_band,
+        project_back=remesh_project,
+        verbose=True,
+        bvh=bvh,
+    ))
+    print(f"After remeshing: {cm.num_vertices} vertices, {cm.num_faces} faces")
+    cm.simplify(decimation_target, verbose=True)
+    print(f"After simplifying: {cm.num_vertices} vertices, {cm.num_faces} faces")
+    out_vertices, out_faces = cm.read()
+
+    print("Sampling face colours...", end='', flush=True)
+    centroids = out_vertices[out_faces.long()].mean(dim=1)
+    _, face_id, uvw = bvh.unsigned_distance(centroids, return_uvw=True)
+    pos = (vertices[faces[face_id.long()]] * uvw.unsqueeze(-1)).sum(dim=1)
+    attrs = grid_sample_3d(
+        attr_volume,
+        torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
+        shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
+        grid=((pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
+        mode='trilinear',
+    )
+    attrs = attrs.reshape(-1, attr_volume.shape[1])   # grid_sample_3d keeps the batch dim
+    base_color = np.clip(attrs[:, pbr_attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    print("Done")
+
+    vertices_np = out_vertices.cpu().numpy().copy()
+    faces_np = out_faces.cpu().numpy()
+    y, z = vertices_np[:, 1].copy(), vertices_np[:, 2].copy()
+    vertices_np[:, 1], vertices_np[:, 2] = z, -y
+    colors = np.concatenate([base_color, np.full((len(faces_np), 1), 255, dtype=np.uint8)], axis=1)
+    shared = trimesh.Trimesh(vertices=vertices_np, faces=faces_np, process=False)
+    shared.visual = trimesh.visual.ColorVisuals(shared, face_colors=colors)
+    shared = drop_offbody_components(shared)
+    faces_np = np.asarray(shared.faces)
+    colors = np.asarray(shared.visual.face_colors)
+    flat = trimesh.Trimesh(
+        vertices=np.asarray(shared.vertices)[faces_np].reshape(-1, 3),
+        faces=np.arange(len(faces_np) * 3).reshape(-1, 3),
+        process=False,
+    )
+    flat.visual = trimesh.visual.ColorVisuals(flat, face_colors=colors)
+    return flat
+
+
+def load_models(ckpt_path):
     print("-"*100)
     print("Loading model ............")
     with open("microsoft/TRELLIS.2-4B/pipeline.json", "r") as f:
@@ -527,7 +624,6 @@ def inference(ckpt_path, item):
     gen3dseg.load_state_dict(state_dict)
     gen3dseg.eval()
     gen3dseg.cuda()
-    sampler = Sampler()
 
     shape_encoder = models.from_pretrained("microsoft/TRELLIS.2-4B/ckpts/shape_enc_next_dc_f16c32_fp16").cuda().eval()
     tex_encoder = models.from_pretrained("microsoft/TRELLIS.2-4B/ckpts/tex_enc_next_dc_f16c32_fp16").cuda().eval()
@@ -538,10 +634,33 @@ def inference(ckpt_path, item):
     rembg_model.cuda()
     image_cond_model = DinoV3FeatureExtractor(model_name="facebook/dinov3-vitl16-pretrain-lvd1689m")
     image_cond_model.cuda()
+    return {
+        "pipeline_args": pipeline_args, "gen3dseg": gen3dseg, "sampler": Sampler(),
+        "shape_encoder": shape_encoder, "tex_encoder": tex_encoder,
+        "shape_decoder": shape_decoder, "tex_decoder": tex_decoder,
+        "rembg_model": rembg_model, "image_cond_model": image_cond_model,
+    }
 
-    process_glb_to_vxz(item['glb'], item['input_vxz'])
-    shape_slat, meshes, subs, tex_slat = vxz_to_latent_slat(shape_encoder, shape_decoder, tex_encoder, item['input_vxz'])
 
+def vxz_is_current(vxz_path, glb_path):
+    """The voxelisation depends only on the input model, so a .vxz newer than it is reusable."""
+    return (os.path.isfile(vxz_path) and os.path.getsize(vxz_path) > 0
+            and os.path.getmtime(vxz_path) >= os.path.getmtime(glb_path))
+
+
+def prepare_input(m, glb, vxz_path, reuse_vxz=True):
+    """Voxelise and encode the input once; every sample shares these latents."""
+    if reuse_vxz and vxz_is_current(vxz_path, glb):
+        print(f"Reusing voxels {vxz_path}")
+    else:
+        process_glb_to_vxz(glb, vxz_path)
+    shape_slat, meshes, subs, tex_slat = vxz_to_latent_slat(
+        m['shape_encoder'], m['shape_decoder'], m['tex_encoder'], vxz_path)
+    return {"shape_slat": shape_slat, "meshes": meshes, "subs": subs, "tex_slat": tex_slat}
+
+
+def run_sample(m, prepared, item):
+    """Render the conditioning view, sample one segmentation and export it."""
     print("-"*100)
     print("Getting cond ............")
     if not item['2d_map']:
@@ -551,26 +670,97 @@ def inference(ckpt_path, item):
         render_from_transforms(item['glb'], item['transforms'], item['img'],
                                azimuths=[item.get('azimuth', 0.0)])
     image = Image.open(item['img'])
-    image = preprocess_image(rembg_model, image)
-    legend_encoder = load_legend_encoder(item['legend_ckpt'], gen3dseg) if item.get('legend_ckpt') else None
+    image = preprocess_image(m['rembg_model'], image)
+    legend_encoder = load_legend_encoder(item['legend_ckpt'], m['gen3dseg']) if item.get('legend_ckpt') else None
     if legend_encoder is not None:
-        image2 = preprocess_image(rembg_model, Image.open(item['img2'])) if item.get('img2') else None
-        cond = get_cond_v3(image_cond_model, image, image2, legend_encoder, item.get('legend'))
+        image2 = preprocess_image(m['rembg_model'], Image.open(item['img2'])) if item.get('img2') else None
+        cond = get_cond_v3(m['image_cond_model'], image, image2, legend_encoder, item.get('legend'))
     else:
         if item.get('legend') or item.get('img2'):
             print("warning: --legend/--img2 ignored: no --legend_ckpt with a legend encoder given")
-        cond = get_cond(image_cond_model, [image])
+        cond = get_cond(m['image_cond_model'], [image])
 
     print("-"*100)
     print("Sampling .................")
-    output_tex_slat = tex_slat_sample_single(gen3dseg, sampler, pipeline_args, shape_slat, tex_slat, cond)
+    output_tex_slat = tex_slat_sample_single(
+        m['gen3dseg'], m['sampler'], m['pipeline_args'], prepared['shape_slat'], prepared['tex_slat'], cond)
     with torch.no_grad():
-        tex_voxels = tex_decoder(output_tex_slat, guide_subs=subs) * 0.5 + 0.5
+        tex_voxels = m['tex_decoder'](output_tex_slat, guide_subs=prepared['subs']) * 0.5 + 0.5
 
     print("-"*100)
     print("Exporting glb ............")
-    glb = maybe_blender_reuv(slat_to_glb(meshes, tex_voxels), item)
+    if item.get('export', 'textured') == 'labels':
+        glb = slat_to_labels_glb(prepared['meshes'], tex_voxels)
+    else:
+        glb = maybe_blender_reuv(slat_to_glb(prepared['meshes'], tex_voxels), item)
     glb.export(item['export_glb'])
+
+
+def inference(ckpt_path, items):
+    """Run one item (the original CLI) or a list of items that share glb / input_vxz.
+
+    The models are loaded and the input voxelised once; each item then renders its own
+    conditioning view, draws its own sample and exports. Seven samples used to mean seven
+    model loads and seven voxelisations of the same mesh.
+    """
+    if isinstance(items, dict):
+        items = [items]
+    m = load_models(ckpt_path)
+    first = items[0]
+    prepared = prepare_input(m, first['glb'], first['input_vxz'], first.get('reuse_vxz', True))
+    for index, item in enumerate(items):
+        if len(items) > 1:
+            print("-"*100)
+            print(f"Sample {index + 1}/{len(items)}: azimuth {item.get('azimuth', 0.0):g} -> {item['export_glb']}")
+        run_sample(m, prepared, item)
+
+
+def items_from_args(args):
+    """The item list an inference run works through.
+
+    --items names a JSON list; each entry may set img, export_glb, azimuth, img2, legend
+    and inherits everything else (glb, input_vxz, transforms, ckpt, export mode) from the
+    command line. Without --items the command line is the one item, as before.
+    """
+    base = {
+        "2d_map": args.two_d_map,
+        "glb": os.path.abspath(args.glb),
+        "input_vxz": os.path.abspath(args.input_vxz),
+        "reuse_vxz": not args.recompute_vxz,
+        "export": args.export,
+        "blender_reuv": args.blender_reuv,
+        "rebake_texture_size": args.rebake_texture_size,
+        "azimuth": args.azimuth,
+        "legend_ckpt": os.path.abspath(args.legend_ckpt) if args.legend_ckpt else None,
+        "legend": os.path.abspath(args.legend) if args.legend else None,
+        "img2": os.path.abspath(args.img2) if args.img2 else None,
+    }
+    if not args.two_d_map:
+        base["transforms"] = os.path.abspath(args.transforms)
+    if not args.items:
+        base["img"] = os.path.abspath(args.img)
+        base["export_glb"] = os.path.abspath(args.export_glb)
+        return [base]
+    with open(args.items, "r", encoding="utf-8") as handle:
+        rows = json.load(handle)
+    if not isinstance(rows, list) or not rows:
+        raise SystemExit(f"--items must be a non-empty JSON list: {args.items}")
+    items = []
+    for row in rows:
+        item = dict(base)
+        for key in ("img", "export_glb"):
+            if key not in row:
+                raise SystemExit(f"--items entry needs {key!r}: {row}")
+            item[key] = os.path.abspath(row[key])
+        for key in ("azimuth",):
+            if key in row:
+                item[key] = float(row[key])
+        for key in ("img2", "legend"):
+            if row.get(key):
+                item[key] = os.path.abspath(row[key])
+        items.append(item)
+    return items
+
 
 if __name__ == "__main__":
     import argparse
@@ -596,14 +786,33 @@ if __name__ == "__main__":
     parser.add_argument(
         "--img",
         type=str,
-        required=True,
-        help="Render image or 2D guidance map path.",
+        default=None,
+        help="Render image or 2D guidance map path (required unless --items).",
     )
     parser.add_argument(
         "--export_glb",
         type=str,
-        required=True,
-        help="Output glb path.",
+        default=None,
+        help="Output glb path (required unless --items).",
+    )
+    parser.add_argument(
+        "--items",
+        type=str,
+        default=None,
+        help="JSON list of {img, export_glb, azimuth?} to run in this one process: the model "
+             "is loaded and the input voxelised once for all of them.",
+    )
+    parser.add_argument(
+        "--export",
+        choices=["textured", "labels"],
+        default="textured",
+        help="textured (default) = UV-unwrapped glb with a baked texture; labels = one colour "
+             "per face, no UVs (all the split needs, and much faster to export).",
+    )
+    parser.add_argument(
+        "--recompute_vxz",
+        action="store_true",
+        help="Voxelise even if --input_vxz already holds a voxelisation newer than --glb.",
     )
     parser.add_argument(
         "--two_d_map",
@@ -647,19 +856,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if (not args.two_d_map) and args.transforms is None:
         parser.error("--transforms is required unless --two_d_map is set.")
-    item = {
-        "2d_map": args.two_d_map,
-        "glb": os.path.abspath(args.glb),
-        "input_vxz": os.path.abspath(args.input_vxz),
-        "img": os.path.abspath(args.img),
-        "export_glb": os.path.abspath(args.export_glb),
-        "blender_reuv": args.blender_reuv,
-        "rebake_texture_size": args.rebake_texture_size,
-        "azimuth": args.azimuth,
-        "legend_ckpt": os.path.abspath(args.legend_ckpt) if args.legend_ckpt else None,
-        "legend": os.path.abspath(args.legend) if args.legend else None,
-        "img2": os.path.abspath(args.img2) if args.img2 else None,
-    }
-    if not args.two_d_map:
-        item["transforms"] = os.path.abspath(args.transforms)
-    inference(os.path.abspath(args.ckpt_path), item)
+    if not args.items and (args.img is None or args.export_glb is None):
+        parser.error("--img and --export_glb are required unless --items is given.")
+    inference(os.path.abspath(args.ckpt_path), items_from_args(args))

@@ -65,6 +65,10 @@ DEFAULT_CONDITION = "surface"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_FRAGMENT_SHARE = 0.01
 DEFAULT_REDRAWS = 2
+# What each full_seg sample writes: labels = one colour per face (all the split reads;
+# skips the UV unwrap and 4K bake), textured = the original UV-unwrapped glb.
+SAMPLE_EXPORT_MODES = ("labels", "textured")
+DEFAULT_SAMPLE_EXPORT = "labels"
 DEFAULT_HOLOPART_LARGE = "score"   # escape | always | score; see hybrid_complete.py
 HOLOPART_LARGE_MODES = ("escape", "always", "score")
 DEFAULT_REFINE = "off"             # masks: cut a voted unit where its own masks name a patch differently
@@ -139,6 +143,7 @@ class PipelineOptions:
     """
     unassigned_to: str | None = DEFAULT_UNASSIGNED_TO
     samples: int = DEFAULT_SAMPLES
+    sample_export: str = DEFAULT_SAMPLE_EXPORT
     azimuth: float = DEFAULT_AZIMUTH
     azimuth_jitter: float = DEFAULT_AZIMUTH_JITTER
     granularity: str = DEFAULT_GRANULARITY
@@ -234,6 +239,7 @@ class PipelineOptions:
         """kwargs for segment_parts.segment_parts, minus glb / prompts / out_glb."""
         return {
             "samples": self.samples,
+            "sample_export": self.sample_export,
             "azimuth": self.azimuth,
             "azimuth_jitter": self.azimuth_jitter,
             "color_tol": self.color_tol,
@@ -289,7 +295,7 @@ class PipelineOptions:
 
     def merge_kwargs(self):
         """kwargs for merge_parts.merge_parts, minus glb / prompts / split_dir / out_glb."""
-        skip = {"samples", "azimuth", "azimuth_jitter", "color_tol",
+        skip = {"samples", "sample_export", "azimuth", "azimuth_jitter", "color_tol",
                 "granularity", "min_atom_faces", "mirror", "auto_prompts", "mode"}
         return {k: v for k, v in self.segment_kwargs().items() if k not in skip}
 
@@ -299,6 +305,8 @@ class PipelineOptions:
         known = {item.name for item in fields(cls)}
         payload = dict(data)
         kwargs = {}
+        if payload.get("sample_export") is not None and payload["sample_export"] not in SAMPLE_EXPORT_MODES:
+            raise ValueError(f"sample_export must be one of {SAMPLE_EXPORT_MODES}, got {payload['sample_export']!r}")
         if payload.get("assign") is not None and payload["assign"] not in ASSIGN_MODES:
             raise ValueError(f"assign must be one of {ASSIGN_MODES}, got {payload['assign']!r}")
         if "rank_model" in payload and payload.get("rank_model") in ("", "string", None):
@@ -333,6 +341,7 @@ class PipelineOptions:
                 else getattr(args, "unassigned_to", DEFAULT_UNASSIGNED_TO)
             ),
             samples=getattr(args, "samples", DEFAULT_SAMPLES),
+            sample_export=getattr(args, "sample_export", DEFAULT_SAMPLE_EXPORT),
             azimuth=getattr(args, "azimuth", DEFAULT_AZIMUTH),
             azimuth_jitter=getattr(args, "azimuth_jitter", DEFAULT_AZIMUTH_JITTER),
             granularity=getattr(args, "granularity", DEFAULT_GRANULARITY),
@@ -499,6 +508,9 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
                         help="SAM3 v3 bank.pt. Empty = raw SAM3.")
     parser.add_argument("--no_concept_bank", action="store_true",
                         help="Disable the v3 bank and fall back to raw SAM3 scores")
+    parser.add_argument("--sample_export", default=DEFAULT_SAMPLE_EXPORT, choices=SAMPLE_EXPORT_MODES,
+                        help="labels (default) = full_seg samples carry one colour per face, "
+                             "no UV unwrap or bake; textured = the original textured glb")
     parser.add_argument("--assign", default=DEFAULT_ASSIGN, choices=ASSIGN_MODES,
                         help="paint = v3 score-threshold overlay; rank = overlay edited by the "
                              "EASE Mask RankGNN; auto = rank unless it deletes a prompt")

@@ -396,6 +396,12 @@ python segment_api.py \
   且可见面多数票明确指向另一个部件时，整块换名（块内不切、背面的块不动）。`refine` 是旧流程：
   逐像素回写可见面、投票接缝带、把游离小岛判给包围它的部件——正面和引导图更贴，但碎块数是
   `stain` 的 3–5 倍。`finetune/split_bench.py` 在 ext_bench 资产上对三者做无 GT 的量化对比。
+- `--sample_export labels|textured`（默认 `labels`，2026-09-30 起）：full_seg 样本只导出每面一个颜色，
+  不再展 UV、烘 4K 贴图。求交、平涂、投票读的本来就是面心颜色，输出不变；样本文件从 17 MB 降到 5 MB。
+  `textured` 恢复原来的带贴图样本（`refine=masks` 或调试时看样本贴图用）。
+- 样本改为批量：7 个样本在一个 `inference_full.py` 进程里跑（`--items` JSON 列表），模型加载一次、
+  输入体素化一次（`work_dir/input.vxz`，按模型时间戳复用）。三个外部资产实测 14 / 20 / 18 分钟 →
+  7 / 10 / 6 分钟（关修复、关贴图）；每次流采样本身只有 3 秒，省下的是重复加载、重复体素化和 UV 烘焙。
 - `--no_v6`：退回 base 2D-map 权重。默认用 `ckpt/full_seg_v6.ckpt`（轨迹监督 LoRA 已合并进去）；
   `--no_sam` 或显式 `--ckpt` 时它本来就不生效。
 - `--no_sam`：完全跳过 SAM3，用无提示 full_seg 权重在普通渲染图上分割（部件无命名，按颜色聚类）。

@@ -58,6 +58,7 @@ from merge_parts import (
 from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public contract
     DEFAULT_AZIMUTH, DEFAULT_AZIMUTH_JITTER, DEFAULT_COMPLETE, DEFAULT_CONCEPT_BANK,
     DEFAULT_ASSIGN, DEFAULT_RANK_MODEL, DEFAULT_RANK_DROP, DEFAULT_RANK_ADD,
+    DEFAULT_SAMPLE_EXPORT,
     DEFAULT_CONDITION, DEFAULT_FLAT_PAINT, DEFAULT_GRANULARITY, DEFAULT_MERGE,
     DEFAULT_PROMPTS, DEFAULT_UNASSIGNED_TO,
     DEFAULT_FRAGMENT_SHARE, DEFAULT_MIN_AREA_SHARE, DEFAULT_MIRROR, DEFAULT_OCTREE_RESOLUTION, DEFAULT_RADIUS,
@@ -107,6 +108,7 @@ def segment_parts(
     out_glb,
     work_dir=None,
     samples=DEFAULT_SAMPLES,
+    sample_export=DEFAULT_SAMPLE_EXPORT,
     azimuth=DEFAULT_AZIMUTH,
     azimuth_jitter=DEFAULT_AZIMUTH_JITTER,
     ckpt=None,
@@ -249,35 +251,58 @@ def segment_parts(
 
     azimuths = sample_azimuths(samples, azimuth, azimuth_jitter)
 
-    def full_seg(index):
-        """One flow-model sample. Each costs a full run, so a rerun picks up where it stopped."""
+    def sample_paths(index):
         sample_dir = os.path.join(work_dir, f"sample_{index:02d}")
         os.makedirs(sample_dir, exist_ok=True)
-        seg_glb = os.path.join(sample_dir, "seg.glb")
         # Keyed by the conditioning angle, not just the slot: --azimuth_jitter changes
         # which view each slot holds, and silently reusing the old one would compare two
         # settings that never actually differed.
-        stamp = os.path.join(sample_dir, "azimuth.json")
-        if reuse and os.path.exists(seg_glb) and sample_is_current(stamp, azimuths[index]):
-            print(f"[split] reusing full_seg sample {index + 1}/{samples} ({seg_glb})")
-            return seg_glb
-        print(f"[split] full_seg sample {index + 1}/{samples}, azimuth {azimuths[index]:g} ...")
-        _run([
-            py_self, os.path.join(ROOT, "inference_full.py"),
-            "--ckpt_path", ckpt, "--glb", glb,
-            "--input_vxz", os.path.join(sample_dir, "input.vxz"),
-            "--img", os.path.join(sample_dir, "render.png"),
-            "--export_glb", seg_glb,
-            "--transforms", transforms, "--azimuth", azimuths[index],
-        ])
-        with open(stamp, "w", encoding="utf-8") as handle:
-            json.dump({"azimuth": azimuths[index]}, handle)
-        return seg_glb
+        return sample_dir, os.path.join(sample_dir, "seg.glb"), os.path.join(sample_dir, "azimuth.json")
+
+    def full_seg(indices):
+        """Flow-model samples for these slots, in ONE inference_full.py process.
+
+        The model is loaded and the input voxelised once for the whole batch (they used to
+        be redone per sample); the voxelisation is shared through work_dir/input.vxz. A
+        rerun picks up where it stopped: finished slots are reused, the rest are batched.
+        """
+        indices = list(indices)
+        todo = []
+        for index in indices:
+            _, seg_glb, stamp = sample_paths(index)
+            if reuse and os.path.exists(seg_glb) and sample_is_current(stamp, azimuths[index]):
+                print(f"[split] reusing full_seg sample {index + 1}/{samples} ({seg_glb})")
+            else:
+                todo.append(index)
+        if todo:
+            print(f"[split] full_seg samples {', '.join(str(i + 1) for i in todo)}/{samples} "
+                  f"in one process, azimuths {', '.join(f'{azimuths[i]:g}' for i in todo)}, "
+                  f"export={sample_export} ...")
+            items = []
+            for index in todo:
+                sample_dir, seg_glb, _ = sample_paths(index)
+                items.append({"img": os.path.join(sample_dir, "render.png"),
+                              "export_glb": seg_glb, "azimuth": azimuths[index]})
+            items_json = os.path.join(work_dir, f"samples_{todo[0]:02d}_{todo[-1]:02d}.json")
+            with open(items_json, "w", encoding="utf-8") as handle:
+                json.dump(items, handle)
+            _run([
+                py_self, os.path.join(ROOT, "inference_full.py"),
+                "--ckpt_path", ckpt, "--glb", glb,
+                "--input_vxz", os.path.join(work_dir, "input.vxz"),
+                "--transforms", transforms,
+                "--items", items_json, "--export", sample_export,
+            ])
+            for index in todo:
+                _, _, stamp = sample_paths(index)
+                with open(stamp, "w", encoding="utf-8") as handle:
+                    json.dump({"azimuth": azimuths[index]}, handle)
+        return [sample_paths(index)[1] for index in indices]
 
     # Sample 0 first, on its own: it is the split's reference mesh and also the source of
     # the temporary flat colour, so the guidance overlays can be drawn -- and looked at --
     # before paying for the remaining samples.
-    sample_glbs = [full_seg(0)]
+    sample_glbs = full_seg([0])
     if propose:
         from auto_prompts import propose_prompts
 
@@ -300,7 +325,7 @@ def segment_parts(
             py_sam3, sam3_model, sam3_threshold, concept_bank, flat_paint, reuse,
             require_masks=strict_parts, assign=assign, rank_model=rank_model,
             rank_drop=rank_drop, rank_add=rank_add)
-    sample_glbs += [full_seg(index) for index in range(1, samples)]
+    sample_glbs += full_seg(range(1, samples))
 
     print(f"[split] intersecting {samples} partitions into atoms ...")
     reference, atoms, report = meet_samples(sample_glbs, color_tol, min_atom_faces, mirror)

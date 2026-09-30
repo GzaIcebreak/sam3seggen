@@ -36,8 +36,12 @@ def load_single_mesh(path):
 
 
 def face_base_colors(mesh):
-    """Base colour per face, read at the face's UV centroid."""
+    """Base colour per face: the face colour of a colour-only glb (inference_full.py
+    --export labels, whose vertices are un-shared so each face keeps its own colour), else
+    the texture read at the face's UV centroid."""
     visual = mesh.visual
+    if isinstance(visual, trimesh.visual.ColorVisuals):
+        return np.asarray(visual.face_colors)[:, :3].astype(np.int16)
     if not isinstance(visual, trimesh.visual.TextureVisuals) or visual.uv is None:
         raise SystemExit("segmentation glb has no UV texture to read part colours from")
     image = visual.material.baseColorTexture
