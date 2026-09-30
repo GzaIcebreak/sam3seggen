@@ -80,15 +80,29 @@ DEFAULT_SEED = 42
 DEFAULT_TEXTURE_SIZE = 2048
 DEFAULT_MIN_RECALL = 0.5
 
-DEFAULT_CONCEPT_BANK = os.environ.get(
-    "SEGVIGEN_CONCEPT_BANK", "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt")
+def _first_existing(env, *candidates):
+    """Env override wins, else the first candidate on this box, else the first candidate."""
+    return os.environ.get(env) or next((p for p in candidates if os.path.exists(p)), candidates[0])
+
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Concept bank: v6 (5928 training objects, min_count 5; HF Zaun1996/sam3-concept-bank v6_all/bank.pt)
+# when installed, else the v3 bank this box shipped with.
+DEFAULT_CONCEPT_BANK = _first_existing(
+    "SEGVIGEN_CONCEPT_BANK",
+    os.path.join(_ROOT, "weights", "concept_bank_v6", "bank.pt"),
+    "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt")
 # How the per-view SAM3 masks become one disjoint map (sam3_multiview.py): paint = the v3
 # score-threshold overlay; rank = that overlay edited by the EASE Mask RankGNN (drop a mask
 # it scores below rank_drop, add one it scores at least rank_add); auto = rank unless the
 # ranker deletes a prompt outright. rank/auto fall back to paint when no ranker is installed.
 ASSIGN_MODES = ("paint", "rank", "auto")
 DEFAULT_ASSIGN = os.environ.get("SEGVIGEN_ASSIGN", "paint")
-DEFAULT_RANK_MODEL = os.environ.get("SEGVIGEN_RANK_MODEL", "")
+DEFAULT_RANK_MODEL = _first_existing(
+    "SEGVIGEN_RANK_MODEL",
+    os.path.join(_ROOT, "weights", "mask_rank_v6", "rank_ease_mc5_epoch6.pt"))
+if not os.path.exists(DEFAULT_RANK_MODEL):
+    DEFAULT_RANK_MODEL = ""   # no ranker installed: assign=rank/auto fall back to paint
 DEFAULT_RANK_DROP = 0.2
 DEFAULT_RANK_ADD = 0.9
 DEFAULT_PY_XPART = os.environ.get(

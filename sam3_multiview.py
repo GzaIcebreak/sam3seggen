@@ -81,8 +81,10 @@ def main():
     parser.add_argument("--model", default=DEFAULT_SAM3)
     parser.add_argument("--threshold", type=float, default=None,
                         help="Score gate. Default 0.4 with the concept bank, 0.3 without.")
-    parser.add_argument("--concept_bank", default=os.environ.get(
-        "SEGVIGEN_CONCEPT_BANK", "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt"),
+    parser.add_argument("--concept_bank", default=os.environ.get("SEGVIGEN_CONCEPT_BANK") or next(
+        (p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "concept_bank_v6", "bank.pt"),
+                     "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt") if os.path.exists(p)),
+        "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt"),
                         help="v3 bank.pt; the maps.png stain. Empty string = raw SAM3.")
     parser.add_argument("--raw", action="store_true",
                         help="Keep overlapping unions instead of the v3 smallest-first overlay")

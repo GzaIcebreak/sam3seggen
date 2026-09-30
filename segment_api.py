@@ -93,11 +93,13 @@ def _weights_default(env, *candidates):
 
 DEFAULT_CONCEPT_BANK = _weights_default(
     "SEGVIGEN_CONCEPT_BANK",
+    os.path.join(ROOT, "weights", "concept_bank_v6", "bank.pt"),
     os.path.join(ROOT, "weights", "concept_bank_v3", "bank.pt"),
     "/root/autodl-tmp/datasets/concept_bank_v3/bank.pt",
 )
 DEFAULT_RANK_MODEL = _weights_default(
     "SEGVIGEN_RANK_MODEL",
+    os.path.join(ROOT, "weights", "mask_rank_v6", "rank_ease_mc5_epoch6.pt"),
     os.path.join(ROOT, "weights", "mask_rank_v3", "rank_ease_epoch8.pt"),
     "/root/autodl-tmp/runs/mask_rank_v3/ease/rank_epoch8.pt",
 )
