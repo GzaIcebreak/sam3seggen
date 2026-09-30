@@ -426,6 +426,14 @@ python segment_api.py \
 - 条件图预渲染：7 个样本只有 5 个不同方位角，`prerender_conditions` 在一个 Blender 场景里一次渲染完再分发，
   拆分阶段 317 s → 158 s（机器人）。
 - 无贴图模型（机器人）整条补全任务 1206 s → 592 s（不再烘焙）。
+- 补全阶段（2026-09-30 第二轮）：
+  - HoloPart 每件的 pymeshlab 减面（~15 s）换成 CuMesh GPU 减面 + TRELLIS.2 的清理流程（~0.3 s），
+    解码分块 20k → 100k 点；机器人 7 件 161 s → 43 s。批量扩散（`--batch_size 7`）实测不省时间（GPU 已满载），保持 1。
+  - X-Part 构建模型时跳过随机初始化（权重随后被严格 `load_state_dict` 覆盖，2638 个张量逐位一致），加载 37 s → 9 s；
+    小碎片归并改为一棵 KD 树（结果逐字节一致），30 s → <1 s。
+  - trimesh 读入再复制后会丢掉 JPEG 格式，导出时把 8K 贴图重编码成 23 MB PNG（每张 ~10 s）；
+    `glb_images.keep_jpeg` 在 parts.glb、boxes.glb、补全件导出前恢复。
+  - 整任务（拆分 + 补全 + 贴图）：机器人 592 s → 341 s，飞机 1014 s → 446 s。
 - `--no_v6`：退回 base 2D-map 权重。默认用 `ckpt/full_seg_v6.ckpt`（轨迹监督 LoRA 已合并进去）；
   `--no_sam` 或显式 `--ckpt` 时它本来就不生效。
 - `--no_sam`：完全跳过 SAM3，用无提示 full_seg 权重在普通渲染图上分割（部件无命名，按颜色聚类）。

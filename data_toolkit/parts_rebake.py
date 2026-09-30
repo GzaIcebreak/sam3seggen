@@ -1028,29 +1028,10 @@ def _textured_source(source_glb):
     if not isinstance(material, PBRMaterial) or material.baseColorTexture is None:
         return None
     # trimesh drops the PIL format on load and would re-encode JPEG textures as PNG (8K: ~23 MB each)
-    if _glb_image_mimes(source_glb) == {"image/jpeg"}:
-        for key in ("baseColorTexture", "metallicRoughnessTexture", "normalTexture",
-                    "emissiveTexture", "occlusionTexture"):
-            image = getattr(material, key, None)
-            if image is not None and getattr(image, "format", None) is None:
-                image.format = "JPEG"
+    from glb_images import keep_jpeg
+
+    keep_jpeg([material], source_glb)
     return mesh, material
-
-
-def _glb_image_mimes(path):
-    """Set of image mime types declared in a .glb's JSON chunk (empty for other files)."""
-    import struct
-
-    try:
-        with open(path, "rb") as f:
-            header = f.read(20)
-            if header[:4] != b"glTF":
-                return set()
-            length = struct.unpack("<I", header[12:16])[0]
-            tree = json.loads(f.read(length))
-    except (OSError, ValueError):
-        return set()
-    return {image.get("mimeType") for image in tree.get("images", [])}
 
 
 def _weld_corners(faces, corner_uv, texel):

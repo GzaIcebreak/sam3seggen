@@ -41,6 +41,7 @@ Run with the X-Part venv (see --xpart_root); nothing here imports SegviGen.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -217,13 +218,36 @@ def fold_small_pieces(pieces, min_area_share=DEFAULT_MIN_AREA_SHARE,
             f"every component is below --min_area_share {min_area_share}; lower it")
 
     groups = {index: [pieces[index][1]] for index in keep}
-    trees = {index: cKDTree(np.asarray(pieces[index][1].vertices)) for index in keep}
+    # One tree per candidate set (all kept pieces, or one part's) instead of one query per
+    # kept piece: 30 s -> under a second on the plane (77 slivers x 14 pieces). The
+    # nearest piece is the owner of the nearest vertex; on an exact tie (a sliver touching
+    # two pieces) the first candidate wins, as with the per-piece min() it replaces.
+    forests = {}
+
+    def forest(candidates):
+        key = tuple(candidates)
+        if key not in forests:
+            points = [np.asarray(pieces[i][1].vertices) for i in candidates]
+            owner = np.concatenate([np.full(len(p), k) for k, p in enumerate(points)])
+            forests[key] = (cKDTree(np.concatenate(points)), owner)
+        return forests[key]
+
+    def nearest(vertices, candidates):
+        tree, owner = forest(candidates)
+        dist, idx = tree.query(vertices)
+        best = float(dist.min())
+        tied = set()
+        for point in vertices[dist <= best]:
+            for hit in tree.query_ball_point(point, best * (1 + 1e-9) + 1e-12):
+                tied.add(int(owner[hit]))
+        return candidates[min(tied)] if tied else candidates[int(owner[idx[int(dist.argmin())]])]
+
     for index, (name, piece) in enumerate(pieces):
         if index in groups:
             continue
         vertices = np.asarray(piece.vertices)
         own = [i for i in keep if pieces[i][0] == name] if fold_within_part else []
-        target = min(own or keep, key=lambda i: float(trees[i].query(vertices)[0].min()))
+        target = nearest(vertices, own or keep)
         print(f"  {name} component at {piece.area / total_area:.2%} of the surface is too "
               f"small to generate; folded into the {pieces[target][0]} next to it")
         groups[target].append(piece)
@@ -366,7 +390,32 @@ def part_surface_condition(surfaces, centre, scale, num_points=XPART_CONDITION_P
     return np.stack(samples).astype(np.float32)
 
 
-def load_pipeline(model_path):
+_RANDOM_INITS = ("uniform_", "normal_", "trunc_normal_", "kaiming_uniform_", "kaiming_normal_",
+                 "xavier_uniform_", "xavier_normal_", "orthogonal_")
+
+
+@contextlib.contextmanager
+def no_random_init():
+    """Make torch.nn.init's random fills no-ops while modules are built.
+
+    Every parameter X-Part builds is then overwritten by a strict load_state_dict, so the
+    random fill is pure cost (21 of the 38 s load). Deterministic fills (zeros_, ones_,
+    constant_) are left alone.
+    """
+    import torch
+
+    saved = {name: getattr(torch.nn.init, name) for name in _RANDOM_INITS
+             if hasattr(torch.nn.init, name)}
+    for name in saved:
+        setattr(torch.nn.init, name, lambda tensor, *args, **kwargs: tensor)
+    try:
+        yield
+    finally:
+        for name, fn in saved.items():
+            setattr(torch.nn.init, name, fn)
+
+
+def load_pipeline(model_path, skip_init=True):
     """X-Part's pipeline without the P3-SAM box predictor it builds unconditionally.
 
     That predictor is the part of X-Part we are replacing: it downloads facebook/sonata
@@ -392,8 +441,9 @@ def load_pipeline(model_path):
 
     partformer_pipeline.instantiate_from_config = skip_box_predictor
     try:
-        return partformer_pipeline.PartFormerPipeline.from_pretrained(
-            model_path=model_path, verbose=True)
+        with (no_random_init() if skip_init else contextlib.nullcontext()):
+            return partformer_pipeline.PartFormerPipeline.from_pretrained(
+                model_path=model_path, verbose=True)
     finally:
         partformer_pipeline.instantiate_from_config = original
 
@@ -495,6 +545,9 @@ def main():
         open_instances.add_geometry(surface, geom_name=f"{index:02d}_{row['name']}")
     open_instances.export(os.path.join(out_dir, "open_instances.glb"))
 
+    from glb_images import keep_jpeg, mesh_materials
+
+    keep_jpeg(mesh_materials(source), args.glb)   # the preview re-encoded 8K JPEGs as PNG (21 s)
     preview = trimesh.Scene()
     preview.add_geometry(source)
     for box in boxes:

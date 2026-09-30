@@ -145,6 +145,11 @@ def export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
         print(f"  {dropped} source faces carried no label and were left out")
     out_dir = os.path.dirname(os.path.abspath(out_glb)) or "."
     os.makedirs(out_dir, exist_ok=True)
+    # submesh() copied the texture and PIL copies drop their format: without this the
+    # source 8K JPEGs are re-encoded as ~23 MB PNGs (~10 s each)
+    from glb_images import keep_jpeg, mesh_materials
+
+    keep_jpeg(mesh_materials(scene), source_glb)
     scene.export(out_glb)
     with open(os.path.join(out_dir, "parts.json"), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, ensure_ascii=False, indent=2)

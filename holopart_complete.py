@@ -26,6 +26,36 @@ DEFAULT_HOLOPART_WEIGHTS = os.environ.get(
     "/root/autodl-tmp/HoloPart/pretrained_weights/HoloPart")
 
 
+def _cumesh_clean(mesh):
+    mesh.remove_duplicate_faces()
+    mesh.repair_non_manifold_edges()
+    mesh.remove_small_connected_components(1e-5)
+    mesh.fill_holes(max_hole_perimeter=3e-2)
+
+
+def cumesh_simplify(mesh, n_faces):
+    """GPU quadric simplification with TRELLIS.2's clean-up (o_voxel.postprocess.to_glb).
+
+    Takes HoloPart's normalised DMC mesh (about [-1, 1]), so the absolute clean-up
+    tolerances mean the same thing for every part.
+    """
+    import torch
+    import cumesh
+
+    welded = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.faces), process=False)
+    welded.merge_vertices()
+    cm = cumesh.CuMesh()
+    cm.init(torch.tensor(np.asarray(welded.vertices), dtype=torch.float32, device="cuda"),
+            torch.tensor(np.asarray(welded.faces), dtype=torch.int32, device="cuda"))
+    if cm.num_faces > 3 * n_faces:
+        cm.simplify(3 * n_faces)
+    _cumesh_clean(cm)
+    cm.simplify(n_faces)
+    _cumesh_clean(cm)
+    vertices, faces = cm.read()
+    return trimesh.Trimesh(vertices.cpu().numpy(), faces.cpu().numpy())
+
+
 def instance_sort_key(name):
     prefix = str(name).split("_", 1)[0]
     return (int(prefix), name) if prefix.isdigit() else (10**9, name)
@@ -55,11 +85,14 @@ def main():
     parser.add_argument("--num_inference_steps", type=int, default=25)
     parser.add_argument("--guidance_scale", type=float, default=3.5)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_chunks", type=int, default=20000)
+    parser.add_argument("--num_chunks", type=int, default=100000,
+                        help="decoder query points per call; 20000 made 1178 calls on the robot (17 s), 100000 makes 235 (10 s) for +0.8 GB")
     parser.add_argument("--max_faces", type=int, default=200000,
                         help="HoloPart's own script decimates every solid to 10,000 faces; "
                              "that flattens a 25%-of-the-model breastplate to a smooth shell. "
                              "Its marching cubes run at 505^3, so keep up to this many.")
+    parser.add_argument("--simplify", choices=("cumesh", "pymeshlab"), default="cumesh",
+                        help="cumesh: GPU, ~0.3 s per solid; pymeshlab: HoloPart's own, ~15 s")
     parser.add_argument("--only", action="append", default=[], metavar="NODE",
                         help="Generate only these instances (repeatable). Every instance "
                              "still describes the whole shape HoloPart conditions on.")
@@ -82,8 +115,17 @@ def main():
 
     # run_holopart calls simplify_mesh(mesh, 10000) from its module globals; raise the cap.
     original_simplify = inference_holopart.simplify_mesh
-    inference_holopart.simplify_mesh = lambda mesh, n_faces: original_simplify(
-        mesh, max(int(n_faces), args.max_faces))
+
+    def simplify(mesh, n_faces):
+        n_faces = max(int(n_faces), args.max_faces)
+        if args.simplify == "cumesh":
+            try:
+                return cumesh_simplify(mesh, n_faces)
+            except (ImportError, RuntimeError) as exc:
+                print(f"[holopart] cumesh simplify failed ({exc}); falling back to pymeshlab")
+        return original_simplify(mesh, n_faces)
+
+    inference_holopart.simplify_mesh = simplify
 
     weights = os.path.abspath(args.weights)
     if not os.path.isdir(weights):
