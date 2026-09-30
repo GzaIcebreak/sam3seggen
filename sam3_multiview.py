@@ -114,6 +114,8 @@ def main():
         BANK_THRESHOLD if bank_path else PLAIN_THRESHOLD)
 
     assign, rank_model = args.assign, args.rank_model
+    if assign == "paint":
+        rank_model = None   # the plain overlay never consults the ranker, even if one is configured
     if assign in ("rank", "auto"):
         if not rank_model or not os.path.exists(rank_model):
             print(f"rank model not found ({rank_model}); painting with the plain overlay")
