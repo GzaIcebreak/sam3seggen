@@ -464,8 +464,8 @@ def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
     """Cut the reference mesh by a face label array and write one node per label.
 
     export_from="source" cuts the source model itself (labels carried over from the
-    remesh, its own texture kept) and falls back to the remesh + bake when the source is
-    not one textured mesh.
+    remesh, its own texture or flat material kept) and falls back to the remesh + bake
+    when the source is several meshes.
     """
     if export_from == "source" and with_texture and source_glb:
         from source_export import export_from_source

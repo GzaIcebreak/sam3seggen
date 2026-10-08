@@ -131,6 +131,15 @@ def bank_concepts(py_sam3, bank_path, cache_dir):
         return [line.strip() for line in handle if line.strip()]
 
 
+def drop_whole_words(parts, candidates, whole=DEFAULT_WHOLE):
+    """(kept, dropped): a 'part' whose mask covers `whole` of the silhouette names the
+    object, not a part of it -- voted as a part it swallows the remainder (a sword's
+    'crossbar' at 83% left nothing for the blade)."""
+    area = {row["concept"]: float(row["area"]) for row in candidates}
+    dropped = [name for name in parts if area.get(name, 0.0) >= whole]
+    return [name for name in parts if name not in dropped], dropped
+
+
 def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     flat_paint="auto", reuse=True, radius=2.0, resolution=512,
                     azimuths=AUTO_AZIMUTHS, elevations=AUTO_ELEVATIONS,
@@ -174,23 +183,28 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
         with open(os.path.join(prompt_dir, "cameras.json"), encoding="utf-8") as handle:
             views = json.load(handle)["views"]
         images = [os.path.join(prompt_dir, view["image"]) for view in views][::2][:4]
-        print(f"[smart] asking Kimi to review {len(proposal['candidates'])} candidate words ...")
+        print(f"[smart] asking the VLM to review {len(proposal['candidates'])} candidate words ...")
         proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
         try:
             chosen = kimi_select(images, proposal["candidates"], concepts)
         except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
             proposal["kimi_error"] = f"{type(error).__name__}: {error}"
-            print(f"[smart] Kimi failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
+            print(f"[smart] VLM failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
         else:
             proposal["kimi"] = chosen
-            print(f"[smart] Kimi: object={chosen['object']!r} main={chosen['main']!r} "
-                  f"parts={chosen['parts']}" + (f" (dropped, not in bank: {chosen['dropped']})"
-                                                if chosen["dropped"] else ""))
+            print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
+                  f"main={chosen['main']!r} parts={chosen['parts']}"
+                  + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
+            chosen["parts"], whole_words = drop_whole_words(chosen["parts"], proposal["candidates"])
+            if whole_words:
+                chosen["dropped_whole"] = whole_words
+                print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
+                      f"or more, so it names the object rather than a part")
             if len(chosen["parts"]) >= 2:
                 proposal["parts"] = chosen["parts"][:max_parts]
                 proposal["main"] = chosen["main"] or proposal["main"]
             else:
-                print("[smart] Kimi returned fewer than two usable parts; keeping the rule-based pick")
+                print("[smart] VLM returned fewer than two usable parts; keeping the rule-based pick")
     prompts = list(proposal["parts"])
     main = proposal["main"]
     if main and main not in prompts:

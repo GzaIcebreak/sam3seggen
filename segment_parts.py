@@ -307,7 +307,7 @@ def segment_parts(
         from auto_prompts import propose_prompts
 
         print("[auto] no prompts; proposing part names from the concept bank"
-              + (" with Kimi review (智能分割模式) ..." if mode == "smart" else " ..."))
+              + (" with VLM review (智能分割模式) ..." if mode == "smart" else " ..."))
         proposed = propose_prompts(
             glb, work_dir, sample_glbs[0], py_sam3, sam3_model, concept_bank,
             flat_paint, reuse, radius, resolution, mode=mode)

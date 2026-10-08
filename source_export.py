@@ -79,7 +79,11 @@ def transfer_labels(remesh, remesh_labels, source, smooth_iterations=DEFAULT_SMO
 
 
 def load_single_textured(source_glb):
-    """The source as one textured Trimesh, or None when it is not that simple."""
+    """The source as one Trimesh (textured or flat-coloured), or None if it is several.
+
+    An untextured source is still worth cutting: the remesh thickens thin geometry (a
+    sword blade), which X-Part then rejects as a different shape from the source.
+    """
     scene = trimesh.load(source_glb, force="scene")
     if len(scene.geometry) != 1:
         return None
@@ -87,20 +91,17 @@ def load_single_textured(source_glb):
     node = scene.graph.geometry_nodes[next(iter(scene.geometry))][0]
     transform, _ = scene.graph.get(node)
     mesh.apply_transform(transform)
-    visual = getattr(mesh, "visual", None)
-    if getattr(visual, "uv", None) is None or getattr(visual, "material", None) is None:
-        return None
     return mesh
 
 
 def export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
                        smooth_iterations=DEFAULT_SMOOTH_ITERATIONS, step="[export]"):
-    """parts.json-style manifest, or None if the source is not a single textured mesh."""
+    """parts.json-style manifest, or None if the source is not a single mesh."""
     from data_toolkit.parts_rebake import LABEL_COLORS, load_single_mesh
 
     source = load_single_textured(source_glb)
     if source is None:
-        print(f"{step} source is not one textured mesh; exporting from the remesh instead")
+        print(f"{step} source is not one mesh; exporting from the remesh instead")
         return None
     remesh = load_single_mesh(mesh_path)
     remesh_labels = np.load(labels_npy)
@@ -118,9 +119,10 @@ def export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
           f"over from the remesh ({len(remesh.faces)} faces; frame {fit['frame']}, "
           f"scale {fit['scale']:.4f}, fit {fit['mean_distance']:.4f})")
 
-    texture = getattr(source.visual.material, "image", None)
+    material = getattr(source.visual, "material", None)
+    texture = getattr(material, "image", None)
     if texture is None:
-        texture = getattr(source.visual.material, "baseColorTexture", None)
+        texture = getattr(material, "baseColorTexture", None)
     texture_size = None if texture is None else int(max(texture.size))
     total_area = float(source.area)
     scene = trimesh.Scene()
