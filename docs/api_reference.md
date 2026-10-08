@@ -182,6 +182,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `GET` | `/jobs/{id}/complete` | `complete/xpart_parts.glb`，修复后的封闭实体，已烘贴图，节点名与 `parts.glb` 对齐 | `complete≠off`，烘焙完成后 |
 | `GET` | `/jobs/{id}/complete_raw` | 烘焙前的生成几何（看形状不看贴图） | 同上，早一步 |
 | `GET` | `/jobs/{id}/complete_decisions` | `decisions.json`：每个实例的评分和最终选择 | `complete=hybrid` |
+| `POST` | `/pipeline_guided` | **引导图一条龙**：`glb` + `guide`（引导图：该模型的渲染图，每个想拆的部件涂一种平色、黑底）+ 可选 `options`。不传文字提示词，由视觉大模型对照引导图命名（每种颜色块一个部件词，左右对称件共用一个词，最大的中心块作主体），SAM3 只测这几个词，后面拆分 → 修复 → 贴图与 `/pipeline` 相同；返回同样的 202 票据。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400。引导图保存在任务目录 `guide.<ext>`，`job.json` 的 `guide` 字段记录文件名，`work/auto_prompts.json` 的 `proposal.guide_image` 同 | 需要 VLM key |
 | `GET` | `/jobs/{id}/atoms` | `work/atoms.glb`，投票前的几何过分割原子 | 拆分之后 |
 | `GET` | `/jobs/{id}/report` | `work/vote_report.json`，逐单元投票表 | 有提示词且 `merge≠off` |
 | `GET` | `/jobs/{id}/guidance/{name}` | `work/guidance/*.png`，SAM3 掩码叠在渲染上的审阅图 | 有提示词 |

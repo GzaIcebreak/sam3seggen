@@ -32,6 +32,8 @@ import os
 import re
 import urllib.request
 
+from PIL import Image
+
 from data_toolkit.front_view import _env_or_dotenv, build_grid
 from auto_prompts import GENERIC_WORDS
 
@@ -109,15 +111,50 @@ def build_question(candidates):
     )
 
 
-def build_shortlist_question(vocabulary, max_parts=MAX_SHORTLIST):
+GUIDE_MIN_SHARE = 0.03   # a colour under this share of the guide's foreground is shading/anti-aliasing
+
+
+def guide_part_count(path, min_share=GUIDE_MIN_SHARE):
+    """How many flat colours the reference segmentation uses (background = transparent or
+    near-black). Each colour is one part the caller wants; left/right pairs may share a word."""
+    image = Image.open(path).convert("RGBA")
+    image.thumbnail((512, 512))
+    pixels = list(image.getdata())
+    fg = [(r, g, b) for r, g, b, a in pixels if a > 16 and max(r, g, b) > 40]
+    if not fg:
+        return 0
+    bins = {}
+    for r, g, b in fg:
+        key = (r // 48, g // 48, b // 48)
+        bins[key] = bins.get(key, 0) + 1
+    return sum(1 for count in bins.values() if count >= min_share * len(fg))
+
+
+def guide_instruction(colours):
+    plural = "" if colours == 1 else "s"
+    return (
+        f" The LAST tile is a reference segmentation of this same object drawn by the user: "
+        f"every flat colour patch is one part they want (roughly {colours} colour{plural}; "
+        "a colour may be reused on another part, and a left/right pair may be painted "
+        "differently); the background is black. Name exactly the parts the reference "
+        "separates: one vocabulary word per kind of part, where a left/right or front/back "
+        "pair of the same thing shares one word, and the largest central piece is the main "
+        "word. Do not add parts the reference does not colour separately, and do not merge "
+        "two separately coloured parts into one word."
+    )
+
+
+def build_shortlist_question(vocabulary, max_parts=MAX_SHORTLIST, guide_colours=None):
     """Ask for the object and its part words BEFORE any segmentation has run.
 
     Sweeping SAM3 over the whole bank (884 words x 8 views) took 6-12 minutes per job,
     half of the pipeline; the VLM can name the parts from the renders alone in seconds,
-    and SAM3 then only has to measure those few words."""
+    and SAM3 then only has to measure those few words. With `guide_colours` the user's
+    reference segmentation is attached as the last tile and sets the parts."""
     words = ", ".join(sorted(set(vocabulary)))
+    guide = guide_instruction(guide_colours) if guide_colours else ""
     return (
-        "These tiles are renders of ONE 3D object from different directions. "
+        "These tiles are renders of ONE 3D object from different directions." + guide + " "
         "Task: split this object into its natural parts for a 3D part library. "
         "Answer with ONLY a JSON object of this shape: "
         '{"object": "<what the object is, 1-3 words>", '
@@ -205,14 +242,19 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
 
 
 def kimi_shortlist(image_paths, vocabulary, api_key=None, base_url=None, model=None,
-                   timeout=300):
-    """Name object / main / parts from the renders alone, restricted to the bank vocabulary."""
-    return ask_vlm(image_paths, build_shortlist_question(vocabulary), vocabulary,
-                   api_key=api_key, base_url=base_url, model=model, timeout=timeout)
+                   timeout=300, guide_image=None):
+    """Name object / main / parts from the renders alone, restricted to the bank vocabulary.
+
+    `guide_image`: the user's reference segmentation (one flat colour per part); it is
+    shown to the model as the last tile and fixes which parts to name."""
+    colours = guide_part_count(guide_image) if guide_image else None
+    return ask_vlm(image_paths, build_shortlist_question(vocabulary, guide_colours=colours),
+                   vocabulary, api_key=api_key, base_url=base_url, model=model,
+                   timeout=timeout, guide_image=guide_image)
 
 
 def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
-            model=None, timeout=300):
+            model=None, timeout=300, guide_image=None):
     """Ask the VLM `question` about the renders. Raises on a missing key or an unusable reply.
 
     The reasoning models answer after thinking out loud; a reply cut off by max_tokens
@@ -228,7 +270,10 @@ def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
         if "moonshot" not in base_url:
             raise RuntimeError(f"set SEGVIGEN_VLM_MODEL: {base_url} does not advertise image support per model")
         model = resolve_model(api_key, base_url)
-    grid, _ = build_grid(list(image_paths)[:MAX_VIEWS])
+    tiles = list(image_paths)[:MAX_VIEWS]
+    if guide_image:
+        tiles = tiles[:MAX_VIEWS - 1] + [guide_image]
+    grid, _ = build_grid(tiles)
     buffer = io.BytesIO()
     grid.save(buffer, format="JPEG", quality=88)
     data_url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()

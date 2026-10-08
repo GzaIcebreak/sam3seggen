@@ -269,26 +269,35 @@ def _summarize_job(job_id: str, include_result=False) -> dict:
 
 def _record_job(job_id: str, filename: str) -> None:
     _current["job_id"] = job_id
-    payload = {
-        "job_id": job_id,
-        "filename": filename,
-        "started": time.time(),
-        "state": "running",
-    }
-    _write_json(os.path.join(JOBS_DIR, job_id, "job.json"), payload)
+    path = os.path.join(JOBS_DIR, job_id, "job.json")
+    # keep what enqueueing wrote (queued time, the guide image's name)
+    payload = {**(_read_json(path) or {}), "job_id": job_id, "filename": filename,
+               "started": time.time(), "state": "running"}
+    _write_json(path, payload)
     _write_json(os.path.join(JOBS_DIR, "current.json"), {"job_id": job_id})
 
 
-def _enqueue_job(upload: bytes, filename: str, options: dict) -> dict:
-    """Store the upload, mark the job queued, hand it to the worker; return the ticket."""
+def _enqueue_job(upload: bytes, filename: str, options: dict, guide=None) -> dict:
+    """Store the upload, mark the job queued, hand it to the worker; return the ticket.
+
+    `guide`: (filename, bytes) of a reference segmentation image; it is kept in the job
+    dir and its path handed to the pipeline as `guide_image`.
+    """
     job_id = uuid.uuid4().hex
     job = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job, exist_ok=True)
     with open(os.path.join(job, "input" + (os.path.splitext(filename)[1] or ".glb")), "wb") as file:
         file.write(upload)
-    _write_json(os.path.join(job, "job.json"), {
-        "job_id": job_id, "filename": filename, "queued": time.time(), "state": "queued",
-    })
+    record = {"job_id": job_id, "filename": filename, "queued": time.time(), "state": "queued"}
+    if guide is not None:
+        guide_name, guide_bytes = guide
+        ext = (os.path.splitext(guide_name)[1] or ".png").lower()
+        guide_path = os.path.join(job, "guide" + ext)
+        with open(guide_path, "wb") as file:
+            file.write(guide_bytes)
+        options = {**options, "guide_image": guide_path}
+        record["guide"] = os.path.basename(guide_path)
+    _write_json(os.path.join(job, "job.json"), record)
     with _pending_lock:
         _pending.append(job_id)
         position = len(_pending)
@@ -536,6 +545,47 @@ async def pipeline(
         raise HTTPException(400, f"bad option: {exc}")
     return _enqueue_job(await glb.read(), glb.filename or "input.glb",
                         {"prompts": prompts, **resolved.segment_kwargs()})
+
+
+@app.post("/pipeline_guided", status_code=202)
+async def pipeline_guided(
+    glb: UploadFile = File(..., description="The model to split and repair."),
+    guide: UploadFile = File(..., description="引导图: a render of this model with every "
+                             "wanted part painted one flat colour on a black background."),
+    options: OptionalStr = Form(
+        None,
+        description="Optional JSON object of PipelineOptions overrides, same as /pipeline."),
+) -> dict:
+    """One shot steered by a reference segmentation image instead of text prompts.
+
+    The guide is shown to the vision model next to the renders: every flat colour is one
+    part to name (a left/right pair shares a word), the largest central colour is the main
+    body. SAM3 then measures those words and the usual split -> repair -> texture follows.
+    Needs the smart-mode key (SEGVIGEN_VLM_API_KEY), like mode=smart.
+    """
+    overrides = {}
+    if options:
+        try:
+            overrides = json.loads(options)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, f"options must be a JSON object: {exc}")
+        if not isinstance(overrides, dict):
+            raise HTTPException(400, "options must be a JSON object")
+    merged = {**overrides, "mode": "smart"}
+    _check_switches(merged)
+    if not vlm_key_available():
+        raise HTTPException(400, "/pipeline_guided needs SEGVIGEN_VLM_API_KEY on the server "
+                                 "(env var or the repo .env file), like mode=smart")
+    try:
+        resolved = PipelineOptions.from_mapping(merged)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"bad option: {exc}")
+    guide_bytes = await guide.read()
+    if not guide_bytes:
+        raise HTTPException(400, "guide must be an image file")
+    return _enqueue_job(await glb.read(), glb.filename or "input.glb",
+                        {"prompts": "", **resolved.segment_kwargs()},
+                        guide=(guide.filename or "guide.png", guide_bytes))
 
 
 @app.get("/jobs/{job_id}/result")

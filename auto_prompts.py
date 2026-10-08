@@ -234,14 +234,16 @@ def drop_whole_words(parts, candidates, whole=DEFAULT_WHOLE_VLM):
 def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     flat_paint="auto", reuse=True, radius=2.0, resolution=512,
                     azimuths=AUTO_AZIMUTHS, elevations=AUTO_ELEVATIONS,
-                    max_parts=DEFAULT_MAX_PARTS, mode="auto"):
+                    max_parts=DEFAULT_MAX_PARTS, mode="auto", guide_image=None):
     """Render a view ring and pick the part names.
 
     mode="auto": ask SAM3 for every bank concept and pick by the rules above.
     mode="smart" (智能分割模式): the VLM first names the object and its parts from the
     renders (vocabulary = the bank), SAM3 measures just those words, and the ones it finds
     become the prompts; if the VLM fails or none of its words is found, fall back to the
-    full sweep with the VLM reviewing SAM3's candidates. Writes work_dir/auto_prompts.json.
+    full sweep with the VLM reviewing SAM3's candidates. `guide_image` (smart only): the
+    user's reference segmentation, one flat colour per wanted part, shown to the VLM so
+    the names follow it. Writes work_dir/auto_prompts.json.
     Returns {"prompts": [...],
     "unassigned_to": str | None, "proposal": {...}}; "prompts" is empty when nothing usable
     was recognised.
@@ -270,9 +272,10 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
         from smart_prompts import kimi_shortlist
 
         print(f"[smart] asking the VLM to name the object and its parts "
-              f"(vocabulary of {len(concepts)} bank words) ...")
+              f"(vocabulary of {len(concepts)} bank words"
+              + (", following the guide image" if guide_image else "") + ") ...")
         try:
-            chosen = kimi_shortlist(images, concepts)
+            chosen = kimi_shortlist(images, concepts, guide_image=guide_image)
         except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
             print(f"[smart] VLM failed ({type(error).__name__}: {str(error)[:160]}); "
                   "falling back to the full bank sweep")
@@ -352,6 +355,8 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     if main and main not in prompts:
         prompts.append(main)
     unassigned_to = main or (prompts[0] if prompts else None)
+    if guide_image:
+        proposal["guide_image"] = os.path.basename(guide_image)
     result = {"prompts": prompts, "unassigned_to": unassigned_to, "painted": painted,
               "proposal": proposal}
     with open(os.path.join(work_dir, "auto_prompts.json"), "w", encoding="utf-8") as handle:
