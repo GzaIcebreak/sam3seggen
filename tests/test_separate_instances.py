@@ -66,9 +66,10 @@ class ClusteredInstancesTest(unittest.TestCase):
 
 class JoinedInstancesTest(unittest.TestCase):
     def test_legs_joined_at_the_crotch_are_cut_in_two_by_position(self):
-        left = trimesh.creation.box(extents=(0.4, 0.4, 1.6)).apply_translation((-0.5, 0, 0))
-        right = trimesh.creation.box(extents=(0.4, 0.4, 1.6)).apply_translation((0.5, 0, 0))
-        bridge = trimesh.creation.box(extents=(1.0, 0.3, 0.2)).apply_translation((0, 0, 0.7))
+        # legs much taller than the pair is wide: the longest axis is the wrong one to cut
+        left = trimesh.creation.box(extents=(0.4, 0.4, 3.0)).apply_translation((-0.5, 0, 0))
+        right = trimesh.creation.box(extents=(0.4, 0.4, 3.0)).apply_translation((0.5, 0, 0))
+        bridge = trimesh.creation.box(extents=(1.0, 0.3, 0.3)).apply_translation((0, 0, 1.35))
         mesh = trimesh.util.concatenate([left, right, bridge])
         mesh.merge_vertices()
         labels = np.zeros(len(mesh.faces), dtype=int)

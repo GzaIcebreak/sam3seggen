@@ -563,15 +563,18 @@ def _cluster_components(components, centroids, gap):
 def _kmeans_split(points, weights, k, iterations=30, seed=0):
     """Area-weighted k-means on face centroids; returns k index arrays into `points`.
 
-    Seeds are spread along the longest axis so two legs split left/right rather than
-    top/bottom; Lloyd iterations then follow the geometry."""
+    Seeds are spread along the principal axis whose area profile has the deepest dip in
+    its middle: two legs joined at the crotch are taller than they are wide, so the
+    longest axis would cut them into feet and hips, while the profile across them has a
+    gap between the legs. Lloyd iterations then follow the geometry."""
     points = np.asarray(points, dtype=float)
     weights = np.asarray(weights, dtype=float)
     if k <= 1 or len(points) < k:
         return [np.arange(len(points))]
     centre = np.average(points, axis=0, weights=weights)
     spread = points - centre
-    axis = np.linalg.svd(spread * np.sqrt(weights)[:, None], full_matrices=False)[2][0]
+    axes = np.linalg.svd(spread * np.sqrt(weights)[:, None], full_matrices=False)[2]
+    axis = axes[int(np.argmin([_profile_dip(spread @ a, weights) for a in axes]))]
     order = np.argsort(spread @ axis)
     seeds = points[order[((np.arange(k) + 0.5) / k * (len(points) - 1)).astype(int)]].copy()
     assign = None
@@ -586,6 +589,18 @@ def _kmeans_split(points, weights, k, iterations=30, seed=0):
             if member.any():
                 seeds[j] = np.average(points[member], axis=0, weights=weights[member])
     return [np.flatnonzero(assign == j) for j in range(k)]
+
+
+def _profile_dip(coordinate, weights, bins=24):
+    """Lowest area bin in the central half of the profile over the median bin (0 = a clean
+    gap across this axis, 1 = no dip). Ties favour the axis with more spread."""
+    lo, hi = float(coordinate.min()), float(coordinate.max())
+    if hi - lo <= 1e-12:
+        return 2.0
+    hist = np.histogram(coordinate, bins=bins, range=(lo, hi), weights=weights)[0]
+    centre = hist[bins // 4: bins - bins // 4]
+    median = float(np.median(hist[hist > 0])) if (hist > 0).any() else 1.0
+    return float(centre.min() / max(median, 1e-12)) - 1e-3 * (hi - lo)
 
 
 def _merge_clusters(clusters, centroids, areas, total, min_share, wanted):
