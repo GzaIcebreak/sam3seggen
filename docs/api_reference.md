@@ -211,7 +211,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `allow_partial` | bool | `true` | 与上面相反的写法；两者同传时 `strict_parts` 优先 |
 | `reuse` | bool | `true` | 复用任务目录里已有的渲染和同提示词掩码（同一单内） |
 | `auto_prompts` | bool | `true` | 没传 `prompts` 时：SAM3 过一遍概念库 280 个词（8 视角，约 1 分钟），挑主体名 + 2–6 个互不重叠的部件名，再走正常投票。`merge=off` 时不提名 |
-| `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段把候选词和 4 张渲染图交给视觉大模型（任何 OpenAI 兼容接口；当前部署 Qwen `qwen3.8-max`，也可换 Kimi），由它判断物体类别、剔除不属于该物体的词、给出主体名和部件名；只保留概念库里有的词，形状词（plank、panel…）也不要。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400。Qwen 关闭思考时每次 2–4 秒 |
+| `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段把候选词和 4 张渲染图交给视觉大模型（任何 OpenAI 兼容接口；当前部署 Qwen `qwen3.8-max`，也可换 Kimi），由它判断物体类别、剔除不属于该物体的词、给出主体名和部件名；只保留概念库里有的词，形状词（plank、panel…）也不要；单块掩码盖住剪影 60% 以上的部件词当整体词丢弃（按最大连通块判，多实例的 `shelf` 不受影响）；主体名 + 1 个部件词即可采用。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400。Qwen 关闭思考时每次 2–4 秒 |
 
 ### 5.2 拆分（几何边界）
 
@@ -304,7 +304,8 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 |---|---|
 | `node` / `name` / `instance` | 实例（同名部件的独立连通块各是一个实例，如两只手）；`node` 形如 `08_part_03_body`，与 `complete_raw` 里的节点对应 |
 | `area_share` / `large` / `threshold` | 面积占比；是否算大件；用的候选阈值 |
-| `xpart` | X-Part 实体的指标：`cover`（开口面被覆盖比例）、`fit_p90`、`extra_p90`（多余几何）、`escape`（出框率）、`largest_shell`（最大连通壳面积占比） |
+| `xpart` | X-Part 实体的指标：`cover`（开口面被覆盖比例）、`fit_p90`、`extra_p90`（多余几何）、`escape`（出框率）、`largest_shell`（最大连通壳面积占比）、`intrusion`（切除后仍贴在别的部件开口面上的比例，部件互斥） |
+| `xpart_cut` / `holopart_cut` | 打分前从实体上切掉的“长回来的邻居”面积占比（小狗身体上的第二条尾巴和爪子） |
 | `q_xpart` | X-Part 得分 0–1 |
 | `candidate` | 是否低于阈值、跑了 HoloPart 对比 |
 | `holopart` / `q_holopart` | 候选实例才有 |

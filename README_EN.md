@@ -25,11 +25,15 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
   runs on the remesh, but the labels are carried over to the source's own faces and the
   parts are cut from it with their UVs and texture, no bake. The monk's hands went from
   1.3k to 5-7k faces; that is where the fingers were.
+- **Part exclusivity**: X-Part regrows a part's neighbours while closing it (the dog's body
+  came back with a second tail and four paws). Regions of a solid that sit on another part's
+  open surface while off their own are cut away and capped before scoring (only when the rim is
+  short); what remains discounts the score as `intrusion`.
 - **Repair picks its backend by score** (`--holopart_large score`, default): every X-Part
   solid is measured against its open surface (coverage x invented geometry x box escape x
-  biggest-shell share); low scorers get a HoloPart draw, the better one wins, and when both
-  are bad the open surface stays. Box escape alone let a 0%-escape blob through as the
-  tree trunk. HoloPart solids are no longer decimated to 10k faces
+  biggest-shell share x intrusion); low scorers get a HoloPart draw, the better one wins, and
+  when both are bad the open surface stays. Box escape alone let a 0%-escape blob through as
+  the tree trunk. HoloPart solids are no longer decimated to 10k faces
   (`holopart_complete --max_faces`).
 - **Tidy the pieces before prompting**: `--merge_gap` rejoins same-part pieces another part
   cut apart; `--fold_within_part` and `--part_min_area_share` stop small things on a big
