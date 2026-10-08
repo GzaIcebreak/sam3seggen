@@ -86,7 +86,7 @@ class JoinedInstancesTest(unittest.TestCase):
 class SeparateInTheQuestionAndReplyTest(unittest.TestCase):
     def test_guided_question_asks_for_separate_and_the_reply_keeps_only_parts(self):
         question = build_shortlist_question(["leg", "arm", "torso"], guide_colours=5)
-        self.assertIn('"separate"', question)
+        self.assertIn('"colours"', question)
         reply = ('{"object": "astronaut", "main": "torso", "parts": ["leg", "arm"], '
                  '"separate": {"leg": 2, "torso": 1, "wing": 2}}')
         parsed = parse_reply(reply, ["leg", "arm", "torso"])
@@ -95,6 +95,10 @@ class SeparateInTheQuestionAndReplyTest(unittest.TestCase):
                                      '"separate": ["leg"]}', ["leg", "torso"])["separate"], {"leg": 2})
         self.assertEqual(parse_reply('{"object":"x","main":"torso","parts":["leg"]}',
                                      ["leg", "torso"])["separate"], {})
+        colours = ('{"object":"astronaut","main":"torso","parts":["leg","arm","boot"], '
+                   '"colours": {"leg": 2, "arm": 1, "boot": "2", "torso": 1}}')
+        self.assertEqual(parse_reply(colours, ["leg", "arm", "boot", "torso"])["separate"],
+                         {"leg": 2, "boot": 2})
 
 
 if __name__ == "__main__":

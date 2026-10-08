@@ -140,11 +140,11 @@ def guide_instruction(colours):
         "separates: one vocabulary word per kind of part, where a left/right or front/back "
         "pair of the same thing shares one word, and the largest central piece is the main "
         "word. Do not add parts the reference does not colour separately, and do not merge "
-        "two separately coloured parts into one word. Also add a key \"separate\": an object "
-        "mapping each part word whose instances the reference paints in DIFFERENT colours to "
-        "how many such instances there are (a red left leg and a green right leg -> "
-        "{\"leg\": 2}), so they are exported as separate pieces; use {} when every instance "
-        "of a word shares one colour."
+        "two separately coloured parts into one word. Also add a key \"colours\": an object "
+        "with an entry for EVERY part word giving how many distinct colours the reference "
+        "uses for that kind of part (a red left leg and a green right leg -> \"leg\": 2; "
+        "both arms the same dark red -> \"arm\": 1). A count of 2 or more means those "
+        "instances are exported as separate pieces."
     )
 
 
@@ -234,6 +234,13 @@ def parse_reply(text, allowed, generic=()):
     raw_separate = data.get("separate") or {}
     if isinstance(raw_separate, list):
         raw_separate = {word: 2 for word in raw_separate}
+    # "colours": {word: n} for every part; n >= 2 means separately painted instances
+    for word, count in (data.get("colours") or {}).items():
+        try:
+            if int(count) >= 2:
+                raw_separate.setdefault(word, int(count))
+        except (TypeError, ValueError):
+            pass
     separate = {}
     for word, count in raw_separate.items():
         word = clean(word)
