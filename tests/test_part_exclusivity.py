@@ -4,8 +4,8 @@ import numpy as np
 import trimesh
 
 from auto_prompts import drop_whole_words, largest_blob_share, propose_from_masks
-from hybrid_complete import (OpenSurfaces, cap_loops, cull_intrusions, quality_score,
-                             solid_metrics)
+from hybrid_complete import (OpenSurfaces, cap_loops, cull_intrusions, drop_crumbs,
+                             quality_score, solid_metrics)
 
 
 def body_and_tail():
@@ -50,6 +50,17 @@ class CullIntrusionsTest(unittest.TestCase):
         self.assertAlmostEqual(quality_score(clean), 1.0)
         self.assertAlmostEqual(quality_score({**clean, "intrusion": 0.05}), 0.5)
         self.assertAlmostEqual(quality_score({**clean, "intrusion": 0.2}), 0.0)
+
+
+class DropCrumbsTest(unittest.TestCase):
+    def test_slivers_go_and_real_shells_stay(self):
+        big = trimesh.creation.box()
+        other = trimesh.creation.box(extents=(0.5, 0.5, 0.5)).apply_translation((2, 0, 0))
+        crumb = trimesh.creation.box(extents=(0.02, 0.02, 0.02)).apply_translation((0, 2, 0))
+        mesh = trimesh.util.concatenate([big, other, crumb])
+        self.assertEqual(len(mesh.split(only_watertight=False)), 3)
+        self.assertEqual(len(drop_crumbs(mesh).split(only_watertight=False)), 2)
+        self.assertIs(drop_crumbs(big), big)
 
 
 class CapLoopsTest(unittest.TestCase):

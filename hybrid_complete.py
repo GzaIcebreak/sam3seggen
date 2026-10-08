@@ -206,6 +206,7 @@ SCORE_SAMPLES = 20000
 INTRUSION_SCALE = 0.1      # this much residual intrusion zeroes the score
 INTRUSION_MAX_RIM = 1.0    # cut a region only when its rim is shorter than this x diagonal
 INTRUSION_MIN_FACES = 20
+INTRUSION_CRUMB = 0.005    # a shell under this share of the area after the cut is debris
 
 
 class OpenSurfaces:
@@ -323,9 +324,20 @@ def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
     culled.remove_unreferenced_vertices()
     new_edges = np.array([e for e in _boundary_edges(culled)
                           if tuple(sorted(e)) not in before], dtype=int).reshape(-1, 2)
-    culled = cap_loops(culled, _edge_loops(new_edges))
+    culled = drop_crumbs(cap_loops(culled, _edge_loops(new_edges)))
     share = float(solid.area_faces[remove].sum() / max(solid.area, 1e-12))
     return culled, share
+
+
+def drop_crumbs(mesh, crumb=INTRUSION_CRUMB):
+    """Drop shells under `crumb` of the area: slivers the cut left on the neighbour's side."""
+    shells = mesh.split(only_watertight=False)
+    if len(shells) <= 1:
+        return mesh
+    kept = [shell for shell in shells if shell.area >= crumb * mesh.area]
+    if not kept or len(kept) == len(shells):
+        return mesh
+    return trimesh.util.concatenate(kept)
 
 
 def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, seed=0,
