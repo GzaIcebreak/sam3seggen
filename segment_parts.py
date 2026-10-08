@@ -321,7 +321,7 @@ def segment_parts(
         if len(proposed["prompts"]) >= 2:      # one name would be the whole object again
             prompts, unassigned_to = proposed["prompts"], proposed["unassigned_to"]
             if proposed.get("separate") and not separate:
-                separate = list(proposed["separate"])
+                separate = dict(proposed["separate"])
         else:
             prompts, merge, granularity = resolve_unprompted(
                 "", merge, granularity, min_atom_faces, min_unit_faces)

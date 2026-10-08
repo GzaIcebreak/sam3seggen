@@ -27,6 +27,8 @@ import json
 import os
 import sys
 
+import numpy as np
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -432,7 +434,8 @@ def merge_parts(
     if separate and merge == "name":
         labels, label_names, splits = split_separate_instances(
             labels, label_names, welded_face_adjacency(reference),
-            np.asarray(reference.area_faces), separate)
+            np.asarray(reference.area_faces), separate,
+            centroids=np.asarray(reference.triangles_center))
         for name, count in splits:
             print(f"[merge] {name}: {count} separately painted instances -> "
                   + ", ".join([name] + [f"{name} {k}" for k in range(2, count + 1)]))
@@ -466,13 +469,20 @@ def merge_parts(
     return manifest
 
 
-def split_separate_instances(labels, names, adjacency, areas, words, min_share=0.05):
-    """Give each big connected component of a part its own name: `leg`, `leg 2`, ...
+def split_separate_instances(labels, names, adjacency, areas, words, min_share=0.05,
+                             centroids=None, gap=0.03):
+    """Give each instance of a part its own name: `leg`, `leg 2`, ...
 
-    `words`: part names to split, or "all". The pipeline otherwise merges every instance
-    of a name into one node, which is right for a rack's shelves but wrong when the user's
-    guide paints the left and right leg in different colours. Components under `min_share`
-    of the part's area stay with the largest one. Returns (labels, names, [(name, count)]).
+    `words`: part names to split -- a list, "all", a comma string, or a dict
+    {name: expected count}. The pipeline otherwise merges every instance of a name into
+    one node, which is right for a rack's shelves but wrong when the user's guide paints
+    the left and right leg in different colours.
+
+    Instances are found as connected components clustered by proximity: components whose
+    bounding boxes come within `gap` of the part's diagonal belong together (a boot's sole
+    and its upper are two components in the remesh). With an expected count, clusters are
+    merged nearest-first down to that many. Clusters under `min_share` of the part's area
+    join the nearest big one. Returns (labels, names, [(name, count)]).
     """
     import numpy as np
     import trimesh
@@ -483,6 +493,7 @@ def split_separate_instances(labels, names, adjacency, areas, words, min_share=0
     areas = np.asarray(areas, dtype=float)
     if isinstance(words, str):
         words = [w.strip() for w in words.split(",") if w.strip()]
+    counts = dict(words) if isinstance(words, dict) else {}
     targets = list(names) if "all" in words else [w for w in words if w in names]
     report = []
     for name in targets:
@@ -493,18 +504,138 @@ def split_separate_instances(labels, names, adjacency, areas, words, min_share=0
         inside = np.zeros(len(labels), dtype=bool)
         inside[faces] = True
         pairs = adjacency[inside[adjacency].all(axis=1)]
-        components = trimesh.graph.connected_components(pairs, nodes=faces, min_len=1)
-        components = sorted((np.asarray(c) for c in components), key=lambda c: -areas[c].sum())
-        total = areas[faces].sum()
-        big = [c for c in components if areas[c].sum() >= min_share * total]
-        if len(big) < 2:
+        components = [np.asarray(c) for c in
+                      trimesh.graph.connected_components(pairs, nodes=faces, min_len=1)]
+        if len(components) < 2:
             continue
-        # order the pieces by position (lowest x first) so the numbering is stable
-        for k, component in enumerate(big[1:], start=2):
+        clusters = _cluster_components(components, centroids, gap) if centroids is not None \
+            else [[c] for c in components]
+        total = areas[faces].sum()
+        wanted = counts.get(name)
+        clusters = _merge_clusters(clusters, centroids, areas, total, min_share, wanted)
+        if len(clusters) < 2:
+            continue
+        clusters.sort(key=lambda cl: -sum(areas[c].sum() for c in cl))
+        for k, cluster in enumerate(clusters[1:], start=2):
             names.append(f"{name} {k}")
-            labels[component] = len(names) - 1
-        report.append((name, len(big)))
+            for component in cluster:
+                labels[component] = len(names) - 1
+        report.append((name, len(clusters)))
     return labels, names, report
+
+
+def _bbox(components, centroids):
+    points = centroids[np.concatenate(components)]
+    return points.min(axis=0), points.max(axis=0)
+
+
+def _bbox_gap(a, b):
+    """Smallest axis-aligned distance between two boxes (0 when they overlap)."""
+    lo = np.maximum(a[0], b[0])
+    hi = np.minimum(a[1], b[1])
+    return float(np.linalg.norm(np.maximum(lo - hi, 0.0)))
+
+
+def _cluster_components(components, centroids, gap):
+    """Union components whose face-centroid boxes come within `gap` x the part diagonal."""
+    centroids = np.asarray(centroids, dtype=float)
+    boxes = [_bbox([c], centroids) for c in components]
+    lo, hi = _bbox(components, centroids)
+    limit = gap * max(float(np.linalg.norm(hi - lo)), 1e-9)
+    parent = list(range(len(components)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(components)):
+        for j in range(i + 1, len(components)):
+            if _bbox_gap(boxes[i], boxes[j]) <= limit:
+                parent[find(i)] = find(j)
+    groups = {}
+    for i, component in enumerate(components):
+        groups.setdefault(find(i), []).append(component)
+    return list(groups.values())
+
+
+def _kmeans_split(points, weights, k, iterations=30, seed=0):
+    """Area-weighted k-means on face centroids; returns k index arrays into `points`.
+
+    Seeds are spread along the longest axis so two legs split left/right rather than
+    top/bottom; Lloyd iterations then follow the geometry."""
+    points = np.asarray(points, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if k <= 1 or len(points) < k:
+        return [np.arange(len(points))]
+    centre = np.average(points, axis=0, weights=weights)
+    spread = points - centre
+    axis = np.linalg.svd(spread * np.sqrt(weights)[:, None], full_matrices=False)[2][0]
+    order = np.argsort(spread @ axis)
+    seeds = points[order[((np.arange(k) + 0.5) / k * (len(points) - 1)).astype(int)]].copy()
+    assign = None
+    for _ in range(iterations):
+        d = ((points[:, None, :] - seeds[None, :, :]) ** 2).sum(axis=2)
+        new_assign = d.argmin(axis=1)
+        if assign is not None and np.array_equal(new_assign, assign):
+            break
+        assign = new_assign
+        for j in range(k):
+            member = assign == j
+            if member.any():
+                seeds[j] = np.average(points[member], axis=0, weights=weights[member])
+    return [np.flatnonzero(assign == j) for j in range(k)]
+
+
+def _merge_clusters(clusters, centroids, areas, total, min_share, wanted):
+    """Fold crumbs into the nearest big cluster; then merge nearest pairs down to `wanted`."""
+    import numpy as np
+
+    def area(cl):
+        return sum(areas[c].sum() for c in cl)
+
+    def centre(cl):
+        if centroids is None:
+            return None
+        pts = np.concatenate([np.asarray(centroids)[c] for c in cl])
+        return pts.mean(axis=0)
+
+    big = [cl for cl in clusters if area(cl) >= min_share * total]
+    small = [cl for cl in clusters if area(cl) < min_share * total]
+    if not big:
+        return [sum(clusters, [])]
+    for cl in small:
+        if centroids is None:
+            target = max(range(len(big)), key=lambda i: area(big[i]))
+        else:
+            c = centre(cl)
+            target = min(range(len(big)), key=lambda i: float(np.linalg.norm(centre(big[i]) - c)))
+        big[target] = big[target] + cl
+    if wanted and centroids is not None and len(big) < wanted:
+        # the instances touch (two legs meet at the crotch): cut the largest cluster by
+        # position into as many pieces as are missing
+        big.sort(key=area, reverse=True)
+        faces = np.concatenate(big[0])
+        pieces = _kmeans_split(np.asarray(centroids)[faces], areas[faces], wanted - len(big) + 1)
+        big = [[faces[piece]] for piece in pieces if len(piece)] + big[1:]
+    while wanted and len(big) > wanted:
+        if centroids is None:
+            big.sort(key=area)
+            big[1] = big[1] + big[0]
+            big.pop(0)
+            continue
+        centres = [centre(cl) for cl in big]
+        best = None
+        for i in range(len(big)):
+            for j in range(i + 1, len(big)):
+                d = float(np.linalg.norm(centres[i] - centres[j]))
+                if best is None or d < best[0]:
+                    best = (d, i, j)
+        _, i, j = best
+        big[i] = big[i] + big[j]
+        big.pop(j)
+    return big
 
 
 def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,
