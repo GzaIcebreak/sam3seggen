@@ -44,6 +44,7 @@ DEFAULT_MODEL = None
 _MODEL_CACHE = {}
 MAX_CANDIDATES = 30
 MAX_VIEWS = 4
+MAX_SHORTLIST = 8
 
 
 def vlm_api_key():
@@ -105,6 +106,29 @@ def build_question(candidates):
         "(a car has no wing, a chair has no engine); do not repeat the main word in parts; "
         "do not use left/right/upper/lower; a part should be a visible, physically "
         "separable piece, not a material or a surface pattern."
+    )
+
+
+def build_shortlist_question(vocabulary, max_parts=MAX_SHORTLIST):
+    """Ask for the object and its part words BEFORE any segmentation has run.
+
+    Sweeping SAM3 over the whole bank (884 words x 8 views) took 6-12 minutes per job,
+    half of the pipeline; the VLM can name the parts from the renders alone in seconds,
+    and SAM3 then only has to measure those few words."""
+    words = ", ".join(sorted(set(vocabulary)))
+    return (
+        "These tiles are renders of ONE 3D object from different directions. "
+        "Task: split this object into its natural parts for a 3D part library. "
+        "Answer with ONLY a JSON object of this shape: "
+        '{"object": "<what the object is, 1-3 words>", '
+        '"main": "<the word for the main body that the remaining surface belongs to>", '
+        '"parts": ["<part word>", ...]}. '
+        f"Rules: 1 to {max_parts} parts, most important first; every word (main and parts) "
+        "MUST be taken verbatim from this vocabulary, lowercase: " + words + ". "
+        "Pick words for visible, physically separable pieces of THIS object (a car has "
+        "wheels and doors, a dog has ears and a tail); never a material, a surface pattern "
+        "or a shape word; do not use left/right/upper/lower; do not repeat the main word "
+        "in parts."
     )
 
 
@@ -175,7 +199,21 @@ TOKEN_BUDGETS = (8000, 16000)   # kimi-k3 reasons for ~2-3k tokens before the an
 
 def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=None,
                 model=None, timeout=300):
-    """Ask Kimi for object / main / parts. Raises on a missing key or an unusable reply.
+    """Review SAM3's candidate words: object / main / parts (the full-sweep path)."""
+    return ask_vlm(image_paths, build_question(candidates), allowed_words,
+                   api_key=api_key, base_url=base_url, model=model, timeout=timeout)
+
+
+def kimi_shortlist(image_paths, vocabulary, api_key=None, base_url=None, model=None,
+                   timeout=300):
+    """Name object / main / parts from the renders alone, restricted to the bank vocabulary."""
+    return ask_vlm(image_paths, build_shortlist_question(vocabulary), vocabulary,
+                   api_key=api_key, base_url=base_url, model=model, timeout=timeout)
+
+
+def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
+            model=None, timeout=300):
+    """Ask the VLM `question` about the renders. Raises on a missing key or an unusable reply.
 
     The reasoning models answer after thinking out loud; a reply cut off by max_tokens
     (finish_reason "length", empty content) is retried once with double the budget.
@@ -202,7 +240,7 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
             "model": model, "max_tokens": budget, **provider_params(base_url),
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": data_url}},
-                {"type": "text", "text": build_question(candidates)},
+                {"type": "text", "text": question},
             ]}],
         }
         request = urllib.request.Request(

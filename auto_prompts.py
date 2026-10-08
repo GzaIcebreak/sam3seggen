@@ -40,6 +40,7 @@ DEFAULT_MAX_PARTS = 6
 DEFAULT_MIN_AREA = 0.02       # share of the silhouette, summed over views
 DEFAULT_WHOLE = 0.5           # at least this share: a name for the object, not a part
 DEFAULT_WHOLE_VLM = 0.6       # for a word the VLM already vouches for as a part
+DEFAULT_SHORTLIST_MIN_VIEWS = 0.25   # a shortlisted word only has to show up in a quarter of the views
 DEFAULT_OVERLAP = 0.3         # parts sharing more than this of the smaller one are the same thing
 DEFAULT_MIN_VIEWS = 0.5       # seen in at least this share of the views
 PREFERRED_MAIN = ("body", "torso", "主体")
@@ -139,6 +140,70 @@ def largest_blob_share(masks, foreground):
     return out
 
 
+def word_stats(masks, foreground, scores, concepts, min_area=DEFAULT_MIN_AREA,
+               min_views=DEFAULT_MIN_VIEWS):
+    """Candidate-style rows for the given concepts: area, biggest blob, score, views,
+    and whether SAM3 found the word often enough and large enough to prompt with."""
+    masks = np.asarray(masks, dtype=bool)
+    foreground = np.asarray(foreground, dtype=bool)
+    scores = np.asarray(scores, dtype=float)
+    views = scores.shape[0]
+    masks = masks & foreground[:, None]
+    fg_total = max(int(foreground.sum()), 1)
+    area = masks.sum(axis=(2, 3)).sum(axis=0) / fg_total
+    blob = largest_blob_share(masks, foreground)
+    detected = (scores > 0).sum(axis=0)
+    mean_score = np.where(detected > 0, scores.sum(axis=0) / np.maximum(detected, 1), 0.0)
+    return [{"concept": str(name), "area": float(area[i]), "blob": float(blob[i]),
+             "score": float(mean_score[i]), "views": int(detected[i]),
+             "eligible": bool(detected[i] >= min_views * views and area[i] >= min_area)}
+            for i, name in enumerate(concepts)]
+
+
+def accept_shortlist(chosen, rows, max_parts=DEFAULT_MAX_PARTS, whole=DEFAULT_WHOLE_VLM):
+    """(proposal, reason). The VLM's shortlist after SAM3 has measured it: words SAM3 did
+    not find are dropped, words whose biggest blob covers `whole` of the object are
+    whole-object words, and what is left must be a main word plus at least one part."""
+    by_name = {row["concept"]: row for row in rows}
+    found = [p for p in chosen["parts"] if by_name.get(p, {}).get("eligible")]
+    missing = [p for p in chosen["parts"] if p not in found]
+    kept, whole_words = drop_whole_words(found, rows, whole)
+    main = chosen.get("main")
+    if not main:
+        return None, "the VLM named no main-body word"
+    if not kept:
+        return None, (f"none of the VLM's parts survived: not found by SAM3 {missing}, "
+                      f"whole-object words {whole_words}")
+    proposal = {"main": main, "parts": kept[:max_parts], "candidates": rows,
+                "mode": "smart", "shortlist": True, "kimi": dict(chosen)}
+    if missing:
+        proposal["kimi"]["not_found"] = missing
+    if whole_words:
+        proposal["kimi"]["dropped_whole"] = whole_words
+    return proposal, None
+
+
+def covered_share(masks, foreground, concepts, parts):
+    masks = np.asarray(masks, dtype=bool) & np.asarray(foreground, dtype=bool)[:, None]
+    covered = np.zeros(masks.shape[0:1] + masks.shape[2:], dtype=bool)
+    names = list(concepts)
+    for part in parts:
+        if part in names:
+            covered |= masks[:, names.index(part)]
+    return float(covered.sum() / max(int(np.asarray(foreground).sum()), 1))
+
+
+def sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir, painted,
+               masks_npz, words):
+    subprocess.run([
+        py_sam3, os.path.join(ROOT, "sam3_multiview.py"),
+        "--views_dir", prompt_dir, "--out", masks_npz, "--raw",
+        "--model", sam3_model, "--concept_bank", concept_bank,
+        *(["--extra_views_dir", views_dir] if painted else []),
+        "--prompts", *words,
+    ], check=True, stdout=subprocess.DEVNULL)
+
+
 def bank_concepts(py_sam3, bank_path, cache_dir):
     """The bank's concept names, read once through the SAM3 venv (torch lives there)."""
     # Keyed by the bank file's mtime: a retrained bank dropped in at the same path must not
@@ -170,11 +235,14 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     flat_paint="auto", reuse=True, radius=2.0, resolution=512,
                     azimuths=AUTO_AZIMUTHS, elevations=AUTO_ELEVATIONS,
                     max_parts=DEFAULT_MAX_PARTS, mode="auto"):
-    """Render a view ring, ask SAM3 for every bank concept, and pick the part names.
+    """Render a view ring and pick the part names.
 
-    mode="auto" picks by the rules above; mode="smart" (智能分割模式) hands the candidates
-    and four renders to Kimi, which knows what the object is and drops words that do not
-    belong to it. Writes work_dir/auto_prompts.json. Returns {"prompts": [...],
+    mode="auto": ask SAM3 for every bank concept and pick by the rules above.
+    mode="smart" (智能分割模式): the VLM first names the object and its parts from the
+    renders (vocabulary = the bank), SAM3 measures just those words, and the ones it finds
+    become the prompts; if the VLM fails or none of its words is found, fall back to the
+    full sweep with the VLM reviewing SAM3's candidates. Writes work_dir/auto_prompts.json.
+    Returns {"prompts": [...],
     "unassigned_to": str | None, "proposal": {...}}; "prompts" is empty when nothing usable
     was recognised.
     """
@@ -188,51 +256,97 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     prompt_dir, painted = flat_paint_stage(
         seg_glb, views_dir, os.path.join(work_dir, "views_auto_flat"), flat_paint, reuse)
     concepts = bank_concepts(py_sam3, concept_bank, os.path.dirname(os.path.abspath(concept_bank)))
-    masks_npz = os.path.join(work_dir, "auto_concepts_grey.npz" if painted else "auto_concepts.npz")
-    if not (reuse and os.path.isfile(masks_npz)):
-        print(f"[auto] asking SAM3 for all {len(concepts)} bank concepts over "
-              f"{len(azimuths.split(','))} views ...")
-        subprocess.run([
-            py_sam3, os.path.join(ROOT, "sam3_multiview.py"),
-            "--views_dir", prompt_dir, "--out", masks_npz, "--raw",
-            "--model", sam3_model, "--concept_bank", concept_bank,
-            *(["--extra_views_dir", views_dir] if painted else []),
-            "--prompts", *concepts,
-        ], check=True, stdout=subprocess.DEVNULL)
-    mask_set = load_masks(masks_npz)
-    proposal = propose_from_masks(mask_set.masks, mask_set.foreground, mask_set.scores,
-                                  mask_set.concepts, max_parts=max_parts)
-    proposal["mode"] = mode
+    suffix = "_grey" if painted else ""
+    images = []
     if mode == "smart":
-        from smart_prompts import kimi_select
-
         with open(os.path.join(prompt_dir, "cameras.json"), encoding="utf-8") as handle:
             views = json.load(handle)["views"]
         images = [os.path.join(prompt_dir, view["image"]) for view in views][::2][:4]
-        print(f"[smart] asking the VLM to review {len(proposal['candidates'])} candidate words ...")
-        proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
+
+    proposal = None
+    if mode == "smart":
+        # Shortlist first: the VLM names the parts from the renders, SAM3 only measures
+        # those words. The full bank sweep below is the fallback.
+        from smart_prompts import kimi_shortlist
+
+        print(f"[smart] asking the VLM to name the object and its parts "
+              f"(vocabulary of {len(concepts)} bank words) ...")
         try:
-            chosen = kimi_select(images, proposal["candidates"], concepts)
+            chosen = kimi_shortlist(images, concepts)
         except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
-            proposal["kimi_error"] = f"{type(error).__name__}: {error}"
-            print(f"[smart] VLM failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
+            print(f"[smart] VLM failed ({type(error).__name__}: {str(error)[:160]}); "
+                  "falling back to the full bank sweep")
+            shortlist_error = f"{type(error).__name__}: {error}"
         else:
-            proposal["kimi"] = chosen
+            shortlist_error = None
             print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
                   f"main={chosen['main']!r} parts={chosen['parts']}"
                   + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
-            chosen["parts"], whole_words = drop_whole_words(chosen["parts"], proposal["candidates"])
-            if whole_words:
-                chosen["dropped_whole"] = whole_words
-                print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
-                      f"or more, so it names the object rather than a part")
-            # main + one part is a split (pineapple: fruit + leaves); only no part at all,
-            # or parts with nothing to name the remainder, falls back to the rules
-            if len(chosen["parts"]) >= 2 or (chosen["parts"] and chosen["main"]):
-                proposal["parts"] = chosen["parts"][:max_parts]
-                proposal["main"] = chosen["main"] or proposal["main"]
+            words = list(dict.fromkeys(chosen["parts"] + ([chosen["main"]] if chosen["main"] else [])))
+            if words:
+                import hashlib
+
+                digest = hashlib.sha1("|".join(words).encode("utf-8")).hexdigest()[:10]
+                short_npz = os.path.join(work_dir, f"auto_shortlist_{digest}{suffix}.npz")
+                if not (reuse and os.path.isfile(short_npz)):
+                    print(f"[smart] asking SAM3 for the {len(words)} shortlisted words over "
+                          f"{len(azimuths.split(','))} views ...")
+                    sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir,
+                               painted, short_npz, words)
+                short = load_masks(short_npz)
+                rows = word_stats(short.masks, short.foreground, short.scores, short.concepts,
+                                  min_views=DEFAULT_SHORTLIST_MIN_VIEWS)
+                proposal, reason = accept_shortlist(chosen, rows, max_parts=max_parts)
+                if proposal is None:
+                    print(f"[smart] shortlist unusable ({reason}); falling back to the full bank sweep")
+                else:
+                    proposal["covered"] = covered_share(short.masks, short.foreground,
+                                                        short.concepts, proposal["parts"])
+                    extra = proposal["kimi"].get("not_found"), proposal["kimi"].get("dropped_whole")
+                    if any(extra):
+                        print(f"[smart] not found by SAM3: {extra[0] or []}; whole-object words "
+                              f"dropped: {extra[1] or []}")
+
+    if proposal is None:
+        masks_npz = os.path.join(work_dir, f"auto_concepts{suffix}.npz")
+        if not (reuse and os.path.isfile(masks_npz)):
+            print(f"[auto] asking SAM3 for all {len(concepts)} bank concepts over "
+                  f"{len(azimuths.split(','))} views ...")
+            sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir, painted,
+                       masks_npz, concepts)
+        mask_set = load_masks(masks_npz)
+        proposal = propose_from_masks(mask_set.masks, mask_set.foreground, mask_set.scores,
+                                      mask_set.concepts, max_parts=max_parts)
+        proposal["mode"] = mode
+        if mode == "smart":
+            from smart_prompts import kimi_select
+
+            if shortlist_error:
+                proposal["shortlist_error"] = shortlist_error
+            print(f"[smart] asking the VLM to review {len(proposal['candidates'])} candidate words ...")
+            proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
+            try:
+                chosen = kimi_select(images, proposal["candidates"], concepts)
+            except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
+                proposal["kimi_error"] = f"{type(error).__name__}: {error}"
+                print(f"[smart] VLM failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
             else:
-                print("[smart] VLM returned no usable part; keeping the rule-based pick")
+                proposal["kimi"] = chosen
+                print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
+                      f"main={chosen['main']!r} parts={chosen['parts']}"
+                      + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
+                chosen["parts"], whole_words = drop_whole_words(chosen["parts"], proposal["candidates"])
+                if whole_words:
+                    chosen["dropped_whole"] = whole_words
+                    print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
+                          f"or more, so it names the object rather than a part")
+                # main + one part is a split (pineapple: fruit + leaves); only no part at all,
+                # or parts with nothing to name the remainder, falls back to the rules
+                if len(chosen["parts"]) >= 2 or (chosen["parts"] and chosen["main"]):
+                    proposal["parts"] = chosen["parts"][:max_parts]
+                    proposal["main"] = chosen["main"] or proposal["main"]
+                else:
+                    print("[smart] VLM returned no usable part; keeping the rule-based pick")
     prompts = list(proposal["parts"])
     main = proposal["main"]
     if main and main not in prompts:

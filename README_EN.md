@@ -12,7 +12,8 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 ## 📣 What's new
 
 - **Smart split mode** (`mode=smart`): with no prompts, a vision model (Qwen `qwen3.8-max` as
-  deployed; Kimi works too) looks at the renders and reviews the bank's candidate words -- the car
+  deployed; Kimi works too) names the parts from the renders using the bank's vocabulary and SAM3
+  only measures those words (about 30 s; the rule-based sweep of the whole bank takes 6-12 min) -- the car
   goes from `wing` to `hood, door, wheel, window, bumper`, the sword to `blade + handle`. Needs
   `SEGVIGEN_VLM_API_KEY`.
 - **Parts get named without prompts** (`auto_prompts`, default on): SAM3 is asked for all 280

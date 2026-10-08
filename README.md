@@ -11,8 +11,8 @@ mesh，带真实贴图。
 
 ## 📣 近期更新
 
-- **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）看渲染图
-  复核概念库的候选词并命名——跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
+- **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）先看渲染图
+  从概念库词表里命名，SAM3 只测这几个词（约 30 秒，规则提名要扫全库 6–12 分钟）——跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
   需要 `SEGVIGEN_VLM_API_KEY`。
 - **不写提示词也能命名**（`auto_prompts`，默认开）：SAM3 一次过概念库的 280 个词，选出主体名和 2–6 个
   互不重叠的部件名再投票。旧测试里"无需求"一列 10 个模型 8 个 0 分；现在小狗自动得到 head / leg / body，
