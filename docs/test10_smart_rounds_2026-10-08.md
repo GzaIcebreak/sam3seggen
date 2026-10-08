@@ -54,3 +54,33 @@ curl -sS -X POST localhost:6006/pipeline -F "glb=@/root/autodl-tmp/test10/dog.gl
 /root/autodl-tmp/envs/trellis2/bin/python /root/autodl-tmp/xmas_split2/explode_render.py \
     --job /root/autodl-tmp/christmas_tree_jobs/<job_id> --out /tmp/dog --title dog --device cpu
 ```
+
+## 第三轮：Qwen 先给候选词，SAM3 只测这些词（`6eb6fc6`）
+
+第二轮的阶段计时显示每单一半时间花在"SAM3 过概念库 884 词 × 8 视角"（6–12 分钟）。第三轮把顺序反过来：
+Qwen 先看 4 张渲染图和整张词表给出主体名 + 1–8 个部件词（2–4 秒），SAM3 只测这几个词（约 20 秒），
+找不到的词丢掉；VLM 失败或一个词都找不到才回退全库扫描。结果在 `xmas_split2/smart10_v3/`。
+
+| 模型 | 第二轮耗时 | 第三轮耗时 | 第三轮结果 | 对比第二轮 |
+|---|---|---|---|---|
+| sword | 909 s | 264 s | blade / hilt | **首次正确**：hilt 面积 14%，不再被整体词规则丢弃 |
+| dog | 777 s | 424 s | body / ear / leg | 退：这次只切出 16 个几何单元，tail 零票、一条腿留在身体里 |
+| mouse | 959 s | 504 s | base / body / ear / head / leg | 持平；ear 仍带走头顶（33%） |
+| pineapple | 818 s | 347 s | body / leaves | 持平 |
+| rack | 919 s | 293 s | frame / shelf | 进：隔板统一叫 shelf（上三块仍留在 frame 里） |
+| human | 1506 s | 432 s | head / arm / hand / leg / foot / body | 进：六件全对 |
+| robot | 1439 s | 424 s | head / torso / legs / body(双臂) | 持平 |
+| chair | 1147 s | 455 s | backrest / slat / seat / leg / crossbar | 进：五件全对 |
+| car | 1272 s | 732 s | body / wheel / windshield | 略进：多出挡风玻璃；hood / roof 仍投不出（车壳一体） |
+| airplane | 2188 s | 731 s | fuselage / wing / propeller / engine / tail / seat / strut | 进：七件 |
+
+- 耗时 264–732 s/单（第二轮 777–2188 s），提名阶段 373–732 s → 20–35 s。
+- 命名质量总体持平或更好（长剑、人形、椅子、飞机、置物架变好；小狗因分割采样随机退了一次）。
+- 仍未解决：几何单元切不开的车壳/靠背（`refine=masks` 在跑车上移动 0 面片，无效）；同一模型多次运行的随机性（SegviGen 采样 + VLM 提名）。
+
+## 引导图一条龙（`POST /pipeline_guided`，开发分支 `part-exclusivity` 的 `634e86c`）
+
+上传模型 + 一张"每个部件涂一种平色"的参考图，Qwen 对照它命名，SAM3 只测这些词。乐高人仔配 9 色 GT 图实测：
+`head, arm, hand, leg, waist + torso`（waist SAM3 未找到被丢弃），正是 GT 的粒度。
+颜色边界参与切几何（能分左右）是下一步：轮廓匹配找相机角度在对称模型上有镜像/前后歧义（人仔 IoU 0.86–0.88 平坦），
+需要 VLM 辅助判定视角方向，或让用户在接口里直接给 `guide_azimuth / guide_elevation`。
