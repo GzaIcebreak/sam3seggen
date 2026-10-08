@@ -193,14 +193,151 @@ SCORE_CANDIDATE_SMALL = 0.6  # a small one; X-Part is at home on small parts, so
 SCORE_FLOOR = 0.3         # both below this: keep the open surface instead of either solid
 SCORE_SAMPLES = 20000
 
+# --- part exclusivity -------------------------------------------------------------------
+# X-Part closes a part by regenerating it from the whole model, and it grows the
+# neighbours back while it is at it: the dog's body came back with a second tail (4.2% of
+# its surface lay on the tail part's own surface) and four paws. Nothing above noticed:
+# the p90 of solid->surface distance is blind to anything under 10% of the surface, and
+# the tail sits inside the body's box. "Intrusion" is the share of a solid's surface that
+# lies on another instance's open surface while being off its own. Such a region is cut
+# away and the hole capped when the cut leaves a short rim (a tail root, an ankle); a
+# region with a long rim (a body's skin under a wrap-around armour) is left alone. What
+# remains discounts the score.
+INTRUSION_SCALE = 0.1      # this much residual intrusion zeroes the score
+INTRUSION_MAX_RIM = 1.0    # cut a region only when its rim is shorter than this x diagonal
+INTRUSION_MIN_FACES = 20
 
-def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, seed=0):
+
+class OpenSurfaces:
+    """Sampled points of every open instance surface, for own/other distance queries."""
+
+    def __init__(self, opened, samples=SCORE_SAMPLES, seed=0):
+        from scipy.spatial import cKDTree
+
+        self.trees = {}
+        points, labels = [], []
+        for inst, node in opened.items():
+            surface = node[1]
+            if surface is None or not len(surface.faces) or surface.area <= 0:
+                continue
+            pts = trimesh.sample.sample_surface(surface, samples, seed=seed)[0]
+            self.trees[inst] = cKDTree(pts)
+            points.append(pts)
+            labels.append(np.full(len(pts), inst))
+        self.all = cKDTree(np.concatenate(points)) if points else None
+        self.all_labels = np.concatenate(labels) if labels else None
+
+    def intruding(self, inst, points, tau):
+        """Per point: off its own surface (> tau) yet within tau of any other instance.
+
+        Within tau only other instances' points can be nearest once the own surface is
+        farther than tau away, so one bounded nearest-neighbour query settles both."""
+        points = np.asarray(points, dtype=float)
+        if self.all is None or not len(points):
+            return np.zeros(len(points), dtype=bool)
+        own = (self.trees[inst].query(points)[0] if inst in self.trees
+               else np.full(len(points), np.inf))
+        near_any = self.all.query(points, distance_upper_bound=tau)[0] < tau
+        return (own > tau) & near_any
+
+
+def _boundary_edges(mesh):
+    """Directed edges (face winding) that belong to exactly one face."""
+    edges = mesh.edges
+    once = trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)
+    return edges[once]
+
+
+def _edge_loops(edges):
+    """Chain directed edges a->b into closed loops of vertex indices."""
+    nxt = {}
+    for a, b in edges:
+        nxt.setdefault(int(a), []).append(int(b))
+    loops, seen = [], set()
+    for a, b in edges:
+        a = int(a)
+        if (a, int(b)) in seen:
+            continue
+        loop, current = [a], a
+        while True:
+            candidates = [c for c in nxt.get(current, []) if (current, c) not in seen]
+            if not candidates:
+                break
+            c = candidates[0]
+            seen.add((current, c))
+            if c == loop[0]:
+                break
+            loop.append(c)
+            current = c
+        if len(loop) >= 3 and current in nxt and loop[0] in nxt.get(current, []):
+            loops.append(loop)
+    return loops
+
+
+def cap_loops(mesh, loops):
+    """Close each boundary loop with a fan around its centroid; returns a new mesh."""
+    if not loops:
+        return mesh
+    vertices = [np.asarray(mesh.vertices)]
+    faces = [np.asarray(mesh.faces)]
+    offset = len(mesh.vertices)
+    for loop in loops:
+        ring = np.asarray(loop)
+        centre = np.asarray(mesh.vertices)[ring].mean(axis=0)
+        vertices.append(centre[None])
+        # a boundary edge a->b is traversed a->b by its face; the cap traverses it b->a
+        nxt = np.roll(ring, -1)
+        faces.append(np.stack([nxt, ring, np.full(len(ring), offset)], axis=1))
+        offset += 1
+    return trimesh.Trimesh(np.concatenate(vertices), np.concatenate(faces), process=False)
+
+
+def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
+                    min_faces=INTRUSION_MIN_FACES):
+    """Cut the solid's regions that duplicate a neighbour; cap the holes. (mesh, cut share)."""
+    if solid is None or not len(solid.faces) or surfaces is None:
+        return solid, 0.0
+    bad = surfaces.intruding(inst, solid.triangles_center, tau)
+    if bad.sum() < min_faces:
+        return solid, 0.0
+    adjacency = np.asarray(solid.face_adjacency)
+    both = bad[adjacency].all(axis=1)
+    components = trimesh.graph.connected_components(
+        adjacency[both], nodes=np.flatnonzero(bad), min_len=min_faces)
+    remove = np.zeros(len(bad), dtype=bool)
+    edge_vertices = np.asarray(solid.face_adjacency_edges)
+    for component in components:
+        in_comp = np.zeros(len(bad), dtype=bool)
+        in_comp[np.asarray(component)] = True
+        rim = in_comp[adjacency].sum(axis=1) == 1
+        rim_length = float(np.linalg.norm(
+            solid.vertices[edge_vertices[rim, 0]] - solid.vertices[edge_vertices[rim, 1]],
+            axis=1).sum())
+        if rim_length <= max_rim * diag:
+            remove |= in_comp
+    if not remove.any():
+        return solid, 0.0
+    before = {tuple(sorted(e)) for e in _boundary_edges(solid)}
+    culled = trimesh.Trimesh(np.asarray(solid.vertices), np.asarray(solid.faces)[~remove],
+                             process=False)
+    culled.remove_unreferenced_vertices()
+    new_edges = np.array([e for e in _boundary_edges(culled)
+                          if tuple(sorted(e)) not in before], dtype=int).reshape(-1, 2)
+    culled = cap_loops(culled, _edge_loops(new_edges))
+    share = float(solid.area_faces[remove].sum() / max(solid.area, 1e-12))
+    return culled, share
+
+
+def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, seed=0,
+                  surfaces=None, instance=None):
     """Fit of a generated solid to the open part surface it should close. None if unscorable.
 
     cover     share of surface samples within tau of the solid (did it keep the input?)
     fit_p90   p90 surface -> solid distance
     extra_p90 p90 solid -> surface distance (did it invent shape that is not there?)
     escape    how far the solid overruns the prompt box
+    intrusion share of the solid's surface lying on another instance's surface (needs
+              `surfaces`, an OpenSurfaces, and the solid's `instance`)
     """
     from scipy.spatial import cKDTree
 
@@ -215,12 +352,16 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     solid_points = trimesh.sample.sample_surface(solid, samples, seed=seed + 1)[0]
     fit = cKDTree(dense).query(part_points)[0] / diag
     extra = cKDTree(part_points).query(solid_points)[0] / diag
+    intrusion = 0.0
+    if surfaces is not None and instance is not None:
+        intrusion = float(surfaces.intruding(instance, solid_points, tau * diag).mean())
     return {
         "cover": float((fit < tau).mean()),
         "fit_p90": float(np.percentile(fit, 90)),
         "extra_p90": float(np.percentile(extra, 90)),
         "escape": float(box_escape(solid.bounds, box)),
         "largest_shell": largest_shell_share(solid),
+        "intrusion": intrusion,
     }
 
 
@@ -240,14 +381,15 @@ def largest_shell_share(solid):
     return float(max(shell.area for shell in shells) / welded.area)
 
 
-def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE):
-    """0..1: coverage, discounted by invented geometry and by box escape."""
+def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUSION_SCALE):
+    """0..1: coverage, discounted by invented geometry, box escape, tatters and intrusion."""
     if not metrics:
         return 0.0
     extra = min(1.0, metrics["extra_p90"] / extra_scale)
     escape = min(1.0, metrics["escape"])
     whole = metrics.get("largest_shell", 1.0)
-    return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole)
+    intrusion = min(1.0, metrics.get("intrusion", 0.0) / intrusion_scale)
+    return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole * (1.0 - intrusion))
 
 
 def _score_inputs(out_dir):
@@ -255,7 +397,15 @@ def _score_inputs(out_dir):
         boxes = json.load(handle)
     opened = index_by_instance(load_part_nodes(os.path.join(out_dir, "open_instances.glb")))
     xpart = index_by_instance(load_part_nodes(os.path.join(out_dir, "xpart_instances.glb")))
-    return boxes, opened, xpart
+    return boxes, opened, xpart, OpenSurfaces(opened)
+
+
+def prepare_solid(row, solid, surfaces, tau=SCORE_TAU):
+    """Cut what duplicates a neighbour, then measure. (mesh, metrics, cut share)."""
+    box = np.asarray(row["box"], dtype=float)
+    diag = max(float(np.linalg.norm(box[1] - box[0])), 1e-9)
+    culled, share = cull_intrusions(solid, row.get("instance"), surfaces, tau * diag, diag)
+    return culled, share
 
 
 def score_candidates(out_dir, candidate=SCORE_CANDIDATE, candidate_small=SCORE_CANDIDATE_SMALL):
@@ -265,22 +415,29 @@ def score_candidates(out_dir, candidate=SCORE_CANDIDATE, candidate_small=SCORE_C
     `candidate_small`. On the decorated tree one flat 0.6 skipped the trunk (X-Part 0.70,
     a blob) while 0.8 everywhere sent half the ornaments to HoloPart for nothing.
     """
-    boxes, opened, xpart = _score_inputs(out_dir)
+    boxes, opened, xpart, surfaces = _score_inputs(out_dir)
     src_ext = source_extent(boxes)
     decisions = []
     for row in boxes:
         inst = row.get("instance")
         surface, solid = opened.get(inst), xpart.get(inst)
-        metrics = solid_metrics(surface and surface[1], solid and solid[1], row["box"])
+        culled, cut = prepare_solid(row, solid and solid[1], surfaces)
+        metrics = solid_metrics(surface and surface[1], culled, row["box"],
+                                surfaces=surfaces, instance=inst)
         score = quality_score(metrics)
         large, _ = is_large(row, src_ext)
         threshold = candidate if large else candidate_small
         decisions.append({
             "name": row["name"], "instance": inst, "area_share": row["area_share"],
             "node": instance_node_name(row), "large": large, "threshold": threshold,
-            "xpart": metrics, "q_xpart": score, "candidate": score < threshold,
+            "xpart": metrics, "xpart_cut": cut, "q_xpart": score,
+            "candidate": score < threshold,
         })
     flagged = sum(d["candidate"] for d in decisions)
+    cut = [d for d in decisions if d["xpart_cut"] > 0]
+    if cut:
+        print(f"[score] cut neighbour duplicates off {len(cut)} X-Part solid(s): "
+              + ", ".join(f"{d['node']} {d['xpart_cut']:.1%}" for d in cut))
     print(f"[score] {flagged}/{len(decisions)} X-Part solids below their threshold "
           f"(large < {candidate}, small < {candidate_small}) -> HoloPart draw")
     return decisions
@@ -288,7 +445,7 @@ def score_candidates(out_dir, candidate=SCORE_CANDIDATE, candidate_small=SCORE_C
 
 def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR):
     """Keep the higher-scoring solid per instance; below `floor` fall back to the open surface."""
-    boxes, opened, xpart = _score_inputs(out_dir)
+    boxes, opened, xpart, surfaces = _score_inputs(out_dir)
     holo = index_by_instance(load_part_nodes(holopart_glb)) if holopart_glb else {}
     missing = [d["node"] for d in decisions if d["candidate"] and d["instance"] not in holo]
     if missing:
@@ -298,12 +455,16 @@ def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR):
         inst = row.get("instance")
         options = []
         if inst in xpart:
-            options.append(("xpart", decision["q_xpart"], xpart[inst][1]))
+            culled, _ = prepare_solid(row, xpart[inst][1], surfaces)
+            options.append(("xpart", decision["q_xpart"], culled))
         if decision["candidate"]:
-            metrics = solid_metrics(opened[inst][1], holo[inst][1], row["box"])
+            culled, cut = prepare_solid(row, holo[inst][1], surfaces)
+            metrics = solid_metrics(opened[inst][1], culled, row["box"],
+                                    surfaces=surfaces, instance=inst)
             decision["holopart"] = metrics
+            decision["holopart_cut"] = cut
             decision["q_holopart"] = quality_score(metrics)
-            options.append(("holopart", decision["q_holopart"], holo[inst][1]))
+            options.append(("holopart", decision["q_holopart"], culled))
         backend, score, mesh = max(options, key=lambda option: option[1]) if options \
             else ("open", 0.0, None)
         if score < floor:

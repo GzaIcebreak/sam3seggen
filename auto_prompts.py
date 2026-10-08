@@ -39,6 +39,7 @@ GENERIC_WORDS = frozenset({
 DEFAULT_MAX_PARTS = 6
 DEFAULT_MIN_AREA = 0.02       # share of the silhouette, summed over views
 DEFAULT_WHOLE = 0.5           # at least this share: a name for the object, not a part
+DEFAULT_WHOLE_VLM = 0.6       # for a word the VLM already vouches for as a part
 DEFAULT_OVERLAP = 0.3         # parts sharing more than this of the smaller one are the same thing
 DEFAULT_MIN_VIEWS = 0.5       # seen in at least this share of the views
 PREFERRED_MAIN = ("body", "torso", "主体")
@@ -66,6 +67,7 @@ def propose_from_masks(masks, foreground, scores, concepts, max_parts=DEFAULT_MA
     masks = masks & foreground[:, None]
     fg_total = max(int(foreground.sum()), 1)
     area = masks.sum(axis=(2, 3)).sum(axis=0) / fg_total
+    blob = largest_blob_share(masks, foreground)
     detected = (scores > 0).sum(axis=0)
     mean_score = np.where(detected > 0, scores.sum(axis=0) / np.maximum(detected, 1), 0.0)
     names = list(concepts)
@@ -85,7 +87,9 @@ def propose_from_masks(masks, foreground, scores, concepts, max_parts=DEFAULT_MA
     def share(a, b):
         return (a & b).sum() / max(min(a.sum(), b.sum()), 1)
 
-    candidates = [i for i in np.flatnonzero(eligible & (area >= min_area) & (area < whole))]
+    # a word whose single biggest blob is under `whole` can be a part even when all its
+    # blobs together are not: six shelves sum to most of a rack, one shelf does not
+    candidates = [i for i in np.flatnonzero(eligible & (area >= min_area) & (blob < whole))]
     candidates.sort(key=lambda i: -(area[i] * mean_score[i]))
     picked = []
     for i in candidates:
@@ -103,8 +107,9 @@ def propose_from_masks(masks, foreground, scores, concepts, max_parts=DEFAULT_MA
     covered = np.zeros_like(foreground)
     for j in picked:
         covered |= masks[:, j]
-    rows = [{"concept": names[i], "area": float(area[i]), "score": float(mean_score[i]),
-             "views": int(detected[i]), "eligible": bool(eligible[i])}
+    rows = [{"concept": names[i], "area": float(area[i]), "blob": float(blob[i]),
+             "score": float(mean_score[i]), "views": int(detected[i]),
+             "eligible": bool(eligible[i])}
             for i in np.argsort(-(area * mean_score))[:20] if detected[i] > 0]
     return {
         "main": names[main] if main is not None else None,
@@ -112,6 +117,26 @@ def propose_from_masks(masks, foreground, scores, concepts, max_parts=DEFAULT_MA
         "covered": float(covered.sum() / fg_total),
         "candidates": rows,
     }
+
+
+def largest_blob_share(masks, foreground):
+    """Per concept: the biggest connected blob's share of the silhouette, averaged over the
+    views where the concept fired. The summed mask cannot tell six shelves from one rack."""
+    from scipy import ndimage
+
+    views, count = masks.shape[:2]
+    out = np.zeros(count)
+    for i in range(count):
+        shares = []
+        for v in range(views):
+            mask = masks[v, i]
+            if not mask.any():
+                continue
+            labels, n = ndimage.label(mask)
+            sizes = np.bincount(labels.ravel())[1:] if n else np.array([0])
+            shares.append(sizes.max() / max(int(foreground[v].sum()), 1))
+        out[i] = float(np.mean(shares)) if shares else 0.0
+    return out
 
 
 def bank_concepts(py_sam3, bank_path, cache_dir):
@@ -131,11 +156,12 @@ def bank_concepts(py_sam3, bank_path, cache_dir):
         return [line.strip() for line in handle if line.strip()]
 
 
-def drop_whole_words(parts, candidates, whole=DEFAULT_WHOLE):
-    """(kept, dropped): a 'part' whose mask covers `whole` of the silhouette names the
-    object, not a part of it -- voted as a part it swallows the remainder (a sword's
-    'crossbar' at 83% left nothing for the blade)."""
-    area = {row["concept"]: float(row["area"]) for row in candidates}
+def drop_whole_words(parts, candidates, whole=DEFAULT_WHOLE_VLM):
+    """(kept, dropped): a 'part' whose single biggest blob covers `whole` of the silhouette
+    names the object, not a part of it -- voted as a part it swallows the remainder (a
+    sword's 'crossbar' at 83% left nothing for the blade). Judged per blob so that a rack's
+    'shelf' (six blobs, 60% together, ~10% each) stays a part."""
+    area = {row["concept"]: float(row.get("blob", row["area"])) for row in candidates}
     dropped = [name for name in parts if area.get(name, 0.0) >= whole]
     return [name for name in parts if name not in dropped], dropped
 
@@ -200,11 +226,13 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                 chosen["dropped_whole"] = whole_words
                 print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
                       f"or more, so it names the object rather than a part")
-            if len(chosen["parts"]) >= 2:
+            # main + one part is a split (pineapple: fruit + leaves); only no part at all,
+            # or parts with nothing to name the remainder, falls back to the rules
+            if len(chosen["parts"]) >= 2 or (chosen["parts"] and chosen["main"]):
                 proposal["parts"] = chosen["parts"][:max_parts]
                 proposal["main"] = chosen["main"] or proposal["main"]
             else:
-                print("[smart] VLM returned fewer than two usable parts; keeping the rule-based pick")
+                print("[smart] VLM returned no usable part; keeping the rule-based pick")
     prompts = list(proposal["parts"])
     main = proposal["main"]
     if main and main not in prompts:
