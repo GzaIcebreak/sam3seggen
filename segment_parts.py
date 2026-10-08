@@ -165,6 +165,7 @@ def segment_parts(
     auto_prompts=True,
     mode="auto",
     guide_image=None,
+    separate=None,
 ):
     """Segment `glb` into parts and write them all into `out_glb`.
 
@@ -319,6 +320,8 @@ def segment_parts(
             flat_paint, reuse, radius, resolution, mode=mode, guide_image=guide_image)
         if len(proposed["prompts"]) >= 2:      # one name would be the whole object again
             prompts, unassigned_to = proposed["prompts"], proposed["unassigned_to"]
+            if proposed.get("separate") and not separate:
+                separate = list(proposed["separate"])
         else:
             prompts, merge, granularity = resolve_unprompted(
                 "", merge, granularity, min_atom_faces, min_unit_faces)
@@ -376,6 +379,7 @@ def segment_parts(
             part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
             merge_gap=merge_gap, merge_max_share=merge_max_share,
             refine=refine, refine_min_share=refine_min_share, export_from=export_from,
+            separate=separate or None,
         )
 
     if merge == "fragments":

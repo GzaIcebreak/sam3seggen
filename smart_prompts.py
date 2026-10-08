@@ -140,7 +140,10 @@ def guide_instruction(colours):
         "separates: one vocabulary word per kind of part, where a left/right or front/back "
         "pair of the same thing shares one word, and the largest central piece is the main "
         "word. Do not add parts the reference does not colour separately, and do not merge "
-        "two separately coloured parts into one word."
+        "two separately coloured parts into one word. Also add a key \"separate\": a list of "
+        "the part words whose two or more instances the reference paints in DIFFERENT "
+        "colours (a red left leg and a green right leg -> \"leg\"), so they are exported as "
+        "separate pieces; leave it empty when every instance of a word shares one colour."
     )
 
 
@@ -227,8 +230,13 @@ def parse_reply(text, allowed, generic=()):
         dropped.append(main)
         main = ""
     parts = [p for p in parts if p != main]
+    separate = []
+    for word in data.get("separate") or []:
+        word = clean(word)
+        if word in parts and word not in separate:
+            separate.append(word)
     return {"object": str(data.get("object") or "").strip(), "main": main or None,
-            "parts": parts, "dropped": dropped}
+            "parts": parts, "dropped": dropped, "separate": separate}
 
 
 TOKEN_BUDGETS = (8000, 16000)   # kimi-k3 reasons for ~2-3k tokens before the answer; retry once if cut

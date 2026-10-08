@@ -196,6 +196,9 @@ class PipelineOptions:
     refine: str = DEFAULT_REFINE
     refine_min_share: float = DEFAULT_REFINE_MIN_SHARE
     export_from: str = DEFAULT_EXPORT_FROM
+    # export each big connected instance of these part names as its own part ("leg", "leg 2");
+    # comma list or "all". The guided flow fills it from the reference's colours.
+    separate: str = ""
     # empty prompts: ask SAM3 for every bank concept and pick the part names (auto_prompts.py)
     auto_prompts: bool = DEFAULT_AUTO_PROMPTS
     mode: str = DEFAULT_MODE
@@ -289,6 +292,7 @@ class PipelineOptions:
             "refine": self.refine,
             "refine_min_share": self.refine_min_share,
             "export_from": self.export_from,
+            "separate": self.separate,
             "auto_prompts": self.auto_prompts,
             "mode": self.mode,
         }
@@ -391,6 +395,7 @@ class PipelineOptions:
             refine=getattr(args, "refine", DEFAULT_REFINE),
             refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
             export_from=getattr(args, "export_from", DEFAULT_EXPORT_FROM),
+            separate=getattr(args, "separate", "") or "",
             auto_prompts=not getattr(args, "no_auto_prompts", False),
             mode=getattr(args, "mode", DEFAULT_MODE),
         )
@@ -487,6 +492,8 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--no_auto_prompts", action="store_true",
                         help="Without prompts, name the parts 主体 / 底座 instead of asking "
                              "SAM3 for every concept in the bank and picking the part names")
+    parser.add_argument("--separate", default="",
+                        help="Comma list of part names (or all) whose big connected instances are exported as separate parts: leg, leg 2 ...")
     parser.add_argument("--export_from", default=DEFAULT_EXPORT_FROM, choices=EXPORT_FROM_MODES,
                         help="source (default): cut the parts from the source model with "
                              "its own UVs and texture (full resolution, no bake); remesh: "

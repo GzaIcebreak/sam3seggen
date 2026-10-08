@@ -325,6 +325,7 @@ def merge_parts(
     refine=DEFAULT_REFINE,
     refine_min_share=DEFAULT_REFINE_MIN_SHARE,
     export_from=DEFAULT_EXPORT_FROM,
+    separate=None,
 ):
     """Name the atoms in `split_dir` with `prompts` and write the parts into `out_glb`.
 
@@ -428,6 +429,13 @@ def merge_parts(
         labels = units
     else:
         label_names = expected_names
+    if separate and merge == "name":
+        labels, label_names, splits = split_separate_instances(
+            labels, label_names, welded_face_adjacency(reference),
+            np.asarray(reference.area_faces), separate)
+        for name, count in splits:
+            print(f"[merge] {name}: {count} separately painted instances -> "
+                  + ", ".join([name] + [f"{name} {k}" for k in range(2, count + 1)]))
 
     labels_npy = os.path.join(split_dir, "labels.npy")
     names_json = os.path.join(split_dir, "label_names.json")
@@ -456,6 +464,47 @@ def merge_parts(
                    part_min_area_share=part_min_area_share, fold_within_part=fold_within_part,
                    merge_gap=merge_gap, merge_max_share=merge_max_share)
     return manifest
+
+
+def split_separate_instances(labels, names, adjacency, areas, words, min_share=0.05):
+    """Give each big connected component of a part its own name: `leg`, `leg 2`, ...
+
+    `words`: part names to split, or "all". The pipeline otherwise merges every instance
+    of a name into one node, which is right for a rack's shelves but wrong when the user's
+    guide paints the left and right leg in different colours. Components under `min_share`
+    of the part's area stay with the largest one. Returns (labels, names, [(name, count)]).
+    """
+    import numpy as np
+    import trimesh
+
+    labels = np.asarray(labels).copy()
+    names = list(names)
+    adjacency = np.asarray(adjacency).reshape(-1, 2)
+    areas = np.asarray(areas, dtype=float)
+    if isinstance(words, str):
+        words = [w.strip() for w in words.split(",") if w.strip()]
+    targets = list(names) if "all" in words else [w for w in words if w in names]
+    report = []
+    for name in targets:
+        index = names.index(name)
+        faces = np.flatnonzero(labels == index)
+        if len(faces) < 2:
+            continue
+        inside = np.zeros(len(labels), dtype=bool)
+        inside[faces] = True
+        pairs = adjacency[inside[adjacency].all(axis=1)]
+        components = trimesh.graph.connected_components(pairs, nodes=faces, min_len=1)
+        components = sorted((np.asarray(c) for c in components), key=lambda c: -areas[c].sum())
+        total = areas[faces].sum()
+        big = [c for c in components if areas[c].sum() >= min_share * total]
+        if len(big) < 2:
+            continue
+        # order the pieces by position (lowest x first) so the numbering is stable
+        for k, component in enumerate(big[1:], start=2):
+            names.append(f"{name} {k}")
+            labels[component] = len(names) - 1
+        report.append((name, len(big)))
+    return labels, names, report
 
 
 def export_labelled(mesh_path, source_glb, labels_npy, names_json, out_glb,

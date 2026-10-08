@@ -212,6 +212,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `allow_partial` | bool | `true` | 与上面相反的写法；两者同传时 `strict_parts` 优先 |
 | `reuse` | bool | `true` | 复用任务目录里已有的渲染和同提示词掩码（同一单内） |
 | `auto_prompts` | bool | `true` | 没传 `prompts` 时：`mode=auto` 让 SAM3 过一遍概念库全部词（v6 库 884 词、8 视角，6–12 分钟），挑主体名 + 2–6 个互不重叠的部件名，再走正常投票；`mode=smart` 见下，快得多。`merge=off` 时不提名 |
+| `separate` | str | `""` | 逗号分隔的部件名（或 `all`）：投票后把该名字的面按连通块拆成独立部件 `leg`、`leg 2`…（面积 ≥ 5% 的块各成一件，碎块并入最大的）。默认同名实例合成一个节点。引导图接口会按参考图里"同一部件涂了不同颜色"自动填这个列表 |
 | `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段先把 4 张渲染图和概念库词表交给视觉大模型（任何 OpenAI 兼容接口；当前部署 Qwen `qwen3.8-max`，也可换 Kimi），由它说出物体类别、主体名和 1–8 个部件词（只能用词表里的词，形状词 plank、panel… 不要）；SAM3 只对这几个词测面积：至少 1/4 的视角里出现且 ≥ 2% 剪影的才保留，单块掩码盖住剪影 60% 以上的当整体词丢弃（按最大连通块判，多实例的 `shelf` 不受影响）；主体名 + 1 个部件词即可采用。VLM 失败或一个词都没找到时回退到全库扫描 + VLM 复核（慢 10 倍以上）。`work/auto_prompts.json` 里 `proposal.shortlist=true` 表示走的是快路径。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400 |
 
 ### 5.2 拆分（几何边界）

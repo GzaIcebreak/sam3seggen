@@ -175,7 +175,8 @@ def accept_shortlist(chosen, rows, max_parts=DEFAULT_MAX_PARTS, whole=DEFAULT_WH
         return None, (f"none of the VLM's parts survived: not found by SAM3 {missing}, "
                       f"whole-object words {whole_words}")
     proposal = {"main": main, "parts": kept[:max_parts], "candidates": rows,
-                "mode": "smart", "shortlist": True, "kimi": dict(chosen)}
+                "mode": "smart", "shortlist": True, "kimi": dict(chosen),
+                "separate": [w for w in chosen.get("separate") or [] if w in kept]}
     if missing:
         proposal["kimi"]["not_found"] = missing
     if whole_words:
@@ -358,7 +359,7 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     if guide_image:
         proposal["guide_image"] = os.path.basename(guide_image)
     result = {"prompts": prompts, "unassigned_to": unassigned_to, "painted": painted,
-              "proposal": proposal}
+              "proposal": proposal, "separate": list(proposal.get("separate") or [])}
     with open(os.path.join(work_dir, "auto_prompts.json"), "w", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, indent=2)
     if prompts:
