@@ -506,12 +506,12 @@ def split_separate_instances(labels, names, adjacency, areas, words, min_share=0
         pairs = adjacency[inside[adjacency].all(axis=1)]
         components = [np.asarray(c) for c in
                       trimesh.graph.connected_components(pairs, nodes=faces, min_len=1)]
-        if len(components) < 2:
+        wanted = counts.get(name)
+        if len(components) < 2 and not (wanted and wanted >= 2 and centroids is not None):
             continue
         clusters = _cluster_components(components, centroids, gap) if centroids is not None \
             else [[c] for c in components]
         total = areas[faces].sum()
-        wanted = counts.get(name)
         clusters = _merge_clusters(clusters, centroids, areas, total, min_share, wanted)
         if len(clusters) < 2:
             continue
@@ -560,13 +560,13 @@ def _cluster_components(components, centroids, gap):
     return list(groups.values())
 
 
-def _kmeans_split(points, weights, k, iterations=30, seed=0):
-    """Area-weighted k-means on face centroids; returns k index arrays into `points`.
+def _kmeans_split(points, weights, k, iterations=50):
+    """Cut a face set into k pieces by position; returns k index arrays into `points`.
 
-    Seeds are spread along the principal axis whose area profile has the deepest dip in
-    its middle: two legs joined at the crotch are taller than they are wide, so the
-    longest axis would cut them into feet and hips, while the profile across them has a
-    gap between the legs. Lloyd iterations then follow the geometry."""
+    The cut is a 1-D, area-weighted k-means along the principal axis that is cheapest to
+    cut through (see _cut_cost): two legs joined at the crotch are taller than the pair is
+    wide, so a 3-D k-means would settle on feet-versus-hips; along the across-axis the
+    only thing in the way is the crotch. Deterministic and independent of face order."""
     points = np.asarray(points, dtype=float)
     weights = np.asarray(weights, dtype=float)
     if k <= 1 or len(points) < k:
@@ -574,33 +574,39 @@ def _kmeans_split(points, weights, k, iterations=30, seed=0):
     centre = np.average(points, axis=0, weights=weights)
     spread = points - centre
     axes = np.linalg.svd(spread * np.sqrt(weights)[:, None], full_matrices=False)[2]
-    axis = axes[int(np.argmin([_profile_dip(spread @ a, weights) for a in axes]))]
-    order = np.argsort(spread @ axis)
-    seeds = points[order[((np.arange(k) + 0.5) / k * (len(points) - 1)).astype(int)]].copy()
+    axis = axes[int(np.argmin([_cut_cost(spread @ a, weights) for a in axes]))]
+    coordinate = spread @ axis
+    order = np.argsort(coordinate, kind="stable")
+    cumulative = np.cumsum(weights[order]) / weights.sum()
+    # equal-area quantile seeds along the axis
+    seeds = np.array([coordinate[order][min(int(np.searchsorted(cumulative, (j + 0.5) / k)),
+                                             len(order) - 1)] for j in range(k)])
     assign = None
     for _ in range(iterations):
-        d = ((points[:, None, :] - seeds[None, :, :]) ** 2).sum(axis=2)
-        new_assign = d.argmin(axis=1)
+        new_assign = np.abs(coordinate[:, None] - seeds[None, :]).argmin(axis=1)
         if assign is not None and np.array_equal(new_assign, assign):
             break
         assign = new_assign
         for j in range(k):
             member = assign == j
             if member.any():
-                seeds[j] = np.average(points[member], axis=0, weights=weights[member])
+                seeds[j] = np.average(coordinate[member], weights=weights[member])
     return [np.flatnonzero(assign == j) for j in range(k)]
 
 
-def _profile_dip(coordinate, weights, bins=24):
-    """Lowest area bin in the central half of the profile over the median bin (0 = a clean
-    gap across this axis, 1 = no dip). Ties favour the axis with more spread."""
-    lo, hi = float(coordinate.min()), float(coordinate.max())
-    if hi - lo <= 1e-12:
+def _cut_cost(coordinate, weights, slab=0.1):
+    """Share of the surface that a plane cut at the area-balanced position would slice
+    through (faces within a slab of `slab` x the extent). Two legs joined at the crotch
+    are cheap to cut left/right (only the crotch is in the slab) and expensive to cut
+    top/bottom (both legs are). Ties favour the longer axis."""
+    order = np.argsort(coordinate)
+    cumulative = np.cumsum(weights[order])
+    median = coordinate[order][int(np.searchsorted(cumulative, cumulative[-1] / 2))]
+    extent = float(coordinate.max() - coordinate.min())
+    if extent <= 1e-12:
         return 2.0
-    hist = np.histogram(coordinate, bins=bins, range=(lo, hi), weights=weights)[0]
-    centre = hist[bins // 4: bins - bins // 4]
-    median = float(np.median(hist[hist > 0])) if (hist > 0).any() else 1.0
-    return float(centre.min() / max(median, 1e-12)) - 1e-3 * (hi - lo)
+    inside = np.abs(coordinate - median) <= slab * extent / 2
+    return float(weights[inside].sum() / max(weights.sum(), 1e-12)) - 1e-6 * extent
 
 
 def _merge_clusters(clusters, centroids, areas, total, min_share, wanted):

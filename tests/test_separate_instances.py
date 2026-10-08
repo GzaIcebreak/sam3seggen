@@ -72,6 +72,8 @@ class JoinedInstancesTest(unittest.TestCase):
         bridge = trimesh.creation.box(extents=(1.0, 0.3, 0.3)).apply_translation((0, 0, 1.35))
         mesh = trimesh.util.concatenate([left, right, bridge])
         mesh.merge_vertices()
+        for _ in range(3):                      # a dense surface, like the remesh
+            mesh = mesh.subdivide()
         labels = np.zeros(len(mesh.faces), dtype=int)
         new_labels, names, report = split_separate_instances(
             labels, ["leg"], welded_face_adjacency(mesh), mesh.area_faces, {"leg": 2},
