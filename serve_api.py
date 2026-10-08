@@ -67,6 +67,8 @@ from smart_prompts import vlm_config, vlm_key_available
 
 _DEFAULTS = PipelineOptions()
 
+TMP_DIR = os.environ.get("SEGVIGEN_TMP_DIR") or None  # None = system temp
+
 JOBS_DIR = os.path.abspath(os.environ.get(
     "SEGVIGEN_JOBS_DIR", os.path.join(tempfile.gettempdir(), "segvigen_jobs")))
 JOB_ID = re.compile(r"\A[0-9a-f]{32}\Z")
@@ -547,45 +549,66 @@ async def pipeline(
                         {"prompts": prompts, **resolved.segment_kwargs()})
 
 
-@app.post("/pipeline_guided", status_code=202)
-async def pipeline_guided(
-    glb: UploadFile = File(..., description="The model to split and repair."),
-    guide: UploadFile = File(..., description="引导图: a render of this model with every "
+@app.post("/guide_prompts")
+async def guide_prompts(
+    guide: UploadFile = File(..., description="引导图: a render of the model with every "
                              "wanted part painted one flat colour on a black background."),
-    options: OptionalStr = Form(
-        None,
-        description="Optional JSON object of PipelineOptions overrides, same as /pipeline."),
+    glb: UploadFile = File(None, description="Optional: the model itself. Four renders of "
+                           "it are shown to the vision model next to the guide (about a "
+                           "minute); without it the guide alone is read (seconds)."),
 ) -> dict:
-    """One shot steered by a reference segmentation image instead of text prompts.
+    """Turn a reference segmentation image into prompts for POST /pipeline.
 
-    The guide is shown to the vision model next to the renders: every flat colour is one
-    part to name (a left/right pair shares a word), the largest central colour is the main
-    body. SAM3 then measures those words and the usual split -> repair -> texture follows.
-    Needs the smart-mode key (SEGVIGEN_VLM_API_KEY), like mode=smart.
+    The vision model reads the guide (one flat colour per wanted part) against the bank
+    vocabulary and names the object, the main-body word and the part words. Nothing is
+    segmented here: pass the returned `prompts` and `unassigned_to` to /pipeline as they
+    are, or edit them first. Needs the smart-mode key (SEGVIGEN_VLM_API_KEY).
     """
-    overrides = {}
-    if options:
-        try:
-            overrides = json.loads(options)
-        except json.JSONDecodeError as exc:
-            raise HTTPException(400, f"options must be a JSON object: {exc}")
-        if not isinstance(overrides, dict):
-            raise HTTPException(400, "options must be a JSON object")
-    merged = {**overrides, "mode": "smart"}
-    _check_switches(merged)
     if not vlm_key_available():
-        raise HTTPException(400, "/pipeline_guided needs SEGVIGEN_VLM_API_KEY on the server "
+        raise HTTPException(400, "/guide_prompts needs SEGVIGEN_VLM_API_KEY on the server "
                                  "(env var or the repo .env file), like mode=smart")
-    try:
-        resolved = PipelineOptions.from_mapping(merged)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(400, f"bad option: {exc}")
     guide_bytes = await guide.read()
     if not guide_bytes:
         raise HTTPException(400, "guide must be an image file")
-    return _enqueue_job(await glb.read(), glb.filename or "input.glb",
-                        {"prompts": "", **resolved.segment_kwargs()},
-                        guide=(guide.filename or "guide.png", guide_bytes))
+    from auto_prompts import bank_concepts
+    from smart_prompts import kimi_shortlist
+
+    with tempfile.TemporaryDirectory(dir=TMP_DIR) as tmp:
+        guide_path = os.path.join(tmp, "guide" + (os.path.splitext(guide.filename or "")[1] or ".png"))
+        with open(guide_path, "wb") as file:
+            file.write(guide_bytes)
+        images = []
+        if glb is not None and glb.filename:
+            model_path = os.path.join(tmp, "model.glb")
+            with open(model_path, "wb") as file:
+                file.write(await glb.read())
+            from merge_parts import render_views
+
+            views_dir = render_views(model_path, os.path.join(tmp, "views"),
+                                     "45,135,225,315", "15", 2.0, 512, reuse=False)
+            with open(os.path.join(views_dir, "cameras.json"), encoding="utf-8") as handle:
+                images = [os.path.join(views_dir, view["image"])
+                          for view in json.load(handle)["views"]]
+        bank = segment_parts.DEFAULT_CONCEPT_BANK
+        concepts = bank_concepts(segment_parts.DEFAULT_PY_SAM3, bank,
+                                 os.path.dirname(os.path.abspath(bank)))
+        try:
+            chosen = kimi_shortlist(images, concepts, guide_image=guide_path)
+        except Exception as exc:
+            raise HTTPException(502, f"the vision model did not answer usably: {exc}") from exc
+    parts = [p for p in chosen["parts"] if p != chosen["main"]]
+    prompts = parts + ([chosen["main"]] if chosen["main"] else [])
+    return {
+        "object": chosen.get("object"),
+        "main": chosen.get("main"),
+        "parts": parts,
+        "prompts": ", ".join(prompts),
+        "unassigned_to": chosen.get("main"),
+        "colours": chosen.get("separate") or {},
+        "dropped_not_in_bank": chosen.get("dropped") or [],
+        "model": chosen.get("model"),
+        "next": "POST /pipeline with -F prompts=<prompts> -F unassigned_to=<unassigned_to>",
+    }
 
 
 @app.get("/jobs/{job_id}/result")

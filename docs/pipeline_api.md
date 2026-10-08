@@ -111,22 +111,22 @@ curl -o repaired_parts.glb "$HOST/jobs/23a10e71…/result"
 `curl -o` 存到运行命令的当前目录；浏览器直接打开存到默认下载文件夹。文件本身一直在服务器 `$SEGVIGEN_JOBS_DIR/{job_id}/complete/xpart_parts.glb`，不下载也能用。
 
 
-## 4b. 引导图一条龙（`POST /pipeline_guided`）
+## 4b. 引导图 → 提示词（`POST /guide_prompts`）
 
-不想写提示词、但手里有一张"想拆成什么样"的图（比如给模型每个部件涂一种颜色的渲染图）时，用这个接口：
+手里有一张"想拆成什么样"的图（给模型每个部件涂一种颜色的渲染图）时，先让视觉大模型把它翻译成提示词，再照常提交 `/pipeline`：
 
 ```sh
-curl -sS -X POST "$HOST/pipeline_guided" \
-  -F "glb=@人物-06.glb" \
-  -F "guide=@人物-06_gt.png" \
-  -F 'options={"merge_gap": 0.01}'          # 可选，和 /pipeline 的 options 一样
+# 1) 引导图 -> 提示词（几秒；加 -F glb=@人物-06.glb 会渲染 4 张视图一起给模型看，约 1 分钟）
+curl -sS -X POST "$HOST/guide_prompts" -F "guide=@人物-06_gt.png"
+# {"object": "lego minifigure", "main": "torso", "parts": ["head", "arm", "hand", "leg"],
+#  "prompts": "head, arm, hand, leg, torso", "unassigned_to": "torso", "colours": {"leg": 2, "arm": 2, ...}, ...}
+
+# 2) 原接口
+curl -sS -X POST "$HOST/pipeline" -F "glb=@人物-06.glb" -F "prompts=head, arm, hand, leg, torso" -F "unassigned_to=torso"
 ```
 
-- `guide`：该模型的一张渲染图，每个想拆出的部件涂一种平色，黑色背景（左右两只手可以涂不同色，也可以同色）。
-- 视觉大模型对照引导图和管线自己的渲染图命名：每种颜色块给一个概念库里的词，左右对称件共用一个词，最大的中心块当主体；SAM3 只测这几个词确认找得到，然后和 `/pipeline` 一样拆分、修复、贴图。乐高人仔配 9 色 GT 图，得到 `head, arm, hand, leg, waist + torso`（`waist` SAM3 没找到被丢弃）。
-- 返回与 `/pipeline` 相同的 202 票据，之后 `GET /jobs/{id}`、`/jobs/{id}/result` 照旧。需要服务器配好 `SEGVIGEN_VLM_API_KEY`（与 `mode=smart` 相同），否则 400。
-- 参考图里同一种部件涂了不同颜色（左腿红、右腿绿）时，Qwen 会把它列进 `separate`，该部件按连通块拆成 `leg`、`leg 2` 两个独立部件导出（`/pipeline` 也可在 `options` 里手动给 `"separate": "leg,arm"`）。
-- 目前引导图只决定**拆成哪些部件**（命名、数量、哪些要左右分开）；颜色边界本身还没有用来切几何（下一步：对齐视角后把颜色区域投影到网格参与投票，那时才能区分左右）。
+- 只保留概念库里有的词（不在库里的列在 `dropped_not_in_bank`）；`colours` 是每个部件词在引导图里的颜色数，想把左右件分开导出可以在 `/pipeline` 的 `options` 里给 `"separate": "leg,arm"`（默认不拆）。
+- 这一步不碰 GPU、不做分割，拿到词可以先改再提交。
 
 ## 5. `options` 常用键
 

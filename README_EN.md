@@ -11,10 +11,9 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
 
 ## 📣 What's new
 
-- **Guided one-shot** (`POST /pipeline_guided`): upload the model plus a reference render with every
-  wanted part painted one flat colour; the vision model names the parts from it (one word per colour,
-  symmetric pairs share one), then the usual `/pipeline` flow runs. The colours only decide which parts
-  exist; their boundaries do not cut geometry yet.
+- **Guide image to prompts** (`POST /guide_prompts`): upload a reference render with every wanted part
+  painted one flat colour (optionally the model too); the vision model turns it into `prompts` +
+  `unassigned_to` for the ordinary `/pipeline`. Seconds, and the words can be edited before use.
 - **Smart split mode** (`mode=smart`): with no prompts, a vision model (Qwen `qwen3.8-max` as
   deployed; Kimi works too) names the parts from the renders using the bank's vocabulary and SAM3
   only measures those words (about 30 s; the rule-based sweep of the whole bank takes 6-12 min) -- the car

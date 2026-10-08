@@ -11,8 +11,8 @@ mesh，带真实贴图。
 
 ## 📣 近期更新
 
-- **引导图一条龙**（`POST /pipeline_guided`）：上传模型 + 一张每个部件涂一种颜色的参考图，视觉大模型对照它命名
-  （每种颜色一个部件词，对称件共用），后面流程与 `/pipeline` 相同。目前只决定拆成哪些部件，颜色边界不参与切几何。
+- **引导图 → 提示词**（`POST /guide_prompts`）：上传一张每个部件涂一种颜色的参考图（可选再给模型），视觉大模型
+  把它翻译成 `prompts` + `unassigned_to`，再照常提交 `/pipeline`。几秒出词，可以先改再用。
 - **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）先看渲染图
   从概念库词表里命名，SAM3 只测这几个词（约 30 秒，规则提名要扫全库 6–12 分钟）——跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
   需要 `SEGVIGEN_VLM_API_KEY`。
