@@ -290,7 +290,7 @@ python segment_parts.py \
 | `--holopart_large` | `escape` / `always` / `score` | `score` | 混合修复里何时换 HoloPart：大件超框才换 / 大件一律换 / 按评分 |
 | `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`：大件 / 小件的 X-Part 实体低于此分再跑 HoloPart 对比，取高分 |
 | `--score_floor` | float | `0.3` | `score`：两者都低于此分时退回开口面 |
-| `--refine` / `--refine_min_share` | `masks` / `off`、float | `off` / `0.1` | 投票后按面读掩码，把单元里一整块被别的名字认领的区域切出来 |
+| `--refine` / `--refine_min_share` | `masks` / `off`、float | `masks` / `0.05` | 投票后按面读掩码，把单元里一整块（≥ 单元面积 5%）被别的名字认领的区域切出来。SegviGen 常把腿、尾巴和肚子熔成一个单元，没有哪个掩码能占到一半，整块就归了主体；以前这步因为在未焊接的网格上找连通块而从没起过作用，现在默认开 |
 | `--export_from` | `source` / `remesh` | `source` | 部件从原模型切（原分辨率、原 UV，不烘）；`remesh` 从重建网格切再烘 |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part 重建 |
 | `--texture_size` | int | `2048` | 烘焙分辨率 |

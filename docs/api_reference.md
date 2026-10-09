@@ -236,7 +236,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `concept_bank` / `no_concept_bank` | 路径 / bool | 环境变量 | 换概念库，或退回原生 SAM3；不要同传 |
 | `flat_paint` | `auto` / `on` / `off` | `auto` | 无贴图模型先平涂再给 SAM3 |
 | `min_recall` | float | `0.5` | 掩码至少盖住单元这么多像素才认领 |
-| `refine` / `refine_min_share` | `masks` / `off`，float | `off` / `0.1` | 投票后按面读掩码，把单元里一整块被别的名字认领的区域切出来。给「几何没分开、掩码分得开」的模型用 |
+| `refine` / `refine_min_share` | `masks` / `off`，float | `masks` / `0.05` | 投票后按面读掩码，把单元里一整块被别的名字认领的区域切出来。给「几何没分开、掩码分得开」的模型用 |
 
 ### 5.4 导出
 

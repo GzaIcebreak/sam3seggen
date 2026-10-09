@@ -301,7 +301,7 @@ Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached
 | `--holopart_large` | `escape` / `always` / `score` | `score` | when hybrid repair swaps in HoloPart: large solid left its box / every large one / by score |
 | `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`: a large / small X-Part solid below this also gets a HoloPart draw; the better one wins |
 | `--score_floor` | float | `0.3` | `score`: both below this keeps the open surface instead |
-| `--refine` / `--refine_min_share` | `masks` / `off`, float | `off` / `0.1` | after the vote, cut a unit where the masks read per face name a coherent patch of it differently |
+| `--refine` / `--refine_min_share` | `masks` / `off`, float | `masks` / `0.05` | after the vote, cut a unit where the masks read per face name a coherent patch (>= 5% of the unit) differently; SegviGen fuses legs, tail and belly into one unit no mask can claim, and this used to be a no-op on the unwelded mesh |
 | `--export_from` | `source` / `remesh` | `source` | cut the parts from the source model (full resolution, its own UVs, no bake) or from the remesh + bake |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part reconstruction |
 | `--texture_size` | int | `2048` | bake resolution |
