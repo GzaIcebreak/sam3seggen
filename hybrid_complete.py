@@ -304,22 +304,58 @@ def _edge_loops(edges):
     return loops
 
 
-def cap_loops(mesh, loops):
-    """Close each boundary loop with a fan around its centroid; returns a new mesh."""
+CAP_RINGS = 4            # concentric rings a cap is built from (a fan when the loop is tiny)
+CAP_SMOOTH = 25          # Laplacian passes over the cap's interior, rim fixed
+
+
+def cap_loops(mesh, loops, rings=CAP_RINGS, smooth=CAP_SMOOTH):
+    """Close each boundary loop with a smooth cap; returns a new mesh.
+
+    The cap is built from concentric rings shrinking towards the loop's centroid, so the
+    boundary edges stay exactly those of the hole (watertight), and its interior vertices
+    are then Laplacian-smoothed with the rim fixed: a soap film over the hole instead of a
+    fan, which on a non-planar rim showed every triangle as a facet."""
     if not loops:
         return mesh
-    vertices = [np.asarray(mesh.vertices)]
+    base = np.asarray(mesh.vertices)
+    vertices = [base]
     faces = [np.asarray(mesh.faces)]
-    offset = len(mesh.vertices)
+    offset = len(base)
+    first_new = offset
     for loop in loops:
         ring = np.asarray(loop)
-        centre = np.asarray(mesh.vertices)[ring].mean(axis=0)
+        n = len(ring)
+        points = base[ring]
+        centre = points.mean(axis=0)
+        layers = [ring]
+        if n >= 6 and rings >= 2:
+            for k in range(1, rings):
+                t = 1.0 - k / rings
+                vertices.append(centre + (points - centre) * t)
+                layers.append(offset + np.arange(n))
+                offset += n
         vertices.append(centre[None])
-        # a boundary edge a->b is traversed a->b by its face; the cap traverses it b->a
-        nxt = np.roll(ring, -1)
-        faces.append(np.stack([nxt, ring, np.full(len(ring), offset)], axis=1))
+        centre_index = offset
         offset += 1
-    return trimesh.Trimesh(np.concatenate(vertices), np.concatenate(faces), process=False)
+        # a boundary edge a->b is traversed a->b by its face; the cap traverses it b->a
+        for outer, inner in zip(layers[:-1], layers[1:]):
+            outer_next, inner_next = np.roll(outer, -1), np.roll(inner, -1)
+            faces.append(np.stack([outer_next, outer, inner], axis=1))
+            faces.append(np.stack([outer_next, inner, inner_next], axis=1))
+        last = layers[-1]
+        faces.append(np.stack([np.roll(last, -1), last, np.full(n, centre_index)], axis=1))
+    capped = trimesh.Trimesh(np.concatenate(vertices), np.concatenate(faces), process=False)
+    if smooth > 0 and offset > first_new:
+        positions = np.array(capped.vertices)
+        movable = np.arange(first_new, offset)
+        neighbours = capped.vertex_neighbors
+        for _ in range(smooth):
+            for v in movable:
+                nb = neighbours[v]
+                if nb:
+                    positions[v] = positions[nb].mean(axis=0)
+        capped = trimesh.Trimesh(positions, np.asarray(capped.faces), process=False)
+    return capped
 
 
 def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
