@@ -11,7 +11,7 @@ import os
 import numpy as np
 import trimesh
 
-from xpart_complete import box_escape, group_solids, hollow_share, load_part_nodes
+from xpart_complete import box_escape, group_solids, hollow_share, load_part_nodes, thin_faces
 
 ESCAPE_LIMIT = 0.5
 AREA_LARGE = 0.08
@@ -191,7 +191,7 @@ SCORE_EXTRA_SCALE = 0.35  # invented geometry this far out (p90) zeroes the scor
                           # closing a thigh sits ~0.1 of the diagonal off the open surface
 ESCAPE_FREE = 0.2         # a solid may reach this far past its box before it counts (the plug)
 RIM_BAND = 0.16           # within this x diagonal of the part's own cut rim: the collar zone
-HOLOPART_MARGIN = 0.1     # HoloPart replaces an X-Part solid only when ahead by this much
+HOLOPART_MARGIN = 0.2     # HoloPart replaces an X-Part solid only when ahead by this much
 SCORE_CANDIDATE = 0.8     # a large instance below this also gets a HoloPart draw to compare
 SCORE_CANDIDATE_SMALL = 0.6  # a small one; X-Part is at home on small parts, so ask less often
 SCORE_FLOOR = 0.3         # both below this: keep the open surface instead of either solid
@@ -311,18 +311,23 @@ def cap_loops(mesh, loops):
 
 
 def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
-                    min_faces=INTRUSION_MIN_FACES, band=RIM_BAND):
+                    min_faces=INTRUSION_MIN_FACES, band=RIM_BAND, box=None):
     """Cut the solid's regions that duplicate a neighbour; cap the holes. (mesh, cut share).
 
-    Only regions with a short rim are cut (a regrown tail, a paw). Inside the band along
-    the part's own cut rim nothing is cut: that is where the plug of a part closed through
-    its cut passes the neighbour's surface, and slicing a ring out of it left the plug's
-    dome as a loose shell."""
+    Two kinds of region go. Outside the band along the part's own cut rim: an intruding
+    region with a short rim (a regrown tail, a paw). Inside the band: an intruding region
+    that is THIN (thin_faces) -- the plate or ring the generator copied from the
+    neighbour's surface along the cut; the plug of a part closed through its cut also
+    touches the neighbour there but is thick, so it stays (slicing a ring out of it left
+    the plug's dome as a loose shell)."""
     if solid is None or not len(solid.faces) or surfaces is None:
         return solid, 0.0
     centres = solid.triangles_center
-    bad = surfaces.intruding(inst, centres, tau)
-    bad &= ~surfaces.near_rim(inst, centres, band * diag)
+    intruding = surfaces.intruding(inst, centres, tau)
+    in_band = surfaces.near_rim(inst, centres, band * diag)
+    thin = thin_faces(solid, box) if box is not None and intruding.sum() >= min_faces         else np.zeros(len(centres), dtype=bool)
+    # inside the band only a THICK intruding region is spared: that is the plug
+    bad = intruding & (thin | ~in_band)
     if bad.sum() < min_faces:
         return solid, 0.0
     adjacency = np.asarray(solid.face_adjacency)
@@ -331,9 +336,14 @@ def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
         adjacency[both], nodes=np.flatnonzero(bad), min_len=min_faces)
     remove = np.zeros(len(bad), dtype=bool)
     edge_vertices = np.asarray(solid.face_adjacency_edges)
+    face_area = np.asarray(solid.area_faces)
     for component in components:
         in_comp = np.zeros(len(bad), dtype=bool)
         in_comp[np.asarray(component)] = True
+        thin_area = float(face_area[in_comp & thin].sum() / max(face_area[in_comp].sum(), 1e-12))
+        if thin_area > 0.5:                       # a flange (by area) goes whatever its rim length
+            remove |= in_comp
+            continue
         rim = in_comp[adjacency].sum(axis=1) == 1
         rim_length = float(np.linalg.norm(
             solid.vertices[edge_vertices[rim, 0]] - solid.vertices[edge_vertices[rim, 1]],
@@ -454,7 +464,7 @@ def prepare_solid(row, solid, surfaces, tau=SCORE_TAU):
     """Cut what duplicates a neighbour, then measure. (mesh, metrics, cut share)."""
     box = np.asarray(row["box"], dtype=float)
     diag = max(float(np.linalg.norm(box[1] - box[0])), 1e-9)
-    culled, share = cull_intrusions(solid, row.get("instance"), surfaces, tau * diag, diag)
+    culled, share = cull_intrusions(solid, row.get("instance"), surfaces, tau * diag, diag, box=box)
     return culled, share
 
 

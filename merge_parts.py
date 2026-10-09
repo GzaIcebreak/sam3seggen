@@ -414,6 +414,29 @@ def merge_parts(
         print(f"[refine] {len(changes)} patch(es) moved")
         with open(os.path.join(split_dir, "refine_report.json"), "w", encoding="utf-8") as handle:
             json.dump(changes, handle, ensure_ascii=False, indent=2)
+        if changes:
+            # the patches follow mask pixels and their rims are jagged; a few majority
+            # passes over welded neighbours straighten the cut the solids will inherit
+            from refine_units import welded_adjacency
+            from source_export import smooth_labels
+
+            welded = trimesh.Trimesh(np.asarray(reference.vertices), np.asarray(reference.faces),
+                                     process=False)
+            welded.merge_vertices(merge_tex=True, merge_norm=True)
+            labels = smooth_labels(welded, labels, iterations=3)
+            print("[refine] cut lines smoothed (3 majority passes)")
+        if changes:
+            # the patches follow mask pixels and their rims are jagged; a few majority
+            # passes over welded neighbours straighten the cut the solids will inherit
+            import trimesh
+
+            from source_export import smooth_labels
+
+            welded = trimesh.Trimesh(np.asarray(reference.vertices), np.asarray(reference.faces),
+                                     process=False)
+            welded.merge_vertices(merge_tex=True, merge_norm=True)
+            labels = smooth_labels(welded, labels, iterations=3)
+            print("[refine] cut lines smoothed (3 majority passes)")
     if merge == "fragments":
         names_by_unit = [row["name"] for row in rows]
         units, folded_names, absorbed = fold_fragment_units(

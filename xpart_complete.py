@@ -69,6 +69,42 @@ HOLLOW_SAMPLES = 20000
 HOLLOW_REDRAW = 0.5      # redraw a solid whose hollow share is above this
 
 
+def thin_faces(solid, box, thin=HOLLOW_THIN, samples=HOLLOW_SAMPLES, seed=0):
+    """Per face: is the solid thin here? An inward step of `thin` x the box's smallest
+    extent from the face centroid lands outside the solid (judged by the nearest surface
+    sample's normal). A plate or ring copied from a neighbour along the cut is thin on
+    both sides; the plug of a part closed through its cut is not."""
+    from scipy.spatial import cKDTree
+
+    if solid is None or not len(solid.faces):
+        return np.zeros(0, dtype=bool)
+    box = np.asarray(box, dtype=float)
+    step = thin * float(np.maximum(box[1] - box[0], 1e-9).min())
+    dense_points, dense_faces = trimesh.sample.sample_surface(solid, samples * 10, seed=seed)
+    dense_normals = np.asarray(solid.face_normals)[dense_faces]
+    inward = np.asarray(solid.triangles_center) - np.asarray(solid.face_normals) * step
+    nearest = cKDTree(dense_points).query(inward)[1]
+    return np.einsum("ij,ij->i", inward - dense_points[nearest], dense_normals[nearest]) > 0
+
+
+def thin_faces(solid, box, thin=HOLLOW_THIN, samples=HOLLOW_SAMPLES, seed=0):
+    """Per face: is the solid thin here? An inward step of `thin` x the box's smallest
+    extent from the face centroid lands outside the solid (judged by the nearest surface
+    sample's normal). A plate or ring copied from a neighbour along the cut is thin on
+    both sides; the plug of a part closed through its cut is not."""
+    from scipy.spatial import cKDTree
+
+    if solid is None or not len(solid.faces):
+        return np.zeros(0, dtype=bool)
+    box = np.asarray(box, dtype=float)
+    step = thin * float(np.maximum(box[1] - box[0], 1e-9).min())
+    dense_points, dense_faces = trimesh.sample.sample_surface(solid, samples * 10, seed=seed)
+    dense_normals = np.asarray(solid.face_normals)[dense_faces]
+    inward = np.asarray(solid.triangles_center) - np.asarray(solid.face_normals) * step
+    nearest = cKDTree(dense_points).query(inward)[1]
+    return np.einsum("ij,ij->i", inward - dense_points[nearest], dense_normals[nearest]) > 0
+
+
 def hollow_share(solid, box, dense=None, samples=HOLLOW_SAMPLES, thin=HOLLOW_THIN, seed=0):
     """Share of the solid's surface that is a thin wall with empty space behind it.
 
