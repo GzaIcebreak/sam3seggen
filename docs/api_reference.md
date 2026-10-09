@@ -251,7 +251,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `complete` | `off` / `boxes` / `full` / `hybrid` | `hybrid` | `off` 不修复；`boxes` 只写盒子提示不占 GPU；`full` 只用 X-Part；`hybrid` X-Part 之后按 `holopart_large` 决定 |
-| `holopart_large` | `escape` / `always` / `score` | `score` | `score`：每个 X-Part 实体和它的开口面比对打分（覆盖率 × 多余几何 × 出框 × 最大壳占比 × 侵入率 × 空壳率），低分再跑 HoloPart 取高分，都差就保留开口面。空壳率：从实体表面沿法线向内走最小包围盒边长的 8%，落在实体外面的样本占比——X-Part 只拿开口面做条件时常把面“加厚”成薄双层壳（碗状的头、空心的腿），距离类指标全看不出，这项 0.8–1.0；实心件 ≤ 0.2，刀片、帆 0。超过 15% 开始扣分，65% 归零。采用的实体都丢掉 < 0.5% 面积的碎壳。`escape`：大件且超框 > 50% 才换。`always`：大件一律换 |
+| `holopart_large` | `escape` / `always` / `score` | `score` | `score`：每个 X-Part 实体和它的开口面比对打分（覆盖率 × 多余几何 × 出框 × 最大壳占比 × 侵入率 × 空壳率），低分再跑 HoloPart 取高分，都差就保留开口面。空壳率：从实体表面沿法线向内走最小包围盒边长的 8%，落在实体外面的样本占比——X-Part 只拿开口面做条件时常把面“加厚”成薄双层壳（碗状的头、空心的腿），距离类指标全看不出，这项 0.8–1.0；实心件 ≤ 0.2，刀片、帆 0。超过 15% 开始扣分，65% 归零。采用的实体都丢掉 < 0.5% 面积的碎壳。封“过”切口的塞头是正常几何：多余几何按 p90/0.35 扣、出框 20% 以内不扣、切口沿线 16% 对角线的带状区域不算侵入也不切；HoloPart 贴着开口面长、距离指标天然占便宜，只有比 X-Part 高出 0.1 以上才替换。`escape`：大件且超框 > 50% 才换。`always`：大件一律换 |
 | `score_candidate` / `score_candidate_small` | float | `0.8` / `0.6` | 大件 / 小件低于此分才跑 HoloPart 对比。降低可以省时间 |
 | `score_floor` | float | `0.3` | 两个后端都低于此分时保留开口面 |
 | `condition` | `surface` / `collar` / `box` | `collar` | X-Part 的条件点：`surface` 拆分归属面；`collar` 归属面再加切口两侧邻居面的一圈（切口外 8% 部件对角线以内，最多占 25% 的点），让模型看到切口外表面怎么延续，把部件封“过”切口而不是加厚成壳；`box` 盒内裁剪（X-Part 原生做法，会把盒子里的邻居一起长出来）。当前默认 拆分归属面 + 切口处邻居面的一圈（collar，默认） |
