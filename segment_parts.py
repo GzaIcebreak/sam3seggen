@@ -65,7 +65,7 @@ from pipeline import (  # noqa: F401 — GRANULARITY / DEFAULT_* are the public 
     DEFAULT_REDRAWS, DEFAULT_RESOLUTION, DEFAULT_SAM3_THRESHOLD, DEFAULT_SAMPLES,
     DEFAULT_SEED, DEFAULT_TEXTURE_SIZE, DEFAULT_VIEW_AZIMUTHS, DEFAULT_VIEW_ELEVATIONS,
     DEFAULT_HOLOPART_ROOT, DEFAULT_HOLOPART_WEIGHTS,
-    DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS, GRANULARITY,
+    DEFAULT_XPART_ROOT, DEFAULT_XPART_WEIGHTS, GRANULARITY, DEFAULT_UNITS, DEFAULT_PY_XPART,
     PipelineOptions, add_cli_arguments, check_cli, floors,
 )
 from prompt_specs import (
@@ -161,6 +161,7 @@ def segment_parts(
     merge_max_share=None,
     refine=DEFAULT_REFINE,
     refine_min_share=DEFAULT_REFINE_MIN_SHARE,
+    units=DEFAULT_UNITS,
     export_from=DEFAULT_EXPORT_FROM,
     auto_prompts=True,
     mode="auto",
@@ -308,7 +309,20 @@ def segment_parts(
     # All samples in one process (one model load, one voxelisation, one Blender scene for
     # the conditioning views). Sample 0 is still the split's reference mesh and the source
     # of the temporary flat colour; the guidance overlays are drawn right after.
-    sample_glbs = full_seg(range(samples))
+    p3 = None
+    if units in ("auto", "p3sam"):
+        from p3sam_units import p3sam_atoms
+
+        print("[units] P3-SAM native part segmentation of the source model ...")
+        p3 = p3sam_atoms(glb, work_dir, py_xpart or DEFAULT_PY_XPART, seed=seed, reuse=reuse)
+        if p3 is None and units == "p3sam":
+            raise SystemExit("units=p3sam, but P3-SAM found no usable split of this model (see above)")
+    if p3 is not None:
+        # P3-SAM's pieces are the atoms; its seg.glb stands in for the SegviGen sample
+        # wherever one is read (flat paint, guidance, the vote's reference mesh)
+        sample_glbs = [p3["seg_glb"]]
+    else:
+        sample_glbs = full_seg(range(samples))
     if propose:
         from auto_prompts import propose_prompts
 
@@ -335,16 +349,27 @@ def segment_parts(
             require_masks=strict_parts, assign=assign, rank_model=rank_model,
             rank_drop=rank_drop, rank_add=rank_add)
 
-    print(f"[split] intersecting {samples} partitions into atoms ...")
-    reference, atoms, report = meet_samples(sample_glbs, color_tol, min_atom_faces, mirror)
-    np.save(atoms_npy, atoms)
-    atoms_debug_glb(reference, atoms, os.path.join(work_dir, "atoms.glb"))
-    with open(os.path.join(work_dir, "atoms_report.json"), "w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2)
-    mirrored = (f"mirrored about {report['mirror_axis']}" if report["mirror_axis"]
-                else f"not mirrored (symmetry {report['mirror_share']:.2f})")
-    print(f"  labels per sample {report['labels_per_sample']}, {mirrored} -> "
-          f"{report['atoms']} atoms, largest {report['largest_share']:.1%} of the area")
+    if p3 is not None:
+        from data_toolkit.parts_rebake import load_single_mesh
+
+        reference, atoms, report = load_single_mesh(p3["seg_glb"]), p3["atoms"], p3["report"]
+        np.save(atoms_npy, atoms)
+        atoms_debug_glb(reference, atoms, os.path.join(work_dir, "atoms.glb"))
+        with open(os.path.join(work_dir, "atoms_report.json"), "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        print(f"  P3-SAM pieces -> {report['atoms']} atoms, largest "
+              f"{report['largest_share']:.1%} of the area")
+    else:
+        print(f"[split] intersecting {samples} partitions into atoms ...")
+        reference, atoms, report = meet_samples(sample_glbs, color_tol, min_atom_faces, mirror)
+        np.save(atoms_npy, atoms)
+        atoms_debug_glb(reference, atoms, os.path.join(work_dir, "atoms.glb"))
+        with open(os.path.join(work_dir, "atoms_report.json"), "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        mirrored = (f"mirrored about {report['mirror_axis']}" if report["mirror_axis"]
+                    else f"not mirrored (symmetry {report['mirror_share']:.2f})")
+        print(f"  labels per sample {report['labels_per_sample']}, {mirrored} -> "
+              f"{report['atoms']} atoms, largest {report['largest_share']:.1%} of the area")
 
     # split_units also fuses each remesh inner wall into the outer shell it lines. That
     # has to happen before anything is named: the two are not edge-connected, so a

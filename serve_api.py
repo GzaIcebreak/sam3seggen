@@ -59,7 +59,7 @@ import segment_parts
 from pipeline import (
     COMPLETE_MODES, CONDITION_MODES, FLAT_PAINT_MODES, GRANULARITY,
     EXPORT_FROM_MODES, HOLOPART_LARGE_MODES, MERGE_MODES_ALL, MIRROR_MODES, MODES,
-    PipelineOptions, REFINE_MODES,
+    PipelineOptions, REFINE_MODES, UNITS_MODES,
 )
 
 from merge_parts import parse_part_floors
@@ -488,7 +488,7 @@ def _check_switches(mapping: dict) -> None:
         ("complete", COMPLETE_MODES), ("condition", CONDITION_MODES),
         ("holopart_large", HOLOPART_LARGE_MODES), ("refine", REFINE_MODES),
         ("export_from", EXPORT_FROM_MODES), ("flat_paint", FLAT_PAINT_MODES),
-        ("mirror", MIRROR_MODES), ("mode", MODES),
+        ("mirror", MIRROR_MODES), ("mode", MODES), ("units", UNITS_MODES),
     )
     for key, allowed in checks:
         value = mapping.get(key)
@@ -668,7 +668,12 @@ async def segment(
                     "hybrid (X-Part, HoloPart on large box-escapees; default)."),
     condition: str = Form(
         _DEFAULTS.condition,
-        description="surface = faces the split assigned; box = whatever is in the box."),
+        description="surface = faces the split assigned; collar = those plus the neighbours "
+                    "along the cut (default); box = whatever is in the box."),
+    units: str = Form(
+        _DEFAULTS.units,
+        description="auto = P3-SAM native 3D part segmentation when it splits the model, "
+                    "else the SegviGen samples; p3sam / segvigen force one."),
     min_area_share: float = Form(_DEFAULTS.min_area_share),
     fragment_share: float = Form(
         _DEFAULTS.fragment_share,
@@ -743,6 +748,8 @@ async def segment(
         raise HTTPException(400, f"complete must be one of {COMPLETE_MODES}")
     if condition not in CONDITION_MODES:
         raise HTTPException(400, f"condition must be one of {CONDITION_MODES}")
+    if units not in UNITS_MODES:
+        raise HTTPException(400, f"units must be one of {UNITS_MODES}")
     if holopart_large not in HOLOPART_LARGE_MODES:
         raise HTTPException(400, f"holopart_large must be one of {HOLOPART_LARGE_MODES}")
     if refine not in REFINE_MODES:
@@ -789,6 +796,7 @@ async def segment(
         "merge": merge,
         "complete": complete,
         "condition": condition,
+        "units": units,
         "min_area_share": min_area_share,
         "fragment_share": fragment_share,
         "redraws": redraws,

@@ -301,6 +301,7 @@ Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached
 | `--holopart_large` | `escape` / `always` / `score` | `score` | when hybrid repair swaps in HoloPart: large solid left its box / every large one / by score |
 | `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`: a large / small X-Part solid below this also gets a HoloPart draw; the better one wins |
 | `--score_floor` | float | `0.3` | `score`: both below this keeps the open surface instead |
+| `--units` | `auto` / `p3sam` / `segvigen` | `auto` | geometric units: P3-SAM native 3D part segmentation when it splits the model (hard-surface, articulated: joints, every door, every wheel apart), else the SegviGen samples (smooth organic shapes, where P3-SAM returns one part) |
 | `--refine` / `--refine_min_share` | `masks` / `off`, float | `masks` / `0.05` | after the vote, cut a unit where the masks read per face name a coherent patch (>= 5% of the unit) differently; SegviGen fuses legs, tail and belly into one unit no mask can claim, and this used to be a no-op on the unwelded mesh |
 | `--export_from` | `source` / `remesh` | `source` | cut the parts from the source model (full resolution, its own UVs, no bake) or from the remesh + bake |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part reconstruction |

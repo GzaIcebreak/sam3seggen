@@ -76,6 +76,10 @@ HOLOPART_LARGE_MODES = ("escape", "always", "score")
 DEFAULT_REFINE = "masks"           # cut a voted unit where its own masks name a patch differently; off keeps one name per unit
 REFINE_MODES = ("masks", "off")
 DEFAULT_REFINE_MIN_SHARE = 0.05
+# where the geometric units come from: P3-SAM (Hunyuan3D-Part) when it really splits
+# the model, else the SegviGen samples (p3sam_units.py)
+UNITS_MODES = ("auto", "p3sam", "segvigen")
+DEFAULT_UNITS = os.environ.get("SEGVIGEN_UNITS", "auto")
 DEFAULT_EXPORT_FROM = "source"     # cut parts from the source model (full resolution, no bake)
 DEFAULT_AUTO_PROMPTS = True        # no prompts: propose part names from the concept bank
 DEFAULT_MODE = "auto"              # auto: rule-based pick; smart (智能分割): Kimi reviews the candidates
@@ -198,6 +202,8 @@ class PipelineOptions:
     refine: str = DEFAULT_REFINE
     refine_min_share: float = DEFAULT_REFINE_MIN_SHARE
     export_from: str = DEFAULT_EXPORT_FROM
+    # geometric units: auto = P3-SAM when it splits the model, else SegviGen samples
+    units: str = DEFAULT_UNITS
     # export each big connected instance of these part names as its own part ("leg", "leg 2");
     # comma list or "all". The guided flow fills it from the reference's colours.
     separate: str = ""
@@ -225,6 +231,7 @@ class PipelineOptions:
                 "holopart_large": list(HOLOPART_LARGE_MODES),
                 "refine": list(REFINE_MODES),
                 "export_from": list(EXPORT_FROM_MODES),
+                "units": list(UNITS_MODES),
                 "mode": list(MODES),
             },
             "defaults": {
@@ -294,6 +301,7 @@ class PipelineOptions:
             "refine": self.refine,
             "refine_min_share": self.refine_min_share,
             "export_from": self.export_from,
+            "units": self.units,
             "separate": self.separate,
             "auto_prompts": self.auto_prompts,
             "mode": self.mode,
@@ -302,7 +310,7 @@ class PipelineOptions:
     def merge_kwargs(self):
         """kwargs for merge_parts.merge_parts, minus glb / prompts / split_dir / out_glb."""
         skip = {"samples", "sample_export", "azimuth", "azimuth_jitter", "color_tol",
-                "granularity", "min_atom_faces", "mirror", "auto_prompts", "mode"}
+                "granularity", "min_atom_faces", "mirror", "auto_prompts", "mode", "units"}
         return {k: v for k, v in self.segment_kwargs().items() if k not in skip}
 
     @classmethod
@@ -397,6 +405,7 @@ class PipelineOptions:
             refine=getattr(args, "refine", DEFAULT_REFINE),
             refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
             export_from=getattr(args, "export_from", DEFAULT_EXPORT_FROM),
+            units=getattr(args, "units", DEFAULT_UNITS),
             separate=getattr(args, "separate", "") or "",
             auto_prompts=not getattr(args, "no_auto_prompts", False),
             mode=getattr(args, "mode", DEFAULT_MODE),
@@ -444,7 +453,12 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
                         help="off | boxes (prompts only) | full (X-Part only) | "
                              "hybrid (X-Part, HoloPart on large box-escapees; default)")
     parser.add_argument("--condition", default=DEFAULT_CONDITION, choices=CONDITION_MODES,
-                        help="surface = faces the split assigned; box = whatever is in the box")
+                        help="surface = faces the split assigned; collar = those plus the "
+                             "neighbours along the cut (default); box = whatever is in the box")
+    parser.add_argument("--units", default=DEFAULT_UNITS, choices=UNITS_MODES,
+                        help="Where the geometric pieces come from: auto = P3-SAM native 3D "
+                             "part segmentation when it splits the model (hard-surface, "
+                             "articulated), else the SegviGen samples; p3sam / segvigen force one")
     parser.add_argument("--min_area_share", type=float, default=DEFAULT_MIN_AREA_SHARE,
                         help="Fold an X-Part component below this share of the surface "
                              "into its nearest neighbour instead of generating it alone")

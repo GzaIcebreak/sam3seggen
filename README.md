@@ -22,6 +22,9 @@ mesh，带真实贴图。
   互不重叠的部件名再投票。旧测试里"无需求"一列 10 个模型 8 个 0 分；现在小狗自动得到 head / leg / body，
   椅子 backrest / chair leg / seat cushion。形状词误认（跑车→wing）和薄件（长剑）仍是短板。
 
+- **几何单元优先用 P3-SAM**（`--units auto`，默认）：Hunyuan3D-Part 的原生三维部件分割先切一遍（约 1 分钟），切开了就用它的块
+  做投票单元并跳过 SegviGen 采样——人形在关节处断开、柜子每扇门分开、四个轮子各是一件；它对光滑有机形体（小狗、猫）
+  整个放弃时才回到 SegviGen 过分割。起名、合并、refine、源模型切割、修复都不变。
 - **部件从原模型切**（`--export_from source`，默认）：标签仍在重建网格上投票，但转到原模型的面上后
   直接切原模型，保留原 UV 和贴图，不再回烘。猴子的手从 1.3k 面变成 5–7k 面，手指才保得住。原模型里 < 2% 面积的
   独立小壳整块取多数标签：游戏资产由几百个小件拼成（骑士 426 壳、自行车 827 壳），逐面最近标签会把它们打成碎屑。
@@ -290,6 +293,7 @@ python segment_parts.py \
 | `--holopart_large` | `escape` / `always` / `score` | `score` | 混合修复里何时换 HoloPart：大件超框才换 / 大件一律换 / 按评分 |
 | `--score_candidate` / `--score_candidate_small` | float | `0.8` / `0.6` | `score`：大件 / 小件的 X-Part 实体低于此分再跑 HoloPart 对比，取高分 |
 | `--score_floor` | float | `0.3` | `score`：两者都低于此分时退回开口面 |
+| `--units` | `auto` / `p3sam` / `segvigen` | `auto` | 几何单元：P3-SAM 切开了就用它（硬表面、关节类），否则 SegviGen 采样；可强制 |
 | `--refine` / `--refine_min_share` | `masks` / `off`、float | `masks` / `0.05` | 投票后按面读掩码，把单元里一整块（≥ 单元面积 5%）被别的名字认领的区域切出来。SegviGen 常把腿、尾巴和肚子熔成一个单元，没有哪个掩码能占到一半，整块就归了主体；以前这步因为在未焊接的网格上找连通块而从没起过作用，现在默认开 |
 | `--export_from` | `source` / `remesh` | `source` | 部件从原模型切（原分辨率、原 UV，不烘）；`remesh` 从重建网格切再烘 |
 | `--octree_resolution` / `--seed` | | `512` / `42` | X-Part 重建 |

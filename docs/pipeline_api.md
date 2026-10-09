@@ -130,6 +130,8 @@ curl -sS -X POST "$HOST/pipeline" -F "glb=@人物-06.glb" -F "prompts=head, arm,
 
 ## 5. `options` 常用键
 
+- `units`（默认 `auto`）：几何单元来源。P3-SAM 原生三维分割切开了就用它的块（硬表面、关节类模型，同类实例分开，且跳过 SegviGen 采样省 2–3 分钟）；光滑有机形体它放弃时回到 SegviGen。`p3sam` / `segvigen` 强制。
+
 放进 `options` 的 JSON 里，键名与 `GET /health` 的 `defaults` 一致；没写的用默认值。完整表见 api_reference.md 第 5 节。
 
 | 键 | 默认 | 什么时候改 |

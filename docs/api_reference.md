@@ -236,6 +236,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `concept_bank` / `no_concept_bank` | 路径 / bool | 环境变量 | 换概念库，或退回原生 SAM3；不要同传 |
 | `flat_paint` | `auto` / `on` / `off` | `auto` | 无贴图模型先平涂再给 SAM3 |
 | `min_recall` | float | `0.5` | 掩码至少盖住单元这么多像素才认领 |
+| `units` | `auto` / `p3sam` / `segvigen` | `auto` | **几何单元从哪来**。`auto`：先跑 P3-SAM（Hunyuan3D-Part 的原生三维部件分割，约 1 分钟），它真的把模型切开了（≥ 3 块、每块 ≥ 1% 面积、最大块 < 85%）就用它的块做几何单元、跳过 7 次 SegviGen 采样；否则照旧用 SegviGen。P3-SAM 靠几何折痕切，硬表面/关节类（人形、机甲、家具、车船、工具）切得准、同类实例（四个轮子、八门炮）天然分开；光滑有机形体（小狗、猫）它整个放弃，这时 SegviGen + 掩码 refine 更好。命名、按名合并、refine、源模型切割、修复全部不变。`p3sam` / `segvigen` 强制其一（`p3sam` 在它没切开时报错）。`work/p3sam/` 里有 `stats.json`、`seg.glb`、`atoms.npy` |
 | `refine` / `refine_min_share` | `masks` / `off`，float | `masks` / `0.05` | 投票后按面读掩码，把单元里一整块被别的名字认领的区域切出来。给「几何没分开、掩码分得开」的模型用 |
 
 ### 5.4 导出
