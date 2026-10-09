@@ -42,7 +42,8 @@ DEFAULT_WHOLE = 0.5           # at least this share: a name for the object, not 
 DEFAULT_WHOLE_VLM = 0.6       # for a word the VLM already vouches for as a part
 DEFAULT_SHORTLIST_MIN_VIEWS = 0.25   # a shortlisted word only has to show up in a quarter of the views
 DEFAULT_SHORTLIST_IOU = 0.6          # two shortlisted words whose masks overlap this much are one part
-DEFAULT_SHORTLIST_MIN_COVER = 0.3    # parts covering less than this also get the full-sweep second opinion
+DEFAULT_SHORTLIST_MIN_PARTS = 2      # fewer found parts than this: the full sweep gives a second opinion
+VARIANT_MAX_GROWTH = 2.0             # a variant may cover at most this x the own word's area
 MAX_VARIANT_PHRASES = 48             # SAM3 phrases measured for one shortlist (parts x variants)
 IRREGULAR_SINGULAR = {"feet": "foot", "teeth": "tooth", "antennae": "antenna", "geese": "goose",
                       "men": "man", "women": "woman", "children": "child", "knives": "knife",
@@ -313,17 +314,21 @@ def variant_phrases(chosen, limit=MAX_VARIANT_PHRASES):
     return out
 
 
-def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM, own_views=DEFAULT_MIN_VIEWS):
+def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM, own_views=DEFAULT_MIN_VIEWS,
+                  max_growth=VARIANT_MAX_GROWTH):
     """{part word: best phrase or None}. The VLM's own word when SAM3 sees it in at least
     `own_views` of the views (and it is not a whole-object mask); otherwise the eligible
-    variant seen in the most views, the smaller mask on a tie -- a stand-in for a word
-    SAM3 does not know (`arms`), not a licence to pick the biggest mask (`glove` would
-    swallow the forearm, `boot` the shin)."""
+    variant seen in the most views -- among those, the one closest in size to the own
+    word when SAM3 found the own word at all (and never more than `max_growth` x its
+    per-view area: `male arm` was the whole upper body), else the smaller mask. A variant stands in
+    for a word SAM3 does not know (`arms`); it is not a licence to pick the biggest mask
+    (`glove` would swallow the forearm, `boot` the shin)."""
     by_name = {row["concept"]: row for row in rows}
     total_views = max((row.get("views", 0) for row in rows), default=0)
     picked = {}
     for word, phrases in variant_phrases(chosen).items():
         own = by_name.get(word)
+        own_found = bool(own and own.get("views", 0) > 0 and own.get("area", 0) > 0)
         if own and own.get("eligible") and float(own.get("blob", own["area"])) < whole \
                 and own["views"] >= own_views * max(total_views, 1):
             picked[word] = word
@@ -333,7 +338,12 @@ def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM, own_views=DEFAULT_MIN_V
             row = by_name.get(phrase)
             if not row or not row.get("eligible") or float(row.get("blob", row["area"])) >= whole:
                 continue
-            key = (row["views"], -round(row["area"], 3), -index)
+            per_view = row["area"] / max(row["views"], 1)
+            own_per_view = own["area"] / max(own["views"], 1) if own_found else None
+            if own_found and per_view > max_growth * own_per_view:
+                continue
+            size = -abs(per_view - own_per_view) if own_found else -per_view
+            key = (row["views"], round(size, 4), -index)
             if best is None or key > best[0]:
                 best = (key, phrase)
         picked[word] = best[1] if best else None
@@ -472,9 +482,10 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                         print(f"[smart] not found by SAM3: {kimi.get('not_found') or []}; "
                               f"whole-object words dropped: {kimi.get('dropped_whole') or []}; "
                               f"same thing as another word: {kimi.get('dropped_overlap') or {}}")
-                    if proposal["covered"] < DEFAULT_SHORTLIST_MIN_COVER:
-                        print(f"[smart] the parts cover only {proposal['covered']:.0%} of the "
-                              "silhouette; asking the full bank sweep for a second opinion")
+                    if len(proposal["part_names"]) < DEFAULT_SHORTLIST_MIN_PARTS:
+                        print(f"[smart] only {len(proposal['part_names'])} part found "
+                              f"({proposal['covered']:.0%} of the silhouette); asking the full "
+                              "bank sweep for a second opinion")
                         shortlist_proposal, proposal = proposal, None
 
     if proposal is None:
@@ -518,8 +529,10 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                 else:
                     print("[smart] VLM returned no usable part; keeping the rule-based pick")
     if shortlist_proposal is not None:
-        # the sweep's review is the second opinion: keep whichever covers more
-        if proposal.get("covered", 0.0) > shortlist_proposal["covered"]:
+        # the sweep's review is the second opinion: it wins when it names more parts
+        # and covers more (a one-word shortlist is what sent us here)
+        if len(proposal.get("parts") or []) > len(shortlist_proposal["part_names"]) \
+                and proposal.get("covered", 0.0) > shortlist_proposal["covered"]:
             proposal["shortlist_overruled"] = {
                 "parts": shortlist_proposal["parts"], "covered": shortlist_proposal["covered"]}
             print(f"[smart] the sweep covers {proposal.get('covered', 0.0):.0%} vs the "

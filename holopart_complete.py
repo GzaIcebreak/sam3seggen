@@ -147,22 +147,55 @@ def main():
             batch[key] = [batch[key][i] for i in picked]
         names = [names[i] for i in picked]
         print(f"[holopart] generating {len(names)} of the instances: {names}")
-    scene = run_holopart(
-        pipe,
-        batch=batch,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        num_inference_steps=args.num_inference_steps,
-        guidance_scale=args.guidance_scale,
-        num_chunks=args.num_chunks,
-        device="cuda",
-    )
+    def draw(sub_batch):
+        scene = run_holopart(
+            pipe,
+            batch=sub_batch,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.guidance_scale,
+            num_chunks=args.num_chunks,
+            device="cuda",
+        )
+        return list(scene.geometry.values())
+
+    def slice_batch(indices):
+        index = torch.tensor(indices, device="cuda")
+        sub = dict(batch)
+        for key in ("whole_cond", "part_cond", "part_local_cond"):
+            sub[key] = batch[key].index_select(0, index)
+        for key in ("part_id_list", "part_center_list", "part_scale_list"):
+            sub[key] = [batch[key][i] for i in indices]
+        return sub
+
+    try:
+        meshes = draw(batch)
+        if len(meshes) != len(names):
+            raise RuntimeError(f"HoloPart returned {len(meshes)} solids for {len(names)} instances")
+        results = list(zip(names, meshes))
+    except Exception as exc:
+        # One instance can take the whole batch down (an empty occupancy grid raised
+        # inside flash_extract_geometry on a shovel); draw them one at a time and skip
+        # the ones that fail -- the score policy falls back to X-Part or the open surface.
+        print(f"[holopart] batch failed ({type(exc).__name__}: {str(exc)[:120]}); "
+              "drawing the instances one at a time")
+        torch.cuda.empty_cache()
+        results = []
+        for i, name in enumerate(names):
+            try:
+                single = draw(slice_batch([i]))
+                if len(single) == 1:
+                    results.append((name, single[0]))
+                else:
+                    print(f"  {name}: HoloPart returned {len(single)} solids; skipped")
+            except Exception as inner:
+                print(f"  {name}: HoloPart failed ({type(inner).__name__}: {str(inner)[:100]}); skipped")
+            torch.cuda.empty_cache()
+        if not results:
+            raise SystemExit("HoloPart produced no solid for any instance")
     out = trimesh.Scene()
-    meshes = list(scene.geometry.values())
-    if len(meshes) != len(names):
-        raise SystemExit(
-            f"HoloPart returned {len(meshes)} solids for {len(names)} instances")
-    for name, mesh in zip(names, meshes):
+    for name, mesh in results:
         out.add_geometry(mesh, geom_name=name)
         ext = np.asarray(mesh.bounds[1] - mesh.bounds[0])
         print(f"  {name:<18} faces={len(mesh.faces)} ext={np.round(ext, 3)}")

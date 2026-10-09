@@ -650,7 +650,10 @@ def main():
         outline.vertices *= (box[1] - box[0])
         outline.vertices += (box[0] + box[1]) / 2
         preview.add_geometry(outline)
-    preview.export(os.path.join(out_dir, "boxes.glb"))
+    try:
+        preview.export(os.path.join(out_dir, "boxes.glb"))
+    except Exception as exc:  # cosmetic: an RGBA source texture cannot be re-encoded as JPEG
+        print(f"  (boxes.glb preview not written: {type(exc).__name__}: {str(exc)[:120]})")
     if args.boxes_only:
         print(f"saved {out_dir}/boxes.glb")
         return

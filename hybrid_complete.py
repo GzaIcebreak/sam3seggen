@@ -496,7 +496,12 @@ def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR, margi
     holo = index_by_instance(load_part_nodes(holopart_glb)) if holopart_glb else {}
     missing = [d["node"] for d in decisions if d["candidate"] and d["instance"] not in holo]
     if missing:
-        raise SystemExit(f"HoloPart missing instance(s): {missing}")
+        # HoloPart skipped them (its draw failed); they are judged on X-Part alone
+        print(f"[score] no HoloPart draw for {missing}; X-Part or the open surface it is")
+        for d in decisions:
+            if d["candidate"] and d["instance"] not in holo:
+                d["candidate"] = False
+                d["holopart_skipped"] = True
     names, solids = [], []
     for row, decision in zip(boxes, decisions):
         inst = row.get("instance")

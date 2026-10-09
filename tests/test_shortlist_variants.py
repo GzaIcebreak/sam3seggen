@@ -74,6 +74,16 @@ class VariantTest(unittest.TestCase):
         self.assertEqual(proposal["kimi"]["variants_used"], {"arms": "arm", "head": "dog head"})
         self.assertNotIn("not_found", proposal["kimi"])
 
+    def test_a_variant_may_not_be_a_much_bigger_mask_than_the_own_word(self):
+        # "arm" seen from one of four sides (too few to trust); "male arm" is the whole upper body
+        masks, fg, scores, names = masks_for({"arm": (30, 34), "male arm": (4, 34), "body": (4, 44)}, views=4)
+        for view in (1, 2, 3):
+            scores[view, names.index("arm")] = 0.0
+            masks[view, names.index("arm")] = False
+        rows = word_stats(masks, fg, scores, names, min_views=0.25)
+        chosen = {"object": "figure", "main": "body", "parts": ["arm"], "alternatives": {"arm": ["male arm"]}}
+        self.assertEqual(pick_variants(chosen, rows)["arm"], "arm")   # the small own word, not the torso
+
     def test_the_own_word_wins_over_a_bigger_variant_when_sam3_knows_it(self):
         masks, fg, scores, names = masks_for({"hand": (36, 40), "glove": (30, 40), "body": (4, 44)})
         rows = word_stats(masks, fg, scores, names, min_views=0.25)
