@@ -187,7 +187,11 @@ def apply_hybrid(out_dir, holopart_glb=None, escape_limit=ESCAPE_LIMIT,
 # blob that stayed inside the box (0% escape) yet covered only 80% of the branches within
 # 2% of the diagonal, where HoloPart covered 97%.
 SCORE_TAU = 0.02          # a surface point counts as covered within this share of the diagonal
-SCORE_EXTRA_SCALE = 0.2   # invented geometry this far out (p90) zeroes the score
+SCORE_EXTRA_SCALE = 0.35  # invented geometry this far out (p90) zeroes the score; a plug
+                          # closing a thigh sits ~0.1 of the diagonal off the open surface
+ESCAPE_FREE = 0.2         # a solid may reach this far past its box before it counts (the plug)
+RIM_BAND = 0.16           # within this x diagonal of the part's own cut rim: the collar zone
+HOLOPART_MARGIN = 0.1     # HoloPart replaces an X-Part solid only when ahead by this much
 SCORE_CANDIDATE = 0.8     # a large instance below this also gets a HoloPart draw to compare
 SCORE_CANDIDATE_SMALL = 0.6  # a small one; X-Part is at home on small parts, so ask less often
 SCORE_FLOOR = 0.3         # both below this: keep the open surface instead of either solid
@@ -218,6 +222,7 @@ class OpenSurfaces:
         from scipy.spatial import cKDTree
 
         self.trees = {}
+        self.rims = {}
         points, labels = [], []
         for inst, node in opened.items():
             surface = node[1]
@@ -225,6 +230,9 @@ class OpenSurfaces:
                 continue
             pts = trimesh.sample.sample_surface(surface, samples, seed=seed)[0]
             self.trees[inst] = cKDTree(pts)
+            rim = _boundary_edges(surface)
+            if len(rim):
+                self.rims[inst] = cKDTree(np.asarray(surface.vertices)[np.unique(rim)])
             points.append(pts)
             labels.append(np.full(len(pts), inst))
         self.all = cKDTree(np.concatenate(points)) if points else None
@@ -242,6 +250,13 @@ class OpenSurfaces:
                else np.full(len(points), np.inf))
         near_any = self.all.query(points, distance_upper_bound=tau)[0] < tau
         return (own > tau) & near_any
+
+    def near_rim(self, inst, points, reach):
+        """Per point: within `reach` of the instance's own cut rim (the collar zone)."""
+        points = np.asarray(points, dtype=float)
+        if inst not in self.rims or not len(points):
+            return np.zeros(len(points), dtype=bool)
+        return self.rims[inst].query(points, distance_upper_bound=reach)[0] < reach
 
 
 def _boundary_edges(mesh):
@@ -296,11 +311,18 @@ def cap_loops(mesh, loops):
 
 
 def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
-                    min_faces=INTRUSION_MIN_FACES):
-    """Cut the solid's regions that duplicate a neighbour; cap the holes. (mesh, cut share)."""
+                    min_faces=INTRUSION_MIN_FACES, band=RIM_BAND):
+    """Cut the solid's regions that duplicate a neighbour; cap the holes. (mesh, cut share).
+
+    Only regions with a short rim are cut (a regrown tail, a paw). Inside the band along
+    the part's own cut rim nothing is cut: that is where the plug of a part closed through
+    its cut passes the neighbour's surface, and slicing a ring out of it left the plug's
+    dome as a loose shell."""
     if solid is None or not len(solid.faces) or surfaces is None:
         return solid, 0.0
-    bad = surfaces.intruding(inst, solid.triangles_center, tau)
+    centres = solid.triangles_center
+    bad = surfaces.intruding(inst, centres, tau)
+    bad &= ~surfaces.near_rim(inst, centres, band * diag)
     if bad.sum() < min_faces:
         return solid, 0.0
     adjacency = np.asarray(solid.face_adjacency)
@@ -350,8 +372,9 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     fit_p90   p90 surface -> solid distance
     extra_p90 p90 solid -> surface distance (did it invent shape that is not there?)
     escape    how far the solid overruns the prompt box
-    intrusion share of the solid's surface lying on another instance's surface (needs
-              `surfaces`, an OpenSurfaces, and the solid's `instance`)
+    intrusion share of the solid's surface lying on another instance's surface, outside
+              the band along its own cut rim where the collar conditioning puts some
+              (needs `surfaces`, an OpenSurfaces, and the solid's `instance`)
     hollow    share of the solid's surface that is a thin double wall (see hollow_share)
     """
     from scipy.spatial import cKDTree
@@ -369,7 +392,9 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     extra = cKDTree(part_points).query(solid_points)[0] / diag
     intrusion = 0.0
     if surfaces is not None and instance is not None:
-        intrusion = float(surfaces.intruding(instance, solid_points, tau * diag).mean())
+        bad = surfaces.intruding(instance, solid_points, tau * diag)
+        outside = ~surfaces.near_rim(instance, solid_points, RIM_BAND * diag)
+        intrusion = float(bad[outside].mean()) if outside.any() else 0.0
     return {
         "cover": float((fit < tau).mean()),
         "fit_p90": float(np.percentile(fit, 90)),
@@ -398,13 +423,13 @@ def largest_shell_share(solid):
 
 
 def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUSION_SCALE,
-                  hollow_free=HOLLOW_FREE, hollow_scale=HOLLOW_SCALE):
-    """0..1: coverage, discounted by invented geometry, box escape, tatters, intrusion
-    and hollowness (a thin double wall where a filled part should be)."""
+                  hollow_free=HOLLOW_FREE, hollow_scale=HOLLOW_SCALE, escape_free=ESCAPE_FREE):
+    """0..1: coverage, discounted by invented geometry, box escape beyond a free margin,
+    tatters, intrusion and hollowness (a thin double wall where a filled part should be)."""
     if not metrics:
         return 0.0
     extra = min(1.0, metrics["extra_p90"] / extra_scale)
-    escape = min(1.0, metrics["escape"])
+    escape = min(1.0, max(0.0, metrics["escape"] - escape_free) / max(1.0 - escape_free, 1e-9))
     whole = metrics.get("largest_shell", 1.0)
     intrusion = min(1.0, metrics.get("intrusion", 0.0) / intrusion_scale)
     hollow = min(1.0, max(0.0, metrics.get("hollow", 0.0) - hollow_free) / hollow_scale)
@@ -463,8 +488,10 @@ def score_candidates(out_dir, candidate=SCORE_CANDIDATE, candidate_small=SCORE_C
     return decisions
 
 
-def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR):
-    """Keep the higher-scoring solid per instance; below `floor` fall back to the open surface."""
+def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR, margin=HOLOPART_MARGIN):
+    """Keep the better solid per instance (HoloPart only when ahead of X-Part by `margin`:
+    it hugs the open surface and always looks a little better by distance); below `floor`
+    fall back to the open surface."""
     boxes, opened, xpart, surfaces = _score_inputs(out_dir)
     holo = index_by_instance(load_part_nodes(holopart_glb)) if holopart_glb else {}
     missing = [d["node"] for d in decisions if d["candidate"] and d["instance"] not in holo]
@@ -485,6 +512,8 @@ def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR):
             decision["holopart_cut"] = cut
             decision["q_holopart"] = quality_score(metrics)
             options.append(("holopart", decision["q_holopart"], culled))
+        if len(options) == 2 and options[1][1] < options[0][1] + margin:
+            options = options[:1]          # X-Part unless HoloPart is clearly better
         backend, score, mesh = max(options, key=lambda option: option[1]) if options \
             else ("open", 0.0, None)
         if score < floor:

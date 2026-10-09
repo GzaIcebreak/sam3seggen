@@ -52,24 +52,33 @@ class VariantTest(unittest.TestCase):
         self.assertEqual(phrases["body"], ["body", "dog body"])
 
     def test_the_best_detected_variant_segments_the_part(self):
-        # SAM3 ignores "arms" and only saw "head" from one side; "arm" and "dog head" work
+        # SAM3 ignores "arms" and only saw "head" from one of four sides; "arm" and "dog head" work
         masks, fg, scores, names = masks_for({
             "arms": None, "arm": (4, 12), "dog arms": None,
-            "head": (12, 20), "face": None, "dog head": (12, 20), "body": (20, 44), "dog body": None})
-        scores[1, names.index("head")] = 0.0
-        masks[1, names.index("head")] = False
+            "head": (12, 20), "face": None, "dog head": (12, 20), "body": (20, 40), "dog body": None},
+            views=4)
+        for view in (1, 2, 3):
+            scores[view, names.index("head")] = 0.0
+            masks[view, names.index("head")] = False
         rows = word_stats(masks, fg, scores, names, min_views=0.25)
         chosen = {"object": "dog figurine", "main": "body", "parts": ["arms", "head"],
                   "alternatives": {"head": ["face"]}}
         picked = pick_variants(chosen, rows)
         self.assertEqual(picked["arms"], "arm")
-        self.assertEqual(picked["head"], "dog head")      # seen in both views, head in one
+        self.assertEqual(picked["head"], "dog head")      # seen from all sides, head from one
+        self.assertEqual(picked["body"], "body")          # its own word, seen everywhere
         proposal, reason = accept_shortlist(chosen, rows, masks=masks, foreground=fg, concepts=names)
         self.assertIsNone(reason)
         self.assertEqual(proposal["parts"], ["arms=arm", "head=dog head"])
         self.assertEqual(proposal["part_names"], ["arms", "head"])
         self.assertEqual(proposal["kimi"]["variants_used"], {"arms": "arm", "head": "dog head"})
         self.assertNotIn("not_found", proposal["kimi"])
+
+    def test_the_own_word_wins_over_a_bigger_variant_when_sam3_knows_it(self):
+        masks, fg, scores, names = masks_for({"hand": (36, 40), "glove": (30, 40), "body": (4, 44)})
+        rows = word_stats(masks, fg, scores, names, min_views=0.25)
+        chosen = {"object": "figure", "main": "body", "parts": ["hand"], "alternatives": {"hand": ["glove"]}}
+        self.assertEqual(pick_variants(chosen, rows)["hand"], "hand")
 
 
 class OverlapTest(unittest.TestCase):

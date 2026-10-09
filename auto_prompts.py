@@ -313,18 +313,27 @@ def variant_phrases(chosen, limit=MAX_VARIANT_PHRASES):
     return out
 
 
-def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM):
-    """{part word: best phrase or None}: among a word's measured variants, the eligible
-    one seen in the most views (then the largest), skipping whole-object masks."""
+def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM, own_views=DEFAULT_MIN_VIEWS):
+    """{part word: best phrase or None}. The VLM's own word when SAM3 sees it in at least
+    `own_views` of the views (and it is not a whole-object mask); otherwise the eligible
+    variant seen in the most views, the smaller mask on a tie -- a stand-in for a word
+    SAM3 does not know (`arms`), not a licence to pick the biggest mask (`glove` would
+    swallow the forearm, `boot` the shin)."""
     by_name = {row["concept"]: row for row in rows}
+    total_views = max((row.get("views", 0) for row in rows), default=0)
     picked = {}
     for word, phrases in variant_phrases(chosen).items():
+        own = by_name.get(word)
+        if own and own.get("eligible") and float(own.get("blob", own["area"])) < whole \
+                and own["views"] >= own_views * max(total_views, 1):
+            picked[word] = word
+            continue
         best = None
         for index, phrase in enumerate(phrases):
             row = by_name.get(phrase)
             if not row or not row.get("eligible") or float(row.get("blob", row["area"])) >= whole:
                 continue
-            key = (row["views"], round(row["area"], 3), -index)
+            key = (row["views"], -round(row["area"], 3), -index)
             if best is None or key > best[0]:
                 best = (key, phrase)
         picked[word] = best[1] if best else None
