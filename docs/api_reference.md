@@ -259,7 +259,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `min_area_share` | float | `0.005` | 低于表面占比的连通块折进最近大件，不单独生成 |
 | `part_min_area_share` | `名=占比,…` | 无 | 按部件覆盖上一项，如 `装饰品=0.001` |
 | `fold_within_part` | bool | `false` | 小块只折进同名部件 |
-| `merge_gap` / `merge_max_share` | float | `0` / `0.05` | 把被别的部件切开的同名小块接回一件（`0.01` 适合握棍的手）；`0` 关。挨在一起的小物件会被接成一件，圣诞树类模型保持 `0` |
+| `merge_gap` / `merge_max_share` | float | `0.01` / `0.05` | 把被别的部件切开的同名小块接回一件（`0.01` 适合握棍的手）；`0` 关。挨在一起的小物件会被接成一件，圣诞树类模型保持 `0` |
 | `redraws` | int | `2` | 生成实体超出盒子时重抽次数，只留更贴盒的 |
 | `octree_resolution` / `seed` | int | `512` / `42` | X-Part 重建分辨率与种子 |
 

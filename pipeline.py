@@ -79,6 +79,9 @@ DEFAULT_REFINE_MIN_SHARE = 0.05
 # where the geometric units come from: P3-SAM (Hunyuan3D-Part) when it really splits
 # the model, else the SegviGen samples (p3sam_units.py)
 UNITS_MODES = ("auto", "p3sam", "segvigen")
+# same-named pieces whose surfaces come within this share of the model diagonal are one
+# X-Part prompt: an ear cup is cup + grille + cushion ring, not three solids (xpart_complete.py)
+DEFAULT_MERGE_GAP = 0.01
 DEFAULT_UNITS = os.environ.get("SEGVIGEN_UNITS", "auto")
 DEFAULT_EXPORT_FROM = "source"     # cut parts from the source model (full resolution, no bake)
 DEFAULT_AUTO_PROMPTS = True        # no prompts: propose part names from the concept bank
@@ -195,7 +198,7 @@ class PipelineOptions:
     # what counts as one prompt (xpart_complete.py)
     part_min_area_share: str | None = None
     fold_within_part: bool = False
-    merge_gap: float = 0.0
+    merge_gap: float = DEFAULT_MERGE_GAP
     merge_max_share: float = DEFAULT_MERGE_MAX_SHARE
     # after the vote: split a unit where SAM3's per-face masks name a coherent patch of
     # it differently (refine_units.py); cut parts from the source model (source_export.py)
@@ -400,7 +403,7 @@ class PipelineOptions:
             score_floor=getattr(args, "score_floor", SCORE_FLOOR),
             part_min_area_share=getattr(args, "part_min_area_share", None),
             fold_within_part=bool(getattr(args, "fold_within_part", False)),
-            merge_gap=getattr(args, "merge_gap", 0.0),
+            merge_gap=getattr(args, "merge_gap", DEFAULT_MERGE_GAP),
             merge_max_share=getattr(args, "merge_max_share", DEFAULT_MERGE_MAX_SHARE),
             refine=getattr(args, "refine", DEFAULT_REFINE),
             refine_min_share=getattr(args, "refine_min_share", DEFAULT_REFINE_MIN_SHARE),
@@ -487,7 +490,7 @@ def add_cli_arguments(parser, *, split=True, merge_off=True):
     parser.add_argument("--fold_within_part", action="store_true",
                         help="Fold a small component only into its own part (many small "
                              "things stuck on a big one: ornaments on a tree)")
-    parser.add_argument("--merge_gap", type=float, default=0.0,
+    parser.add_argument("--merge_gap", type=float, default=DEFAULT_MERGE_GAP,
                         help="Rejoin same-part pieces whose surfaces come within this share "
                              "of the model diagonal (a hand the staff cut in two). 0 = off")
     parser.add_argument("--merge_max_share", type=float, default=DEFAULT_MERGE_MAX_SHARE,
