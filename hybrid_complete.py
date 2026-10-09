@@ -191,7 +191,10 @@ SCORE_EXTRA_SCALE = 0.35  # invented geometry this far out (p90) zeroes the scor
                           # closing a thigh sits ~0.1 of the diagonal off the open surface
 ESCAPE_FREE = 0.2         # a solid may reach this far past its box before it counts (the plug)
 RIM_BAND = 0.16           # within this x diagonal of the part's own cut rim: the collar zone
-HOLOPART_MARGIN = 0.2     # HoloPart replaces an X-Part solid only when ahead by this much
+HOLOPART_MARGIN = 0.2     # HoloPart replaces an X-Part solid only when ahead by this much ...
+HOLOPART_ONLY_BELOW = 0.35  # ... and only when the X-Part solid is this bad (its cuts are cleaner)
+REGROWN_SHARE = 0.2       # an intruding region this big (x own open area) is a regrown neighbour, not a plug
+NEIGHBOUR_COVER = 0.35    # ... or one that lies on this share of a single neighbour's open surface
 SCORE_CANDIDATE = 0.8     # a large instance below this also gets a HoloPart draw to compare
 SCORE_CANDIDATE_SMALL = 0.6  # a small one; X-Part is at home on small parts, so ask less often
 SCORE_FLOOR = 0.3         # both below this: keep the open surface instead of either solid
@@ -210,7 +213,7 @@ SCORE_SAMPLES = 20000
 INTRUSION_SCALE = 0.1      # this much residual intrusion zeroes the score
 INTRUSION_MAX_RIM = 1.0    # cut a region only when its rim is shorter than this x diagonal
 INTRUSION_MIN_FACES = 20
-INTRUSION_CRUMB = 0.005    # a shell under this share of the area after the cut is debris
+INTRUSION_CRUMB = 0.02     # a shell under this share of the area after the cut is debris (leg chips left on the body)
 HOLLOW_FREE = 0.15       # this share of thin samples is normal (fingers, rims)
 HOLLOW_SCALE = 0.5       # this much above HOLLOW_FREE zeroes the score
 
@@ -223,11 +226,13 @@ class OpenSurfaces:
 
         self.trees = {}
         self.rims = {}
+        self.opened = {}
         points, labels = [], []
         for inst, node in opened.items():
             surface = node[1]
             if surface is None or not len(surface.faces) or surface.area <= 0:
                 continue
+            self.opened[inst] = surface
             pts = trimesh.sample.sample_surface(surface, samples, seed=seed)[0]
             self.trees[inst] = cKDTree(pts)
             rim = _boundary_edges(surface)
@@ -250,6 +255,13 @@ class OpenSurfaces:
                else np.full(len(points), np.inf))
         near_any = self.all.query(points, distance_upper_bound=tau)[0] < tau
         return (own > tau) & near_any
+
+    def nearest_instance(self, points):
+        """Per point: the instance whose sampled surface is nearest (-1 when none)."""
+        points = np.asarray(points, dtype=float)
+        if self.all is None or not len(points):
+            return np.full(len(points), -1)
+        return self.all_labels[self.all.query(points)[1]]
 
     def near_rim(self, inst, points, reach):
         """Per point: within `reach` of the instance's own cut rim (the collar zone)."""
@@ -326,10 +338,12 @@ def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
     intruding = surfaces.intruding(inst, centres, tau)
     in_band = surfaces.near_rim(inst, centres, band * diag)
     thin = thin_faces(solid, box) if box is not None and intruding.sum() >= min_faces         else np.zeros(len(centres), dtype=bool)
-    # inside the band only a THICK intruding region is spared: that is the plug
-    bad = intruding & (thin | ~in_band)
+    # inside the band a thick intruding region is a plug and is spared -- unless it is big
+    # enough to be a regrown neighbour (X-Part handed the dog's body the whole dog back)
+    bad = intruding
     if bad.sum() < min_faces:
         return solid, 0.0
+    own_area = float(surfaces.opened[inst].area) if inst in getattr(surfaces, "opened", {}) else float(solid.area)
     adjacency = np.asarray(solid.face_adjacency)
     both = bad[adjacency].all(axis=1)
     components = trimesh.graph.connected_components(
@@ -340,9 +354,28 @@ def cull_intrusions(solid, inst, surfaces, tau, diag, max_rim=INTRUSION_MAX_RIM,
     for component in components:
         in_comp = np.zeros(len(bad), dtype=bool)
         in_comp[np.asarray(component)] = True
-        thin_area = float(face_area[in_comp & thin].sum() / max(face_area[in_comp].sum(), 1e-12))
+        comp_area = float(face_area[in_comp].sum())
+        thin_area = float(face_area[in_comp & thin].sum() / max(comp_area, 1e-12))
         if thin_area > 0.5:                       # a flange (by area) goes whatever its rim length
             remove |= in_comp
+            continue
+        if comp_area >= REGROWN_SHARE * own_area:  # a regrown neighbour, band or not
+            remove |= in_comp
+            continue
+        # ... or a copy of most of one neighbour: the body carrying all four legs
+        owners = surfaces.nearest_instance(centres[in_comp])
+        covered = False
+        for other in np.unique(owners):
+            if other < 0 or other == inst or other not in getattr(surfaces, "opened", {}):
+                continue
+            on_other = float(face_area[in_comp][owners == other].sum())
+            if on_other >= NEIGHBOUR_COVER * float(surfaces.opened[other].area):
+                covered = True
+                break
+        if covered:
+            remove |= in_comp
+            continue
+        if in_band[in_comp].mean() > 0.5:         # a thick region along the cut: the plug
             continue
         rim = in_comp[adjacency].sum(axis=1) == 1
         rim_length = float(np.linalg.norm(
@@ -532,8 +565,9 @@ def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR, margi
             decision["holopart_cut"] = cut
             decision["q_holopart"] = quality_score(metrics)
             options.append(("holopart", decision["q_holopart"], culled))
-        if len(options) == 2 and options[1][1] < options[0][1] + margin:
-            options = options[:1]          # X-Part unless HoloPart is clearly better
+        if len(options) == 2 and (options[0][1] >= HOLOPART_ONLY_BELOW
+                                  or options[1][1] < options[0][1] + margin):
+            options = options[:1]          # X-Part unless it is near the floor AND HoloPart is clearly better
         backend, score, mesh = max(options, key=lambda option: option[1]) if options \
             else ("open", 0.0, None)
         if score < floor:

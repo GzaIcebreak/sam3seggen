@@ -36,9 +36,22 @@ class CullIntrusionsTest(unittest.TestCase):
         self.assertGreater(quality_score(after), quality_score(before))
         self.assertTrue(culled.is_watertight)
 
-    def test_a_region_with_a_long_rim_is_left_alone(self):
+    def test_a_whole_regrown_neighbour_is_cut_even_with_a_long_rim(self):
+        # the solid reproduces the tail completely: that is the neighbour regrown, and it
+        # goes however long its rim is
         body, tail, solid = body_and_tail()
         surfaces = OpenSurfaces({0: ("00_body", body), 1: ("01_tail", tail)}, samples=4000)
+        diag = float(np.linalg.norm(body.bounds[1] - body.bounds[0]))
+        culled, share = cull_intrusions(solid, 0, surfaces, 0.02 * diag, diag, max_rim=0.1)
+        self.assertGreater(share, 0.05)
+
+    def test_a_small_touch_of_a_big_neighbour_with_a_long_rim_is_left_alone(self):
+        # the stub only covers a quarter of a long neighbour tail: a contact, not a copy
+        body, tail, solid = body_and_tail()
+        long_tail = trimesh.creation.cylinder(radius=0.08, height=3.2, sections=24)
+        long_tail.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2, (0, 1, 0)))
+        long_tail.apply_translation((0.5 + 1.6, 0, 0))
+        surfaces = OpenSurfaces({0: ("00_body", body), 1: ("01_tail", long_tail)}, samples=4000)
         diag = float(np.linalg.norm(body.bounds[1] - body.bounds[0]))
         culled, share = cull_intrusions(solid, 0, surfaces, 0.02 * diag, diag, max_rim=0.1)
         self.assertEqual(share, 0.0)
