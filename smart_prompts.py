@@ -46,7 +46,7 @@ DEFAULT_MODEL = None
 _MODEL_CACHE = {}
 MAX_CANDIDATES = 30
 MAX_VIEWS = 8      # the proposal renders 8 azimuths; a 2x4 grid is still cheap
-MAX_SHORTLIST = 8
+MAX_SHORTLIST = 6
 
 
 def vlm_api_key():
@@ -165,7 +165,10 @@ def build_shortlist_question(vocabulary, max_parts=MAX_SHORTLIST, guide_colours=
         '"main": "<the word for the main body that the remaining surface belongs to>", '
         '"parts": ["<part word>", ...], '
         '"alternatives": {"<part word>": ["<other noun phrase for the same part>", ...]}}. '
-        f"Rules: 1 to {max_parts} parts, most important first; prefer words from this "
+        f"Rules: 1 to {max_parts} MAJOR parts, most important first -- the pieces a toy or a "
+        "part library would ship separately (head, arm, wheel, horn); NOT accessories or "
+        "sub-parts that belong to a bigger piece (cushion, logo, button, badge, strap, screw, "
+        "trim) unless they are large detachable objects. Prefer words from this "
         "vocabulary, lowercase: " + words + ". A part the vocabulary has no word for may "
         "use another plain English noun. Use the SINGULAR (arm, not arms; a word covers "
         "all instances of that part). For every part give 1 to 3 alternatives a text-"

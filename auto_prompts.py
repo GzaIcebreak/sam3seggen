@@ -42,6 +42,7 @@ DEFAULT_WHOLE = 0.5           # at least this share: a name for the object, not 
 DEFAULT_WHOLE_VLM = 0.6       # for a word the VLM already vouches for as a part
 DEFAULT_SHORTLIST_MIN_VIEWS = 0.25   # a shortlisted word only has to show up in a quarter of the views
 DEFAULT_SHORTLIST_IOU = 0.6          # two shortlisted words whose masks overlap this much are one part
+DEFAULT_SHORTLIST_INSIDE = 0.8       # a word this far inside another kept word's mask is its sub-part
 DEFAULT_SHORTLIST_MIN_PARTS = 2      # fewer found parts than this: the full sweep gives a second opinion
 VARIANT_MAX_GROWTH = 2.0             # a variant may cover at most this x the own word's area
 MAX_VARIANT_PHRASES = 48             # SAM3 phrases measured for one shortlist (parts x variants)
@@ -357,14 +358,22 @@ def union_masks(masks, foreground, concepts, phrase):
     return masks[:, list(concepts).index(phrase)] & np.asarray(foreground, dtype=bool)
 
 
-def resolve_overlaps(order, phrase_of, masks, foreground, concepts, iou=DEFAULT_SHORTLIST_IOU):
-    """(kept, dropped): later words whose mask is the same thing as an earlier word's
-    (IoU >= `iou` over all views) go. The VLM lists parts most important first, so
-    `legs` beats `jeans` and `handle` beats `shaft`."""
-    kept, dropped = [], []
+def resolve_overlaps(order, phrase_of, masks, foreground, concepts, iou=DEFAULT_SHORTLIST_IOU,
+                     inside=DEFAULT_SHORTLIST_INSIDE):
+    """(kept, dropped): a word goes when its mask is the same thing as an earlier kept
+    word's (IoU >= `iou` over all views: `legs` beats `jeans`, `handle` beats `shaft`) or
+    lies inside a kept word's mask (>= `inside` of its own pixels: a hand inside the arm,
+    a cushion inside the ear cup) -- a sub-part folds into the piece it belongs to. Fewer,
+    whole parts rather than many fragile ones. The container is decided by the masks, not
+    the order, so a small word listed first still folds into the big one listed later."""
     unions = {}
     for word in order:
         mine = union_masks(masks, foreground, concepts, phrase_of.get(word) or word)
+        if mine is not None:
+            unions[word] = mine
+    kept, dropped = [], []
+    for word in order:
+        mine = unions.get(word)
         if mine is None:
             kept.append(word)
             continue
@@ -380,9 +389,28 @@ def resolve_overlaps(order, phrase_of, masks, foreground, concepts, iou=DEFAULT_
                 break
         if same is None:
             kept.append(word)
-            unions[word] = mine
         else:
             dropped.append((word, same))
+    # containment, judged against every surviving word (big ones may come later in the list)
+    folded = True
+    while folded:
+        folded = False
+        for word in list(kept):
+            mine = unions.get(word)
+            if mine is None:
+                continue
+            area = mine.sum()
+            for other in kept:
+                theirs = unions.get(other)
+                if other == word or theirs is None or theirs.sum() <= area:
+                    continue
+                if area and np.logical_and(mine, theirs).sum() / area >= inside:
+                    kept.remove(word)
+                    dropped.append((word, other))
+                    folded = True
+                    break
+            if folded:
+                break
     return kept, dropped
 
 

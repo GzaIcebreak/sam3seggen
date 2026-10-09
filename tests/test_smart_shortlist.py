@@ -64,7 +64,7 @@ class ShortlistQuestionTest(unittest.TestCase):
         question = build_shortlist_question(vocabulary)
         for word in vocabulary:
             self.assertIn(word, question)
-        self.assertIn("prefer words from this vocabulary", question)
+        self.assertIn("refer words from this vocabulary", question)
         reply = '{"object": "car", "main": "body", "parts": ["wheel", "door", "spoiler"]}'
         parsed = parse_reply(reply, vocabulary)
         self.assertEqual(parsed["parts"], ["wheel", "door"])

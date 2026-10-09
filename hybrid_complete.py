@@ -376,6 +376,7 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
               the band along its own cut rim where the collar conditioning puts some
               (needs `surfaces`, an OpenSurfaces, and the solid's `instance`)
     hollow    share of the solid's surface that is a thin double wall (see hollow_share)
+    hollow_ref the same measured on the open surface: a shell-shaped part is allowed to be one
     """
     from scipy.spatial import cKDTree
 
@@ -403,6 +404,9 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
         "largest_shell": largest_shell_share(solid),
         "intrusion": intrusion,
         "hollow": hollow_share(solid, box, dense=dense, samples=samples, seed=seed),
+        # the open surface's own hollowness: an ear cup or a bowl IS a thin double wall,
+        # and a solid that reproduces it is right, not hollow
+        "hollow_ref": hollow_share(surface, box, samples=samples, seed=seed),
     }
 
 
@@ -432,7 +436,8 @@ def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUS
     escape = min(1.0, max(0.0, metrics["escape"] - escape_free) / max(1.0 - escape_free, 1e-9))
     whole = metrics.get("largest_shell", 1.0)
     intrusion = min(1.0, metrics.get("intrusion", 0.0) / intrusion_scale)
-    hollow = min(1.0, max(0.0, metrics.get("hollow", 0.0) - hollow_free) / hollow_scale)
+    hollow = min(1.0, max(0.0, metrics.get("hollow", 0.0)
+                          - max(hollow_free, metrics.get("hollow_ref", 0.0))) / hollow_scale)
     return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole
                  * (1.0 - intrusion) * (1.0 - hollow))
 
