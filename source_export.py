@@ -67,15 +67,59 @@ def smooth_labels(mesh, labels, iterations=DEFAULT_SMOOTH_ITERATIONS):
     return labels
 
 
-def transfer_labels(remesh, remesh_labels, source, smooth_iterations=DEFAULT_SMOOTH_ITERATIONS):
-    """Per-face labels for `source`, from the nearest remesh face after frame fitting."""
+SHELL_WHOLE_SHARE = 0.02   # a welded shell under this share of the area is one piece
+
+
+def shell_labels(source, labels, max_share=SHELL_WHOLE_SHARE):
+    """One label per small welded shell: the area-weighted majority of its faces.
+
+    Game assets are built from hundreds of loose pieces (a knight of 426 shells, a
+    bicycle of 827); a per-face nearest-remesh-face transfer gives the faces of one
+    rivet or plate different labels and the part comes out as a scatter of crumbs.
+    A piece that small is one thing and belongs to one part. Shells above `max_share`
+    of the area keep their per-face labels: a single-shell body still has to be cut.
+    Returns (labels, number of shells relabelled)."""
+    labels = np.array(labels).copy()
+    if labels.max() < 0 or not len(source.faces):
+        return labels, 0
+    welded = trimesh.Trimesh(np.asarray(source.vertices), np.asarray(source.faces), process=False)
+    welded.merge_vertices(merge_tex=True, merge_norm=True)
+    components = trimesh.graph.connected_components(
+        welded.face_adjacency, nodes=np.arange(len(welded.faces)), min_len=1)
+    if len(components) <= 1:
+        return labels, 0
+    areas = np.asarray(source.area_faces)
+    total = max(float(areas.sum()), 1e-12)
+    changed = 0
+    for faces in components:
+        faces = np.asarray(faces)
+        if areas[faces].sum() > max_share * total:
+            continue
+        here = labels[faces]
+        valid = here >= 0
+        if not valid.any():
+            continue
+        votes = np.bincount(here[valid], weights=areas[faces][valid])
+        winner = int(votes.argmax())
+        if (here != winner).any():
+            labels[faces] = winner
+            changed += 1
+    return labels, changed
+
+
+def transfer_labels(remesh, remesh_labels, source, smooth_iterations=DEFAULT_SMOOTH_ITERATIONS,
+                    shell_share=SHELL_WHOLE_SHARE):
+    """Per-face labels for `source`: nearest remesh face after frame fitting, a majority
+    smooth, then one label per small welded shell (see shell_labels)."""
     remesh_labels = np.asarray(remesh_labels)
     name, rotation, scale, shift, distance = fit_frame(
         np.asarray(remesh.triangles_center), np.asarray(source.triangles_center))
     aligned = np.asarray(remesh.triangles_center) @ rotation.T * scale + shift
     nearest = cKDTree(aligned).query(np.asarray(source.triangles_center))[1]
     labels = smooth_labels(source, remesh_labels[nearest], smooth_iterations)
-    return labels, {"frame": name, "scale": scale, "mean_distance": distance}
+    labels, shells = shell_labels(source, labels, shell_share) if shell_share > 0 else (labels, 0)
+    return labels, {"frame": name, "scale": scale, "mean_distance": distance,
+                    "shells_relabelled": shells}
 
 
 def load_single_textured(source_glb):
@@ -117,7 +161,8 @@ def export_from_source(mesh_path, source_glb, labels_npy, names_json, out_glb,
             "merge=off for the geometric units.")
     print(f"{step} cutting the source model ({len(source.faces)} faces) by labels carried "
           f"over from the remesh ({len(remesh.faces)} faces; frame {fit['frame']}, "
-          f"scale {fit['scale']:.4f}, fit {fit['mean_distance']:.4f})")
+          f"scale {fit['scale']:.4f}, fit {fit['mean_distance']:.4f}; "
+          f"{fit.get('shells_relabelled', 0)} small shells given one label)")
 
     material = getattr(source.visual, "material", None)
     texture = getattr(material, "image", None)

@@ -45,7 +45,7 @@ KEY_VARS = ("SEGVIGEN_VLM_API_KEY", "MOONSHOT_API_KEY")
 DEFAULT_MODEL = None
 _MODEL_CACHE = {}
 MAX_CANDIDATES = 30
-MAX_VIEWS = 4
+MAX_VIEWS = 8      # the proposal renders 8 azimuths; a 2x4 grid is still cheap
 MAX_SHORTLIST = 8
 
 
@@ -163,9 +163,15 @@ def build_shortlist_question(vocabulary, max_parts=MAX_SHORTLIST, guide_colours=
         "Answer with ONLY a JSON object of this shape: "
         '{"object": "<what the object is, 1-3 words>", '
         '"main": "<the word for the main body that the remaining surface belongs to>", '
-        '"parts": ["<part word>", ...]}. '
-        f"Rules: 1 to {max_parts} parts, most important first; every word (main and parts) "
-        "MUST be taken verbatim from this vocabulary, lowercase: " + words + ". "
+        '"parts": ["<part word>", ...], '
+        '"alternatives": {"<part word>": ["<other noun phrase for the same part>", ...]}}. '
+        f"Rules: 1 to {max_parts} parts, most important first; prefer words from this "
+        "vocabulary, lowercase: " + words + ". A part the vocabulary has no word for may "
+        "use another plain English noun. Use the SINGULAR (arm, not arms; a word covers "
+        "all instances of that part). For every part give 1 to 3 alternatives a text-"
+        "prompted segmenter might know better: the object-specific phrase (dog head, "
+        "robot leg), a synonym (torso / chest / upper body), or a plural if the parts "
+        "always come in groups (legs). "
         "Pick words for visible, physically separable pieces of THIS object (a car has "
         "wheels and doors, a dog has ears and a tail); never a material, a surface pattern "
         "or a shape word; do not use left/right/upper/lower; do not repeat the main word "
@@ -205,12 +211,14 @@ def _last_json_object(text):
             return None
 
 
-def parse_reply(text, allowed, generic=()):
-    """{"object","main","parts","dropped"} from the VLM reply.
+def parse_reply(text, allowed, generic=(), keep_unknown=False):
+    """{"object","main","parts","dropped","alternatives",...} from the VLM reply.
 
-    Keeps only `allowed` (bank) words, and drops `generic` shape words (plank, panel,
-    column, ...) that a model reaches for on furniture; the rule-based path never
-    offers them either.
+    Keeps only `allowed` (bank) words unless `keep_unknown` (the shortlist path: SAM3 is
+    text-prompted, so `dog head` or `overalls` segment fine without being in the bank);
+    always drops `generic` shape words (plank, panel, column, ...) that a model reaches
+    for on furniture. `alternatives` maps a kept part word to the other phrases the VLM
+    offered for it (its own word first), for SAM3 to try.
     """
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
@@ -225,9 +233,10 @@ def parse_reply(text, allowed, generic=()):
         if not word or word in seen:
             continue
         seen.add(word)
-        (parts if word in allowed and word not in generic else dropped).append(word)
+        ok = word not in generic and (keep_unknown or word in allowed)
+        (parts if ok else dropped).append(word)
     main = clean(data.get("main") or "")
-    if main and main not in allowed:
+    if main and not (keep_unknown or main in allowed):
         dropped.append(main)
         main = ""
     parts = [p for p in parts if p != main]
@@ -249,8 +258,24 @@ def parse_reply(text, allowed, generic=()):
                 separate[word] = max(2, int(count))
             except (TypeError, ValueError):
                 separate[word] = 2
+    alternatives = {}
+    raw_alternatives = data.get("alternatives") or data.get("synonyms") or {}
+    if isinstance(raw_alternatives, dict):
+        for word, options in raw_alternatives.items():
+            word = clean(word)
+            if word not in parts and word != main:
+                continue
+            if isinstance(options, str):
+                options = [options]
+            phrases = [word]
+            for option in options or []:
+                option = clean(option)
+                if option and option not in phrases and option not in generic:
+                    phrases.append(option)
+            alternatives[word] = phrases[:4]
     return {"object": str(data.get("object") or "").strip(), "main": main or None,
-            "parts": parts, "dropped": dropped, "separate": separate}
+            "parts": parts, "dropped": dropped, "separate": separate,
+            "alternatives": alternatives}
 
 
 TOKEN_BUDGETS = (8000, 16000)   # kimi-k3 reasons for ~2-3k tokens before the answer; retry once if cut
@@ -265,18 +290,19 @@ def kimi_select(image_paths, candidates, allowed_words, api_key=None, base_url=N
 
 def kimi_shortlist(image_paths, vocabulary, api_key=None, base_url=None, model=None,
                    timeout=300, guide_image=None):
-    """Name object / main / parts from the renders alone, restricted to the bank vocabulary.
+    """Name object / main / parts from the renders alone; the bank is the preferred
+    vocabulary, not a filter (SAM3 is text-prompted and segments `dog head` fine).
 
     `guide_image`: the user's reference segmentation (one flat colour per part); it is
     shown to the model as the last tile and fixes which parts to name."""
     colours = guide_part_count(guide_image) if guide_image else None
     return ask_vlm(image_paths, build_shortlist_question(vocabulary, guide_colours=colours),
                    vocabulary, api_key=api_key, base_url=base_url, model=model,
-                   timeout=timeout, guide_image=guide_image)
+                   timeout=timeout, guide_image=guide_image, keep_unknown=True)
 
 
 def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
-            model=None, timeout=300, guide_image=None):
+            model=None, timeout=300, guide_image=None, keep_unknown=False):
     """Ask the VLM `question` about the renders. Raises on a missing key or an unusable reply.
 
     The reasoning models answer after thinking out loud; a reply cut off by max_tokens
@@ -323,7 +349,7 @@ def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
             last_error = RuntimeError(f"VLM reply cut off at {budget} tokens before the answer")
             continue
         try:
-            result = parse_reply(reply, allowed_words, GENERIC_WORDS)
+            result = parse_reply(reply, allowed_words, GENERIC_WORDS, keep_unknown=keep_unknown)
         except ValueError as error:
             last_error = error
             continue

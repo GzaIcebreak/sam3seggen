@@ -213,7 +213,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | `reuse` | bool | `true` | 复用任务目录里已有的渲染和同提示词掩码（同一单内） |
 | `auto_prompts` | bool | `true` | 没传 `prompts` 时：`mode=auto` 让 SAM3 过一遍概念库全部词（v6 库 884 词、8 视角，6–12 分钟），挑主体名 + 2–6 个互不重叠的部件名，再走正常投票；`mode=smart` 见下，快得多。`merge=off` 时不提名 |
 | `separate` | str | `""` | 逗号分隔的部件名（或 `all`）：投票后把该名字的面按连通块拆成独立部件 `leg`、`leg 2`…（面积 ≥ 5% 的块各成一件，碎块并入最大的）。默认同名实例合成一个节点。引导图接口会按参考图里"同一部件涂了不同颜色"自动填这个列表 |
-| `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段先把 4 张渲染图和概念库词表交给视觉大模型（任何 OpenAI 兼容接口；当前部署 Qwen `qwen3.8-max`，也可换 Kimi），由它说出物体类别、主体名和 1–8 个部件词（只能用词表里的词，形状词 plank、panel… 不要）；SAM3 只对这几个词测面积：至少 1/4 的视角里出现且 ≥ 2% 剪影的才保留，单块掩码盖住剪影 60% 以上的当整体词丢弃（按最大连通块判，多实例的 `shelf` 不受影响）；主体名 + 1 个部件词即可采用。VLM 失败或一个词都没找到时回退到全库扫描 + VLM 复核（慢 10 倍以上）。`work/auto_prompts.json` 里 `proposal.shortlist=true` 表示走的是快路径。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400 |
+| `mode` | `auto` / `smart` | `auto` | **`smart` = 智能分割模式**：提名阶段先把 8 张带贴图的渲染图和概念库词表交给视觉大模型（任何 OpenAI 兼容接口；当前部署 Qwen `qwen3.8-max`，也可换 Kimi），由它说出物体类别、主体名和 1–8 个部件词（单数；优先用词表里的词，词表没有的普通名词也接受，形状词 plank、panel… 不要），并为每个词给 1–3 个备选说法。每个词连同备选、单数形式和“物体名+词”（`dog head`）一起让 SAM3 测面积，取命中视角最多的说法做实际提示词（`arms` SAM3 当武器、0 命中，`arm` 可；`head` 从背面看不到，`dog head` 可），部件名仍是 VLM 的词（spec 写成 `arms=arm`）。至少 1/4 的视角里出现且 ≥ 2% 剪影的才保留，单块掩码盖住剪影 60% 以上的当整体词丢弃（按最大连通块判，多实例的 `shelf` 不受影响）；两个词的掩码 IoU ≥ 0.6 视为同一部件，留 VLM 排在前面的（legs 留、jeans 并入）；主体名 + 1 个部件词即可采用。VLM 失败、一个词都没找到、或保留的部件只盖住剪影不到 30% 时，再跑全库扫描 + VLM 复核，取覆盖更多的一方（慢 10 倍以上）。`proposal.kimi` 里记录 `variants_used`、`not_found`、`dropped_whole`、`dropped_overlap`。`work/auto_prompts.json` 里 `proposal.shortlist=true` 表示走的是快路径。需要 `SEGVIGEN_VLM_API_KEY`，没有则 400 |
 
 ### 5.2 拆分（几何边界）
 
@@ -230,7 +230,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `view_azimuths` / `view_elevations` | 角度列表 | `45,135,225,315` / `10` | SAM3 投票视角 |
+| `view_azimuths` / `view_elevations` | 角度列表 | `0,45,…,315` / `15` | SAM3 投票视角；默认和智能模式提名用的 8 方位一致（以前只有 4 个 45° 斜视角，提名时从 3 个视角看到的词到投票里一票都拿不到） |
 | `radius` / `resolution` | float / int | `2` / `512` | 投票用渲染 |
 | `sam3_threshold` | float | `0.4` | 概念库下的掩码阈值（无库时 0.3） |
 | `concept_bank` / `no_concept_bank` | 路径 / bool | 环境变量 | 换概念库，或退回原生 SAM3；不要同传 |
@@ -242,7 +242,7 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `export_from` | `source` / `remesh` | `source` | `source`：部件直接从原模型切，原分辨率、原 UV、原贴图，不烘。`remesh`：从重建网格切再烘（旧行为） |
+| `export_from` | `source` / `remesh` | `source` | `source`：部件直接从原模型切，原分辨率、原 UV、原贴图，不烘；原模型里面积 < 2% 的独立小壳（游戏资产常由几百个小件拼成）整块取多数标签，不再被逐面最近标签打碎。`remesh`：从重建网格切再烘（旧行为） |
 | `with_texture` | bool | `true` | 封闭实体是否烘贴图；`export_from=remesh` 时也控制开口件是否烘。关掉只有占位色 |
 | `texture_size` | int | `2048` | 小件贴图边长；面积 ≥ 8% 自动 ×2，≥ 40% 自动 ×4，封顶 8192 |
 
@@ -251,10 +251,10 @@ curl -sS -X POST "$HOST/segment" --max-time 3600 -F "glb=@model.glb" | tee resul
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `complete` | `off` / `boxes` / `full` / `hybrid` | `hybrid` | `off` 不修复；`boxes` 只写盒子提示不占 GPU；`full` 只用 X-Part；`hybrid` X-Part 之后按 `holopart_large` 决定 |
-| `holopart_large` | `escape` / `always` / `score` | `score` | `score`：每个 X-Part 实体和它的开口面比对打分，低分再跑 HoloPart 取高分，都差就保留开口面。`escape`：大件且超框 > 50% 才换。`always`：大件一律换 |
+| `holopart_large` | `escape` / `always` / `score` | `score` | `score`：每个 X-Part 实体和它的开口面比对打分（覆盖率 × 多余几何 × 出框 × 最大壳占比 × 侵入率 × 空壳率），低分再跑 HoloPart 取高分，都差就保留开口面。空壳率：从实体表面沿法线向内走最小包围盒边长的 8%，落在实体外面的样本占比——X-Part 只拿开口面做条件时常把面“加厚”成薄双层壳（碗状的头、空心的腿），距离类指标全看不出，这项 0.8–1.0；实心件 ≤ 0.2，刀片、帆 0。超过 15% 开始扣分，65% 归零。采用的实体都丢掉 < 0.5% 面积的碎壳。`escape`：大件且超框 > 50% 才换。`always`：大件一律换 |
 | `score_candidate` / `score_candidate_small` | float | `0.8` / `0.6` | 大件 / 小件低于此分才跑 HoloPart 对比。降低可以省时间 |
 | `score_floor` | float | `0.3` | 两个后端都低于此分时保留开口面 |
-| `condition` | `surface` / `box` | `surface` | X-Part 的条件点来自拆分归属面（推荐）还是盒内裁剪 |
+| `condition` | `surface` / `collar` / `box` | `collar` | X-Part 的条件点：`surface` 拆分归属面；`collar` 归属面再加切口两侧邻居面的一圈（切口外 8% 部件对角线以内，最多占 25% 的点），让模型看到切口外表面怎么延续，把部件封“过”切口而不是加厚成壳；`box` 盒内裁剪（X-Part 原生做法，会把盒子里的邻居一起长出来）。当前默认 拆分归属面 + 切口处邻居面的一圈（collar，默认） |
 | `min_area_share` | float | `0.005` | 低于表面占比的连通块折进最近大件，不单独生成 |
 | `part_min_area_share` | `名=占比,…` | 无 | 按部件覆盖上一项，如 `装饰品=0.001` |
 | `fold_within_part` | bool | `false` | 小块只折进同名部件 |

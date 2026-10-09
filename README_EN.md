@@ -15,8 +15,11 @@ Upstream SegviGen: [Project Page](https://fenghora.github.io/SegviGen-Page/) |
   painted one flat colour (optionally the model too); the vision model turns it into `prompts` +
   `unassigned_to` for the ordinary `/pipeline`. Seconds, and the words can be edited before use.
 - **Smart split mode** (`mode=smart`): with no prompts, a vision model (Qwen `qwen3.8-max` as
-  deployed; Kimi works too) names the parts from the renders using the bank's vocabulary and SAM3
-  only measures those words (about 30 s; the rule-based sweep of the whole bank takes 6-12 min) -- the car
+  deployed; Kimi works too) names the parts (singular, bank vocabulary preferred) from 8 textured renders and offers
+  alternatives per word; SAM3 measures words, alternatives, singulars and `<object> <word>` together (about 30 s; the
+  rule-based sweep of the whole bank takes 6-12 min) and the best-detected phrase segments each part (`arms` is a weapon to
+  SAM3, `arm` works; `dog head` beats `head`), words with the same mask are merged, and under 30% coverage the full sweep
+  gives a second opinion -- the car
   goes from `wing` to `hood, door, wheel, window, bumper`, the sword to `blade + handle`. Needs
   `SEGVIGEN_VLM_API_KEY`.
 - **Parts get named without prompts** (`auto_prompts`, default on): SAM3 is asked for all 280
@@ -52,8 +55,8 @@ on. The CLI, the Python call and HTTP share **one** config object
   Geometry decides every boundary; language only names. `--merge off` stops after units;
   `--complete off` (the default) stops at the open `parts.glb`.
 - **X-Part completion** (`--complete full`): regenerates each open cut as a closed solid.
-  Default `--condition surface` conditions on the faces the split already assigned, not on
-  whatever falls inside a box. Pieces below `--min_area_share 0.005` fold into the nearest
+  Default `--condition collar`: the split's faces plus a collar of the neighbours' faces along the cut, so the part is closed through the cut rather than thickened into a thin shell,
+  not whatever falls inside a box. Pieces below `--min_area_share 0.005` fold into the nearest
   larger neighbour (they used to be dropped). A solid that overruns its box is redrawn
   `--redraws 2` times from the same prompt and kept only if it sits closer.
 - **Texture bake:** both the open parts and the closed solids get the source albedo back.
@@ -278,7 +281,7 @@ Stages 3 and 6 cost GPU minutes; the rest is seconds once the renders are cached
 |---|---|---|---|
 | `--merge` | `name` / `unit` / `off` | `name` | naming; `off` stops after units |
 | `--complete` | `off` / `boxes` / `full` | `off` | X-Part; `full` regenerates then bakes |
-| `--condition` | `surface` / `box` | `surface` | X-Part prompt: split faces, or crop-in-box |
+| `--condition` | `surface` / `collar` / `box` | `collar` | X-Part prompt: split faces; faces + a collar of neighbours along the cut; crop-in-box |
 | `--flat_paint` | `auto` / `on` / `off` | `auto` | temporary flat colour on a grey model |
 | `--granularity` | `fine` / `medium` / `coarse` | `medium` | atom/unit floors 150/300, 300/600, 800/1600 |
 | `--min_atom_faces` / `--min_unit_faces` | int | from granularity | explicit floor wins |

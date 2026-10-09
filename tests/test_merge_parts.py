@@ -7,9 +7,9 @@ from merge_parts import (
 
 class MergeDefaultsTest(unittest.TestCase):
     def test_default_cameras_are_the_four_low_three_quarter_views(self):
-        self.assertEqual(DEFAULT_VIEW_AZIMUTHS, "45,135,225,315")
+        self.assertEqual(DEFAULT_VIEW_AZIMUTHS, "0,45,90,135,180,225,270,315")
         # High enough to read the 3/4, low enough not to hide the legs and base.
-        self.assertEqual(DEFAULT_VIEW_ELEVATIONS, "10")
+        self.assertEqual(DEFAULT_VIEW_ELEVATIONS, "15")
 
     def test_mask_cache_changes_when_the_bank_does(self):
         shared = dict(

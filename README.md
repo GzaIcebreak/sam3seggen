@@ -13,18 +13,22 @@ mesh，带真实贴图。
 
 - **引导图 → 提示词**（`POST /guide_prompts`）：上传一张每个部件涂一种颜色的参考图（可选再给模型），视觉大模型
   把它翻译成 `prompts` + `unassigned_to`，再照常提交 `/pipeline`。几秒出词，可以先改再用。
-- **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）先看渲染图
-  从概念库词表里命名，SAM3 只测这几个词（约 30 秒，规则提名要扫全库 6–12 分钟）——跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
+- **智能分割模式**（`mode=smart`）：不写提示词时由视觉大模型（默认部署 Qwen `qwen3.8-max`，也可用 Kimi）先看 8 张带贴图渲染图
+  命名（优先概念库词表，词表没有的普通名词也行），并给每个词 1–3 个备选说法；SAM3 把词、备选、单数、“物体名+词”一起测（约 30 秒，规则提名要扫全库 6–12 分钟），
+  每个部件用命中最多的说法做提示词（SAM3 把 `arms` 当武器、0 命中，`arm` 可；`head` 从背面认不出，`dog head` 可），掩码重合的词合并（legs 吃掉 jeans），
+  部件盖住剪影不到 30% 时再补跑全库扫描二选一。跑车从 `wing` 变成 `hood, door, wheel, window, bumper`，长剑变成 `blade + handle`。
   需要 `SEGVIGEN_VLM_API_KEY`。
 - **不写提示词也能命名**（`auto_prompts`，默认开）：SAM3 一次过概念库的 280 个词，选出主体名和 2–6 个
   互不重叠的部件名再投票。旧测试里"无需求"一列 10 个模型 8 个 0 分；现在小狗自动得到 head / leg / body，
   椅子 backrest / chair leg / seat cushion。形状词误认（跑车→wing）和薄件（长剑）仍是短板。
 
 - **部件从原模型切**（`--export_from source`，默认）：标签仍在重建网格上投票，但转到原模型的面上后
-  直接切原模型，保留原 UV 和贴图，不再回烘。猴子的手从 1.3k 面变成 5–7k 面，手指才保得住。
+  直接切原模型，保留原 UV 和贴图，不再回烘。猴子的手从 1.3k 面变成 5–7k 面，手指才保得住。原模型里 < 2% 面积的
+  独立小壳整块取多数标签：游戏资产由几百个小件拼成（骑士 426 壳、自行车 827 壳），逐面最近标签会把它们打成碎屑。
 - **修复按评分选后端**（`--holopart_large score`，默认）：每个 X-Part 实体和它的开口面比对（覆盖率 ×
-  多余几何 × 出框 × 最大壳占比 × 侵入率），低分的再跑 HoloPart 取高分，两者都差就退回开口面。只看出框率会放过
-  0% 出框却修成圆块的树身。HoloPart 实体不再被减到 1 万面（`holopart_complete --max_faces`）。
+  多余几何 × 出框 × 最大壳占比 × 侵入率 × 空壳率），低分的再跑 HoloPart 取高分，两者都差就退回开口面。只看出框率会放过
+  0% 出框却修成圆块的树身；只看距离会放过 X-Part 把开口面“加厚”成的薄双层壳（人物-01 的头是只碗，体积只有凸包的 17%），
+  空壳率沿法线向内走一步看落没落在实体外面，碗 0.8–1.0、实心件 ≤ 0.2、刀片 0。HoloPart 实体不再被减到 1 万面（`holopart_complete --max_faces`）。
 - **部件互斥**：X-Part 重生身体时会把邻居长回来（小狗的身体带着第二条尾巴和四只爪子）。打分前把
   "贴着别的部件开口面、却离自己很远"的区域切掉并封口（边缘短才切），剩下的侵入率再扣分。
 - **提示词前先整理碎块**：`--merge_gap` 把被别的部件切开的同名小块接回一件；`--fold_within_part`、
@@ -37,7 +41,8 @@ CLI、Python 和 HTTP **共用一份配置**（`pipeline.py` 的 `PipelineOption
   几何定边界，语言只取名。`--merge off` 停在 units；`--complete off`（默认）停在开放的
   `parts.glb`。
 - **X-Part 补全**（`--complete full`）：把切口敞开的部件生成为封闭实体。默认
-  `--condition surface` 用拆分已经定好的归属面做条件，而不是盒内裁到的东西；过小件
+  `--condition collar`：拆分归属面 + 切口处邻居面的一圈（collar，默认）做条件，而不是盒内裁到的全部东西（`collar` 让模型看到切口外表面怎么延续，
+  部件封“过”切口而不是加厚成壳）；过小件
   `--min_area_share 0.005` 折进最近大件（不再丢弃）；超框用同样条件 `--redraws 2` 重抽，
   只留更贴盒的那一抽。
 - **贴图回烘**：开放件和封闭实体都把源 albedo 烘回去。实体笼子更松（`0.05 / 0.15`），
@@ -264,7 +269,7 @@ python segment_parts.py \
 |---|---|---|---|
 | `--merge` | `name` / `unit` / `off` | `name` | 命名；`off` 停在 units |
 | `--complete` | `off` / `boxes` / `full` / `hybrid` | `hybrid` | 修复：`full` 只用 X-Part；`hybrid` 按 `--holopart_large` 在 X-Part / HoloPart / 开口面之间选；都会再烘贴图 |
-| `--condition` | `surface` / `box` | `surface` | X-Part 条件：拆分归属面，或盒内裁剪 |
+| `--condition` | `surface` / `collar` / `box` | `collar` | X-Part 条件：拆分归属面；归属面 + 切口邻居面一圈；或盒内裁剪 |
 | `--flat_paint` | `auto` / `on` / `off` | `auto` | 渲染无色时先平涂 |
 | `--granularity` | `fine` / `medium` / `coarse` | `medium` | 原子/单元下限 150/300、300/600、800/1600 |
 | `--min_atom_faces` / `--min_unit_faces` | int | 随粒度 | 显式覆盖对应那一半 |
@@ -327,6 +332,11 @@ python segment_parts.py \
 | Mickey 均值（11 件） | 24.1% | **18.7%** |
 
 `--condition box` 保留旧行为用于对照。
+
+只拿自己的面做条件有个副作用：模型不知道切口外面是什么，常把开口面“加厚”成一层薄双层壳交回来
+（人物-01 的头、小狗的四条腿、耳机的耳罩都是这样，表面处处贴合、体积只有凸包的 10–20%）。`--condition collar`
+在自己的面之外再加切口两侧邻居面的一圈（切口外 8% 部件对角线以内，最多占 25% 的条件点），模型看到表面
+怎么延续，就把部件封过切口；长出来的那一点邻居由部件互斥切掉。评分里的空壳率负责兜底。
 
 ### X-Part 不是它提示词的函数
 

@@ -41,6 +41,15 @@ DEFAULT_MIN_AREA = 0.02       # share of the silhouette, summed over views
 DEFAULT_WHOLE = 0.5           # at least this share: a name for the object, not a part
 DEFAULT_WHOLE_VLM = 0.6       # for a word the VLM already vouches for as a part
 DEFAULT_SHORTLIST_MIN_VIEWS = 0.25   # a shortlisted word only has to show up in a quarter of the views
+DEFAULT_SHORTLIST_IOU = 0.6          # two shortlisted words whose masks overlap this much are one part
+DEFAULT_SHORTLIST_MIN_COVER = 0.3    # parts covering less than this also get the full-sweep second opinion
+MAX_VARIANT_PHRASES = 48             # SAM3 phrases measured for one shortlist (parts x variants)
+IRREGULAR_SINGULAR = {"feet": "foot", "teeth": "tooth", "antennae": "antenna", "geese": "goose",
+                      "men": "man", "women": "woman", "children": "child", "knives": "knife",
+                      "leaves": "leaf", "shelves": "shelf", "halves": "half", "wolves": "wolf",
+                      "hooves": "hoof", "glasses": "glasses", "pants": "pants", "shorts": "shorts",
+                      "jeans": "jeans", "scissors": "scissors", "tongs": "tongs", "pliers": "pliers"}
+OBJECT_SUFFIXES = ("figurine", "figure", "toy", "model", "statue", "character", "sculpture")
 DEFAULT_OVERLAP = 0.3         # parts sharing more than this of the smaller one are the same thing
 DEFAULT_MIN_VIEWS = 0.5       # seen in at least this share of the views
 PREFERRED_MAIN = ("body", "torso", "主体")
@@ -160,28 +169,47 @@ def word_stats(masks, foreground, scores, concepts, min_area=DEFAULT_MIN_AREA,
             for i, name in enumerate(concepts)]
 
 
-def accept_shortlist(chosen, rows, max_parts=DEFAULT_MAX_PARTS, whole=DEFAULT_WHOLE_VLM):
-    """(proposal, reason). The VLM's shortlist after SAM3 has measured it: words SAM3 did
-    not find are dropped, words whose biggest blob covers `whole` of the object are
-    whole-object words, and what is left must be a main word plus at least one part."""
+def accept_shortlist(chosen, rows, max_parts=DEFAULT_MAX_PARTS, whole=DEFAULT_WHOLE_VLM,
+                     masks=None, foreground=None, concepts=None, iou=DEFAULT_SHORTLIST_IOU):
+    """(proposal, reason). The VLM's shortlist after SAM3 has measured it and its variants:
+    a word is found if any of its phrases is (the best one segments it: `arm` when the
+    VLM said `arms`, `dog head` for a head SAM3 only saw from behind); words SAM3 did not
+    find at all are dropped, words whose biggest blob covers `whole` of the object are
+    whole-object words, words whose mask is another kept word's (IoU >= `iou`, needs the
+    masks) are collapsed into it, and what is left must be a main word plus at least one
+    part. proposal["parts"] holds prompt specs (`name` or `name=phrase`)."""
     by_name = {row["concept"]: row for row in rows}
-    found = [p for p in chosen["parts"] if by_name.get(p, {}).get("eligible")]
+    picked = pick_variants(chosen, rows, whole)
+    found = [p for p in chosen["parts"] if picked.get(p)]
     missing = [p for p in chosen["parts"] if p not in found]
-    kept, whole_words = drop_whole_words(found, rows, whole)
+    # a word whose own mask names the whole object but has no usable variant
+    whole_words = [p for p in missing
+                   if float(by_name.get(p, {}).get("blob", by_name.get(p, {}).get("area", 0))) >= whole]
+    missing = [p for p in missing if p not in whole_words]
+    overlaps = []
+    if masks is not None and foreground is not None and concepts is not None and len(found) > 1:
+        found, overlaps = resolve_overlaps(found, picked, masks, foreground, concepts, iou)
     main = chosen.get("main")
     if not main:
         return None, "the VLM named no main-body word"
-    if not kept:
+    if not found:
         return None, (f"none of the VLM's parts survived: not found by SAM3 {missing}, "
                       f"whole-object words {whole_words}")
-    proposal = {"main": main, "parts": kept[:max_parts], "candidates": rows,
-                "mode": "smart", "shortlist": True, "kimi": dict(chosen),
-                "separate": {w: n for w, n in (chosen.get("separate") or {}).items() if w in kept}}
+    kept = found[:max_parts]
+    proposal = {"main": main, "parts": [part_spec(p, picked.get(p)) for p in kept],
+                "part_names": kept, "phrases": {p: picked.get(p) or p for p in kept + [main]},
+                "candidates": rows, "mode": "smart", "shortlist": True, "kimi": dict(chosen)}
+    renamed = {p: picked[p] for p in kept if picked.get(p) and picked[p] != p}
+    if renamed:
+        proposal["kimi"]["variants_used"] = renamed
     if missing:
         proposal["kimi"]["not_found"] = missing
     if whole_words:
         proposal["kimi"]["dropped_whole"] = whole_words
+    if overlaps:
+        proposal["kimi"]["dropped_overlap"] = {word: same for word, same in overlaps}
     return proposal, None
+
 
 
 def covered_share(masks, foreground, concepts, parts):
@@ -232,6 +260,118 @@ def drop_whole_words(parts, candidates, whole=DEFAULT_WHOLE_VLM):
     return [name for name in parts if name not in dropped], dropped
 
 
+def singular(phrase):
+    """A naive English singular of the last word ('robot legs' -> 'robot leg'); the word
+    itself when it is not plural. SAM3 ignores `arms` (weapons) and `hands` but finds
+    `arm` and `hand`, so the singular is always worth measuring."""
+    head, _, last = phrase.rpartition(" ")
+    if last in IRREGULAR_SINGULAR:
+        word = IRREGULAR_SINGULAR[last]
+    elif len(last) > 3 and last.endswith("ies"):
+        word = last[:-3] + "y"
+    elif len(last) > 4 and last.endswith(("ses", "xes", "shes", "ches", "zes")):
+        word = last[:-2]
+    elif len(last) > 3 and last.endswith("s") and not last.endswith("ss"):
+        word = last[:-1]
+    else:
+        word = last
+    return f"{head} {word}".strip()
+
+
+def object_noun(object_name):
+    """The noun to prefix part words with: 'dog figurine' -> 'dog', 'robot' -> 'robot',
+    'lego minifigure' -> 'minifigure'; None for a long or empty description."""
+    words = str(object_name or "").lower().split()
+    if not words or len(words) > 3:
+        return None
+    if len(words) >= 2 and words[-1] in OBJECT_SUFFIXES:
+        return words[-2]
+    return words[-1]
+
+
+def variant_phrases(chosen, limit=MAX_VARIANT_PHRASES):
+    """{part word: [phrases to measure]} for the VLM's parts and main word: the word, the
+    VLM's alternatives, its singular, and '<object> <word>'. Order = preference on a tie."""
+    noun = object_noun(chosen.get("object"))
+    alternatives = chosen.get("alternatives") or {}
+    out = {}
+    total = 0
+    words = list(chosen.get("parts") or []) + ([chosen["main"]] if chosen.get("main") else [])
+    for word in dict.fromkeys(words):
+        phrases = [word]
+        for phrase in list(alternatives.get(word) or []) + [singular(word)]:
+            phrase = str(phrase).strip().lower()
+            if phrase and phrase not in phrases:
+                phrases.append(phrase)
+        if noun and not word.startswith(noun + " ") and word != noun:
+            compound = f"{noun} {word}"
+            if compound not in phrases:
+                phrases.append(compound)
+        room = max(limit - total, 1)
+        out[word] = phrases[:room]
+        total += len(out[word])
+    return out
+
+
+def pick_variants(chosen, rows, whole=DEFAULT_WHOLE_VLM):
+    """{part word: best phrase or None}: among a word's measured variants, the eligible
+    one seen in the most views (then the largest), skipping whole-object masks."""
+    by_name = {row["concept"]: row for row in rows}
+    picked = {}
+    for word, phrases in variant_phrases(chosen).items():
+        best = None
+        for index, phrase in enumerate(phrases):
+            row = by_name.get(phrase)
+            if not row or not row.get("eligible") or float(row.get("blob", row["area"])) >= whole:
+                continue
+            key = (row["views"], round(row["area"], 3), -index)
+            if best is None or key > best[0]:
+                best = (key, phrase)
+        picked[word] = best[1] if best else None
+    return picked
+
+
+def union_masks(masks, foreground, concepts, phrase):
+    masks = np.asarray(masks, dtype=bool)
+    if phrase not in list(concepts):
+        return None
+    return masks[:, list(concepts).index(phrase)] & np.asarray(foreground, dtype=bool)
+
+
+def resolve_overlaps(order, phrase_of, masks, foreground, concepts, iou=DEFAULT_SHORTLIST_IOU):
+    """(kept, dropped): later words whose mask is the same thing as an earlier word's
+    (IoU >= `iou` over all views) go. The VLM lists parts most important first, so
+    `legs` beats `jeans` and `handle` beats `shaft`."""
+    kept, dropped = [], []
+    unions = {}
+    for word in order:
+        mine = union_masks(masks, foreground, concepts, phrase_of.get(word) or word)
+        if mine is None:
+            kept.append(word)
+            continue
+        same = None
+        for other in kept:
+            theirs = unions.get(other)
+            if theirs is None:
+                continue
+            inter = np.logical_and(mine, theirs).sum()
+            union = np.logical_or(mine, theirs).sum()
+            if union and inter / union >= iou:
+                same = other
+                break
+        if same is None:
+            kept.append(word)
+            unions[word] = mine
+        else:
+            dropped.append((word, same))
+    return kept, dropped
+
+
+def part_spec(word, phrase):
+    """The prompt spec downstream: the VLM's name, segmented by the phrase SAM3 knows."""
+    return word if phrase in (None, word) else f"{word}={phrase}"
+
+
 def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     flat_paint="auto", reuse=True, radius=2.0, resolution=512,
                     azimuths=AUTO_AZIMUTHS, elevations=AUTO_ELEVATIONS,
@@ -262,12 +402,17 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
     suffix = "_grey" if painted else ""
     images = []
     if mode == "smart":
-        with open(os.path.join(prompt_dir, "cameras.json"), encoding="utf-8") as handle:
+        # the textured renders, all of them: the grey flat paint made a gramophone a
+        # "house" and a skull-studded chest a "toy car"
+        with open(os.path.join(views_dir, "cameras.json"), encoding="utf-8") as handle:
             views = json.load(handle)["views"]
-        images = [os.path.join(prompt_dir, view["image"]) for view in views][::2][:4]
+        images = [os.path.join(views_dir, view["image"]) for view in views][:8]
 
     proposal = None
-    if mode == "smart":
+    shortlist_error = None
+    shortlist_proposal = None     # a weak shortlist result kept while the sweep is tried
+    # SEGVIGEN_SMART_SHORTLIST=0: skip the VLM-first shortlist (A/B against the full sweep)
+    if mode == "smart" and os.environ.get("SEGVIGEN_SMART_SHORTLIST", "1") != "0":
         # Shortlist first: the VLM names the parts from the renders, SAM3 only measures
         # those words. The full bank sweep below is the fallback.
         from smart_prompts import kimi_shortlist
@@ -286,30 +431,42 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
             print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
                   f"main={chosen['main']!r} parts={chosen['parts']}"
                   + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
-            words = list(dict.fromkeys(chosen["parts"] + ([chosen["main"]] if chosen["main"] else [])))
+            words = list(dict.fromkeys(
+                phrase for phrases in variant_phrases(chosen).values() for phrase in phrases))
             if words:
                 import hashlib
 
                 digest = hashlib.sha1("|".join(words).encode("utf-8")).hexdigest()[:10]
                 short_npz = os.path.join(work_dir, f"auto_shortlist_{digest}{suffix}.npz")
                 if not (reuse and os.path.isfile(short_npz)):
-                    print(f"[smart] asking SAM3 for the {len(words)} shortlisted words over "
-                          f"{len(azimuths.split(','))} views ...")
+                    print(f"[smart] asking SAM3 for the {len(words)} shortlisted words and "
+                          f"variants over {len(azimuths.split(','))} views ...")
                     sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir,
                                painted, short_npz, words)
                 short = load_masks(short_npz)
                 rows = word_stats(short.masks, short.foreground, short.scores, short.concepts,
                                   min_views=DEFAULT_SHORTLIST_MIN_VIEWS)
-                proposal, reason = accept_shortlist(chosen, rows, max_parts=max_parts)
+                proposal, reason = accept_shortlist(
+                    chosen, rows, max_parts=max_parts, masks=short.masks,
+                    foreground=short.foreground, concepts=short.concepts)
                 if proposal is None:
                     print(f"[smart] shortlist unusable ({reason}); falling back to the full bank sweep")
                 else:
-                    proposal["covered"] = covered_share(short.masks, short.foreground,
-                                                        short.concepts, proposal["parts"])
-                    extra = proposal["kimi"].get("not_found"), proposal["kimi"].get("dropped_whole")
-                    if any(extra):
-                        print(f"[smart] not found by SAM3: {extra[0] or []}; whole-object words "
-                              f"dropped: {extra[1] or []}")
+                    proposal["covered"] = covered_share(
+                        short.masks, short.foreground, short.concepts,
+                        [proposal["phrases"][p] for p in proposal["part_names"]])
+                    kimi = proposal["kimi"]
+                    if kimi.get("variants_used"):
+                        print(f"[smart] SAM3 knows these better: "
+                              + ", ".join(f"{k} -> {v}" for k, v in kimi["variants_used"].items()))
+                    if kimi.get("not_found") or kimi.get("dropped_whole") or kimi.get("dropped_overlap"):
+                        print(f"[smart] not found by SAM3: {kimi.get('not_found') or []}; "
+                              f"whole-object words dropped: {kimi.get('dropped_whole') or []}; "
+                              f"same thing as another word: {kimi.get('dropped_overlap') or {}}")
+                    if proposal["covered"] < DEFAULT_SHORTLIST_MIN_COVER:
+                        print(f"[smart] the parts cover only {proposal['covered']:.0%} of the "
+                              "silhouette; asking the full bank sweep for a second opinion")
+                        shortlist_proposal, proposal = proposal, None
 
     if proposal is None:
         masks_npz = os.path.join(work_dir, f"auto_concepts{suffix}.npz")
@@ -351,10 +508,23 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                     proposal["main"] = chosen["main"] or proposal["main"]
                 else:
                     print("[smart] VLM returned no usable part; keeping the rule-based pick")
+    if shortlist_proposal is not None:
+        # the sweep's review is the second opinion: keep whichever covers more
+        if proposal.get("covered", 0.0) > shortlist_proposal["covered"]:
+            proposal["shortlist_overruled"] = {
+                "parts": shortlist_proposal["parts"], "covered": shortlist_proposal["covered"]}
+            print(f"[smart] the sweep covers {proposal.get('covered', 0.0):.0%} vs the "
+                  f"shortlist's {shortlist_proposal['covered']:.0%}; using the sweep")
+        else:
+            shortlist_proposal["sweep_overruled"] = {
+                "parts": proposal.get("parts"), "covered": proposal.get("covered")}
+            proposal = shortlist_proposal
+            print(f"[smart] the sweep did not cover more; keeping the shortlist")
     prompts = list(proposal["parts"])
     main = proposal["main"]
-    if main and main not in prompts:
-        prompts.append(main)
+    if main and main not in prompts and main not in [p.split("=", 1)[0] for p in prompts]:
+        phrase = (proposal.get("phrases") or {}).get(main)
+        prompts.append(part_spec(main, phrase))
     unassigned_to = main or (prompts[0] if prompts else None)
     if guide_image:
         proposal["guide_image"] = os.path.basename(guide_image)

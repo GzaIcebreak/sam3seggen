@@ -56,11 +56,42 @@ DEFAULT_MERGE_MAX_SHARE = 0.05
 DEFAULT_FIT_TOLERANCE = 0.05
 # What X-Part samples per part; the conditioner's positional encoding is fitted to it.
 XPART_CONDITION_POINTS = 81920
-CONDITION_MODES = ("surface", "box")
+CONDITION_MODES = ("surface", "box", "collar")
+DEFAULT_COLLAR = 0.08          # neighbour faces within this x part diagonal of the cut rim
+COLLAR_MAX_SHARE = 0.25        # at most this share of the conditioning points is collar
 # A completion is meant to close the cut, which grows the part a little. Half the box again
 # is far past that: the good draws of Mickey's parts all came in under 9% of their box and
 # the bad ones overran by 174% and 675%, so anywhere in between separates them.
 BOX_ESCAPE_WARNING = 0.5
+# A solid that is a thin double wall instead of a filled part (see hollow_share).
+HOLLOW_THIN = 0.08       # inward step, as a share of the box's smallest extent
+HOLLOW_SAMPLES = 20000
+HOLLOW_REDRAW = 0.5      # redraw a solid whose hollow share is above this
+
+
+def hollow_share(solid, box, dense=None, samples=HOLLOW_SAMPLES, thin=HOLLOW_THIN, seed=0):
+    """Share of the solid's surface that is a thin wall with empty space behind it.
+
+    From each surface sample step inwards by `thin` x the box's smallest extent and ask
+    whether that point is inside the solid, judged by the nearest surface sample's normal
+    (behind the surface = inside). In a filled part it is; in the thin double wall X-Part
+    makes of an open surface it is in the cavity between the walls. A filled head gives
+    ~0, the 人物-01 bowl ~0.9. A sword blade is safe: its box's smallest extent IS its
+    thickness, so the step is a fraction of it. Fingers and rims do get flagged, which is
+    what HOLLOW_FREE allows for."""
+    from scipy.spatial import cKDTree
+
+    if solid is None or not len(solid.faces) or solid.area <= 0:
+        return 0.0
+    box = np.asarray(box, dtype=float)
+    step = thin * float(np.maximum(box[1] - box[0], 1e-9).min())
+    dense_points, dense_faces = trimesh.sample.sample_surface(solid, samples * 10, seed=seed)
+    dense_normals = np.asarray(solid.face_normals)[dense_faces]
+    points, face_index = trimesh.sample.sample_surface(solid, samples, seed=seed + 2)
+    inward = np.asarray(points) - np.asarray(solid.face_normals)[face_index] * step
+    nearest = cKDTree(dense_points).query(inward)[1]
+    outside = np.einsum("ij,ij->i", inward - dense_points[nearest], dense_normals[nearest]) > 0
+    return float(outside.mean())
 
 
 def box_escape(generated_bounds, box):
@@ -369,19 +400,78 @@ def xpart_normalization(bounds):
     return centre, float(np.max(bounds[1] - bounds[0]) / 2 / 0.8)
 
 
+def rim_vertices(surface):
+    """Vertices on the open boundary of a surface (edges used by one face only)."""
+    edges = np.asarray(surface.edges_sorted)
+    if not len(edges):
+        return np.zeros((0, 3))
+    _, index, counts = np.unique(edges, axis=0, return_index=True, return_counts=True)
+    boundary = edges[index[counts == 1]]
+    if not len(boundary):
+        return np.zeros((0, 3))
+    return np.asarray(surface.vertices)[np.unique(boundary)]
+
+
+def collar_samples(index, surfaces, num_points, collar=DEFAULT_COLLAR, max_share=COLLAR_MAX_SHARE,
+                   seed=42):
+    """(points, normals) from the OTHER surfaces within `collar` x this part's diagonal of
+    this part's cut rim: what the surface does just past the cut. Empty when the part has
+    no open rim (a loose, closed piece) or no neighbour comes close."""
+    from scipy.spatial import cKDTree
+
+    mine = surfaces[index]
+    rim = rim_vertices(mine)
+    if not len(rim):
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    diag = float(np.linalg.norm(mine.bounds[1] - mine.bounds[0]))
+    reach = collar * max(diag, 1e-9)
+    tree = cKDTree(rim)
+    points, normals = [], []
+    for other_index, other in enumerate(surfaces):
+        if other_index == index or other.area <= 0:
+            continue
+        # cheap reject: the other part's box must come within reach of the rim's box
+        if np.any(other.bounds[0] > rim.max(axis=0) + reach) or \
+                np.any(other.bounds[1] < rim.min(axis=0) - reach):
+            continue
+        count = max(int(num_points * other.area / max(mine.area, 1e-12)), 2000)
+        sampled, face_index = trimesh.sample.sample_surface(other, min(count, num_points),
+                                                           seed=seed + other_index)
+        near = tree.query(np.asarray(sampled))[0] <= reach
+        if near.any():
+            points.append(np.asarray(sampled)[near])
+            normals.append(np.asarray(other.face_normals)[face_index][near])
+    if not points:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    points, normals = np.vstack(points), np.vstack(normals)
+    cap = int(max_share * num_points)
+    if len(points) > cap:
+        pick = np.random.default_rng(seed).choice(len(points), cap, replace=False)
+        points, normals = points[pick], normals[pick]
+    return points, normals
+
+
 def part_surface_condition(surfaces, centre, scale, num_points=XPART_CONDITION_POINTS,
-                           seed=42):
-    """[K, N, 7] of (point, normal, sharp-edge flag) sampled from each part's own faces.
+                           seed=42, collar=0.0):
+    """[K, N, 7] of (point, normal, sharp-edge flag) sampled from each part's own faces --
+    and, with `collar` > 0, from the neighbours' faces within that share of the part's
+    diagonal of its cut rim (see collar_samples); the total stays `num_points`.
 
     The flag is the seventh channel X-Part's own sampler fills with zeros; it marks points
     taken from sharp edges, which it never does for a box crop and we do not either.
     """
     samples = []
-    for surface in surfaces:
+    for index, surface in enumerate(surfaces):
         if surface.area <= 0:
             raise SystemExit("a part component has no area; cannot sample its surface")
-        points, face_index = trimesh.sample.sample_surface(surface, num_points, seed=seed)
+        extra_points, extra_normals = (collar_samples(index, surfaces, num_points, collar, seed=seed)
+                                       if collar > 0 else (np.zeros((0, 3)), np.zeros((0, 3))))
+        own = num_points - len(extra_points)
+        points, face_index = trimesh.sample.sample_surface(surface, own, seed=seed)
         normals = surface.face_normals[face_index]
+        if len(extra_points):
+            points = np.vstack([np.asarray(points), extra_points])
+            normals = np.vstack([np.asarray(normals), extra_normals])
         samples.append(np.hstack([
             (np.asarray(points) - centre) / scale,
             np.asarray(normals),
@@ -487,8 +577,13 @@ def main():
                              "embedding is random per pass, so a redraw is a new draw")
     parser.add_argument("--condition", choices=CONDITION_MODES, default="surface",
                         help="What describes a part to X-Part: the faces the split "
-                             "assigned to it, or (box) whatever of the source falls "
-                             "inside its bounding box, which is X-Part's own default")
+                             "assigned to it, (box) whatever of the source falls "
+                             "inside its bounding box, which is X-Part's own default, or "
+                             "(collar) its faces plus a collar of the neighbours' faces "
+                             "along the cut, so the part is closed through the cut rather "
+                             "than thickened into a shell")
+    parser.add_argument("--collar", type=float, default=DEFAULT_COLLAR,
+                        help="collar width as a share of the part's diagonal")
     parser.add_argument("--boxes_only", action="store_true",
                         help="Write the box prompts and a preview, without loading X-Part")
     parser.add_argument("--no_source_frame", dest="source_frame", action="store_false",
@@ -574,18 +669,23 @@ def main():
     pipeline.to(device="cuda", dtype=torch.float32)
 
     condition = None
-    if args.condition == "surface":
+    if args.condition in ("surface", "collar"):
         centre, norm_scale = xpart_normalization(source.bounds)
-        print(f"sampling {XPART_CONDITION_POINTS} points from each part's own faces "
-              f"(normalisation centre {np.round(centre, 4)}, scale {norm_scale:.4f})")
+        collar = args.collar if args.condition == "collar" else 0.0
+        print(f"sampling {XPART_CONDITION_POINTS} points from each part's own faces"
+              + (f" plus a {collar:.0%}-diagonal collar of its neighbours" if collar else "")
+              + f" (normalisation centre {np.round(centre, 4)}, scale {norm_scale:.4f})")
         condition = torch.from_numpy(part_surface_condition(
-            surfaces, centre, norm_scale, seed=args.seed))
+            surfaces, centre, norm_scale, seed=args.seed, collar=collar))
 
     names = [row["name"] for row in rows]
     solids = generate(pipeline, os.path.abspath(args.glb), boxes, condition, names, args)
 
     solids = redraw_escapees(pipeline, os.path.abspath(args.glb), boxes, condition, names,
                              solids, args)
+    centre, norm_scale = xpart_normalization(source.bounds)
+    solids = redraw_hollow(pipeline, os.path.abspath(args.glb), boxes, surfaces, centre,
+                           norm_scale, names, solids, args)
 
     instances = trimesh.Scene()
     for index, solid in enumerate(solids):
@@ -645,6 +745,50 @@ def generate(pipeline, glb, boxes, condition, names, args):
         for offset, geometry in enumerate(geometries[:len(chunk)]):
             solids[start + offset] = geometry
         torch.cuda.empty_cache()
+    return solids
+
+
+def redraw_hollow(pipeline, glb, boxes, surfaces, centre, scale, names, solids, args):
+    """Draw a part again, with a collar (wider each time), when its solid is a thin shell.
+
+    Conditioned on its own open faces alone, X-Part often hands back the surface thickened
+    into a double wall -- a bowl for a head, a tube for a leg -- rather than a filled part.
+    The neighbours' faces along the cut tell it how the surface continues (collar_samples);
+    on the 人物-01 figure that took hollow instances from 5 of 13 to 1 of 13. The part that
+    stays hollow is tried with twice the collar, then four times, up to --redraws times; a
+    redraw is kept only if it is less hollow."""
+    import torch
+
+    if args.redraws <= 0:
+        return solids
+    base = args.collar if args.condition == "collar" else DEFAULT_COLLAR
+    for attempt in range(args.redraws):
+        hollow = {index: hollow_share(solid, boxes[index])
+                  for index, solid in enumerate(solids) if solid is not None}
+        bad = sorted(i for i, share in hollow.items() if share > HOLLOW_REDRAW)
+        if not bad:
+            return solids
+        collar = base * (2 ** (attempt + 1))
+        print(f"{len(bad)} of {len(boxes)} solids are thin shells "
+              f"({', '.join(f'{names[i]} {hollow[i]:.0%}' for i in bad)}); redrawing them with "
+              f"a {collar:.0%}-diagonal collar (attempt {attempt + 1} of {args.redraws}) ...")
+        cond = torch.from_numpy(part_surface_condition(
+            surfaces, centre, scale, seed=args.seed + attempt + 1, collar=collar))[bad]
+        replacements = generate(pipeline, glb, boxes[bad], cond, [names[i] for i in bad], args)
+        for index, replacement in zip(bad, replacements):
+            if replacement is None:
+                continue
+            after = hollow_share(replacement, boxes[index])
+            if after >= hollow[index]:
+                print(f"  {names[index]}: still {after:.0%} hollow; keeping the {hollow[index]:.0%} one")
+                continue
+            print(f"  {names[index]}: {hollow[index]:.0%} -> {after:.0%} hollow, kept")
+            solids[index] = replacement
+    still = [names[i] for i, solid in enumerate(solids)
+             if solid is not None and hollow_share(solid, boxes[i]) > HOLLOW_REDRAW]
+    if still:
+        print(f"still hollow after {args.redraws} redraws (the score will send them to "
+              f"HoloPart or keep the open surface): {', '.join(still)}")
     return solids
 
 

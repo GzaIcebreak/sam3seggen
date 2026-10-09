@@ -11,7 +11,7 @@ import os
 import numpy as np
 import trimesh
 
-from xpart_complete import box_escape, group_solids, load_part_nodes
+from xpart_complete import box_escape, group_solids, hollow_share, load_part_nodes
 
 ESCAPE_LIMIT = 0.5
 AREA_LARGE = 0.08
@@ -207,6 +207,8 @@ INTRUSION_SCALE = 0.1      # this much residual intrusion zeroes the score
 INTRUSION_MAX_RIM = 1.0    # cut a region only when its rim is shorter than this x diagonal
 INTRUSION_MIN_FACES = 20
 INTRUSION_CRUMB = 0.005    # a shell under this share of the area after the cut is debris
+HOLLOW_FREE = 0.15       # this share of thin samples is normal (fingers, rims)
+HOLLOW_SCALE = 0.5       # this much above HOLLOW_FREE zeroes the score
 
 
 class OpenSurfaces:
@@ -350,6 +352,7 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     escape    how far the solid overruns the prompt box
     intrusion share of the solid's surface lying on another instance's surface (needs
               `surfaces`, an OpenSurfaces, and the solid's `instance`)
+    hollow    share of the solid's surface that is a thin double wall (see hollow_share)
     """
     from scipy.spatial import cKDTree
 
@@ -374,6 +377,7 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
         "escape": float(box_escape(solid.bounds, box)),
         "largest_shell": largest_shell_share(solid),
         "intrusion": intrusion,
+        "hollow": hollow_share(solid, box, dense=dense, samples=samples, seed=seed),
     }
 
 
@@ -393,15 +397,19 @@ def largest_shell_share(solid):
     return float(max(shell.area for shell in shells) / welded.area)
 
 
-def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUSION_SCALE):
-    """0..1: coverage, discounted by invented geometry, box escape, tatters and intrusion."""
+def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUSION_SCALE,
+                  hollow_free=HOLLOW_FREE, hollow_scale=HOLLOW_SCALE):
+    """0..1: coverage, discounted by invented geometry, box escape, tatters, intrusion
+    and hollowness (a thin double wall where a filled part should be)."""
     if not metrics:
         return 0.0
     extra = min(1.0, metrics["extra_p90"] / extra_scale)
     escape = min(1.0, metrics["escape"])
     whole = metrics.get("largest_shell", 1.0)
     intrusion = min(1.0, metrics.get("intrusion", 0.0) / intrusion_scale)
-    return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole * (1.0 - intrusion))
+    hollow = min(1.0, max(0.0, metrics.get("hollow", 0.0) - hollow_free) / hollow_scale)
+    return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole
+                 * (1.0 - intrusion) * (1.0 - hollow))
 
 
 def _score_inputs(out_dir):
@@ -485,6 +493,8 @@ def apply_scored(out_dir, decisions, holopart_glb=None, floor=SCORE_FLOOR):
             backend, mesh = "open", opened[inst][1]
         decision["backend"], decision["score"] = backend, score
         names.append(row["name"])
+        if backend != "open":
+            mesh = drop_crumbs(mesh)      # HoloPart shards (a mouth in 1,649 pieces) go too
         solids.append(drop_duplicate_faces(mesh))
     write_assembled(out_dir, names, solids)
     with open(os.path.join(out_dir, "decisions.json"), "w", encoding="utf-8") as handle:

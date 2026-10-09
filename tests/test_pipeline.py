@@ -61,8 +61,8 @@ class PipelineDefaultsTest(unittest.TestCase):
         self.assertIn("fragments", options.public()["switches"]["merge"])
         self.assertEqual(options.condition, DEFAULT_CONDITION)
         self.assertEqual(options.flat_paint, DEFAULT_FLAT_PAINT)
-        self.assertEqual(options.view_azimuths, "45,135,225,315")
-        self.assertEqual(options.view_elevations, "10")
+        self.assertEqual(options.view_azimuths, "0,45,90,135,180,225,270,315")
+        self.assertEqual(options.view_elevations, "15")
         self.assertFalse(options.strict_parts)
         snapshot = options.public()["defaults"]
         self.assertEqual(snapshot["sam3_threshold"], 0.4)

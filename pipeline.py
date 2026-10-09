@@ -35,7 +35,7 @@ MERGE_MODES = ("name", "unit", "fragments")  # merge_parts; segment_parts also a
 MERGE_MODES_ALL = ("name", "unit", "off", "fragments")
 MIRROR_MODES = ("auto", "none", "x", "y", "z")
 COMPLETE_MODES = ("off", "boxes", "full", "hybrid")
-CONDITION_MODES = ("surface", "box")
+CONDITION_MODES = ("surface", "box", "collar")   # see xpart_complete.CONDITION_MODES
 
 GRANULARITY = {
     "fine": (150, 300),
@@ -51,8 +51,10 @@ DEFAULT_AZIMUTH_JITTER = 30.0
 DEFAULT_GRANULARITY = "medium"
 DEFAULT_COLOR_TOL = 20.0
 DEFAULT_MIRROR = "auto"
-DEFAULT_VIEW_AZIMUTHS = "45,135,225,315"
-DEFAULT_VIEW_ELEVATIONS = "10"
+# The same ring the smart-mode proposal measures (auto_prompts.AUTO_*): a word SAM3
+# found from three of eight directions used to get no vote at all on a 4-view grid.
+DEFAULT_VIEW_AZIMUTHS = "0,45,90,135,180,225,270,315"
+DEFAULT_VIEW_ELEVATIONS = "15"
 DEFAULT_RADIUS = 2.0
 DEFAULT_RESOLUTION = 512
 DEFAULT_SAM3_THRESHOLD = 0.4            # BANK_THRESHOLD; 0.3 is the no-bank painter
@@ -61,7 +63,7 @@ DEFAULT_MERGE = "name"
 DEFAULT_PROMPTS = ("主体", "底座")
 DEFAULT_UNASSIGNED_TO = "body"
 DEFAULT_COMPLETE = "hybrid"
-DEFAULT_CONDITION = "surface"
+DEFAULT_CONDITION = "collar"
 DEFAULT_MIN_AREA_SHARE = 0.005
 DEFAULT_FRAGMENT_SHARE = 0.01
 DEFAULT_REDRAWS = 2
