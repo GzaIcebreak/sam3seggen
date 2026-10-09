@@ -19,10 +19,21 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-DEFAULT_MIN_SHARE = 0.10
+DEFAULT_MIN_SHARE = 0.05
 DEFAULT_MIN_FACES = 50
 # seg.glb already carries to_glb's baked axis swap: see data_toolkit/spike_lift.py.
 SEG_GLB_ROTATION = np.diag([1.0, -1.0, -1.0])
+
+
+def welded_adjacency(mesh):
+    """Face adjacency after welding coincident vertices: seg.glb keeps a vertex per face
+    corner, so the mesh's own face_adjacency is almost empty and no patch could ever
+    reach min_faces."""
+    import trimesh
+
+    welded = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.faces), process=False)
+    welded.merge_vertices(merge_tex=True, merge_norm=True)
+    return welded.face_adjacency
 
 
 def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
@@ -40,7 +51,7 @@ def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
     disagree = (per_face >= 0) & (labels >= 0) & (per_face != labels)
     if not disagree.any():
         return labels, []
-    adjacency = np.asarray(mesh.face_adjacency)
+    adjacency = np.asarray(welded_adjacency(mesh))
     a, b = adjacency[:, 0], adjacency[:, 1]
     keep = (disagree[a] & disagree[b] & (units[a] == units[b]) & (per_face[a] == per_face[b]))
     edges = adjacency[keep]
