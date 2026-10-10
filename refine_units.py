@@ -21,6 +21,10 @@ from scipy.sparse.csgraph import connected_components
 
 DEFAULT_MIN_SHARE = 0.05
 DEFAULT_MIN_FACES = 50
+# a face's per-face label counts as evidence only if this many views' masks back it: on
+# the puppy one rear view's torso mask covered the back of the head, and refine moved an
+# ear's worth of the head to the torso on that view alone
+DEFAULT_MIN_VIEWS = 2
 # seg.glb already carries to_glb's baked axis swap: see data_toolkit/spike_lift.py.
 SEG_GLB_ROTATION = np.diag([1.0, -1.0, -1.0])
 
@@ -77,7 +81,8 @@ def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
 
 def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera_angle_x,
                            resolution, min_share=DEFAULT_MIN_SHARE,
-                           min_faces=DEFAULT_MIN_FACES, smoothness=0.4):
+                           min_faces=DEFAULT_MIN_FACES, smoothness=0.4,
+                           min_views=DEFAULT_MIN_VIEWS):
     """Lift the masks per face and hand the vote's labels to relabel_patches.
 
     `names` orders the label indices (the vote's part order); the lift's own part order
@@ -90,7 +95,7 @@ def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera
     # tip took the hips and hind legs the vote had given to the torso
     part_labels, part_names, _, _ = lift(
         mesh, SEG_GLB_ROTATION, mask_set, cameras, camera_angle_x, resolution,
-        smoothness=smoothness, keep_unvoted=False)
+        smoothness=smoothness, keep_unvoted=False, min_views=min_views)
     to_label = {index: names.index(name) for index, name in enumerate(part_names)
                 if name in names}
     per_face = np.array([to_label.get(int(label), -1) for label in part_labels])

@@ -87,9 +87,13 @@ def mask_lookup(mask_resolution, supersample):
     return (coarse[:, None] * mask_resolution + coarse[None, :]).ravel()
 
 
-def accumulate_votes(face_ids, mask_set: MaskSet, weights, n_faces, supersample=1):
-    """[faces, concepts] evidence, plus which faces any view actually resolved."""
+def accumulate_votes(face_ids, mask_set: MaskSet, weights, n_faces, supersample=1,
+                     view_counts=False):
+    """[faces, concepts] evidence, plus which faces any view actually resolved; with
+    `view_counts` also [faces, concepts] = in how many views the concept's mask covered
+    the face."""
     votes = np.zeros((n_faces, len(mask_set.concepts)), dtype=np.float64)
+    counts = np.zeros((n_faces, len(mask_set.concepts)), dtype=np.int32) if view_counts else None
     visible = np.zeros(n_faces, dtype=bool)
     lookup = mask_lookup(mask_set.masks.shape[-1], supersample)
 
@@ -113,6 +117,10 @@ def accumulate_votes(face_ids, mask_set: MaskSet, weights, n_faces, supersample=
             votes[:, concept] += np.bincount(
                 faces[inside], weights=angle[inside] * score, minlength=n_faces
             )
+            if counts is not None:
+                counts[np.unique(faces[inside]), concept] += 1
+    if counts is not None:
+        return votes, visible, counts
     return votes, visible
 
 
@@ -376,6 +384,18 @@ def cut_weights(lengths, angles, convex, crease_gain=2.0):
     return weights / mean if mean > 0 else weights
 
 
+def drop_thin_evidence(labels, counts, min_views):
+    """-1 wherever the face's label is backed by fewer than `min_views` views' masks."""
+    labels = np.asarray(labels).copy()
+    if min_views <= 1:
+        return labels
+    known = labels >= 0
+    backing = np.zeros(len(labels), dtype=np.int64)
+    backing[known] = np.asarray(counts)[np.flatnonzero(known), labels[known]]
+    labels[known & (backing < min_views)] = -1
+    return labels
+
+
 def drop_unvoted(labels, votes):
     """-1 wherever no mask voted: the label there was grown from a neighbour or taken
     from the nearest face, a guess rather than something a mask said."""
@@ -387,7 +407,7 @@ def drop_unvoted(labels, votes):
 def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
          smooth_iterations=2, supersample=4, min_patch_ratio=0.001, smoothness=0.0,
          crease_gain=2.0, confidence_path=None, confidence_gain=4.0, confidence_hops=4,
-         keep_unvoted=True):
+         keep_unvoted=True, min_views=1):
     """Return per-face part labels, the part names and a coverage report.
 
     `supersample` rasterises face ids finer than the SAM3 masks. A remesh's triangles
@@ -401,6 +421,8 @@ def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
 
     `keep_unvoted=False` returns -1 for every face no mask voted on instead of the label
     grown into it (refine_units reads the result as evidence; a grown label is not).
+    `min_views` > 1 also returns -1 where the face's label is backed by fewer views'
+    masks than that (one view's mask spilling over a neighbour is not evidence).
     """
     from data_toolkit.parts_rebake import smooth_labels
 
@@ -410,9 +432,16 @@ def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
         vertices, faces, cameras, camera_angle_x, resolution=resolution * supersample
     )
     weights = view_weights(centroids, np.asarray(mesh.face_normals), cameras)
-    votes, visible = accumulate_votes(
-        face_ids, mask_set, weights, len(faces), supersample=supersample
-    )
+    counts = None
+    if min_views > 1:
+        votes, visible, counts = accumulate_votes(
+            face_ids, mask_set, weights, len(faces), supersample=supersample, view_counts=True
+        )
+        counts, _ = part_votes_from_concepts(counts.astype(np.float64), mask_set.owners)
+    else:
+        votes, visible = accumulate_votes(
+            face_ids, mask_set, weights, len(faces), supersample=supersample
+        )
     # Merge to parts before anything is cleaned up: a seam between two concepts of the
     # same part does not exist in the output, so there is nothing there worth tidying.
     votes, part_names = part_votes_from_concepts(votes, mask_set.owners)
@@ -437,6 +466,8 @@ def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
 
     if not keep_unvoted:
         labels = drop_unvoted(labels, votes)
+    if counts is not None:
+        labels = drop_thin_evidence(labels, counts, min_views)
     report = {
         **confidence_report,
         "faces": int(len(faces)),

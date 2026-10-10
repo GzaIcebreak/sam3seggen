@@ -112,6 +112,14 @@ class RefineEvidenceTest(unittest.TestCase):
         votes = np.array([[2, 0], [0, 0], [0, 0], [0, 0], [0, 3]], dtype=float)
         self.assertEqual(drop_unvoted(labels, votes).tolist(), [0, -1, -1, -1, 1])
 
+    def test_one_view_is_not_evidence(self):
+        from data_toolkit.lift_sam3 import drop_thin_evidence
+
+        labels = np.array([0, 1, 1, -1])
+        counts = np.array([[3, 0], [0, 1], [1, 2], [0, 0]])
+        self.assertEqual(drop_thin_evidence(labels, counts, 2).tolist(), [0, -1, 1, -1])
+        self.assertEqual(drop_thin_evidence(labels, counts, 1).tolist(), [0, 1, 1, -1])
+
     def test_refine_reads_only_voted_faces(self):
         import data_toolkit.lift_sam3 as lift_sam3
         import refine_units
@@ -137,6 +145,7 @@ class RefineEvidenceTest(unittest.TestCase):
         finally:
             lift_sam3.lift = saved
         self.assertIs(seen.get("keep_unvoted"), False)
+        self.assertEqual(seen.get("min_views"), 2)
         self.assertEqual(changes, [])
         self.assertTrue((new == 0).all())
 
