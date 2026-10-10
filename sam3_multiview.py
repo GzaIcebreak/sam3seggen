@@ -189,17 +189,18 @@ def main():
     def sweep(concepts):
         """SAM3 over every view: the packed rows to save, the per-concept detection
         counts after the overlay, and the raw hits [(score, silhouette share)] before it."""
-        mask_rows, foreground_rows, score_rows = [], [], []
+        mask_rows, foreground_rows, score_rows, instance_rows = [], [], [], []
         detections = {concept: 0 for concept in concepts}
         raw = {concept: [] for concept in concepts}
         for view in manifest["views"]:
             image = Image.open(os.path.join(views_dir, view["image"]))
             print(f"[{view['name']}]")
             sweep_view(view, image, concepts, mask_rows, foreground_rows, score_rows,
-                       detections, raw)
-        return mask_rows, foreground_rows, score_rows, detections, raw
+                       detections, raw, instance_rows)
+        return mask_rows, foreground_rows, score_rows, detections, raw, instance_rows
 
-    def sweep_view(view, image, concepts, mask_rows, foreground_rows, score_rows, detections, raw):
+    def sweep_view(view, image, concepts, mask_rows, foreground_rows, score_rows, detections, raw,
+                   instance_rows):
         if assign == "paint":
             parts = segment_prompts(processor, model, image, concepts, threshold, device, bank=bank)
             if extra_dir:
@@ -236,10 +237,12 @@ def main():
                                      int((hit["mask"].astype(bool) & foreground).sum()) / silhouette))
         masks = np.zeros((len(concepts), *foreground.shape), dtype=bool)
         scores = np.zeros(len(concepts), dtype=np.float32)
+        instances = np.zeros(len(concepts), dtype=np.int32)
         for index, concept in enumerate(concepts):
             hit = found.get(concept)
             if hit is None:
                 continue
+            instances[index] = int(hit.get("instances", 1))
             # SAM3 masks bleed a few pixels past the silhouette; those pixels would
             # otherwise back-project onto whatever surface lies behind the object.
             masks[index] = hit["mask"].astype(bool) & foreground
@@ -254,8 +257,9 @@ def main():
         mask_rows.append(np.packbits(masks, axis=-1))
         foreground_rows.append(np.packbits(foreground, axis=-1))
         score_rows.append(scores)
+        instance_rows.append(instances)
 
-    mask_rows, foreground_rows, score_rows, detections, raw = sweep(concepts)
+    mask_rows, foreground_rows, score_rows, detections, raw, instance_rows = sweep(concepts)
     rescued = {}
     if rescue_enabled(args.no_rescue):
         rescued = rescue_weak_words(concepts, owners, raw, manifest, views_dir, args.unassigned_to,
@@ -264,7 +268,7 @@ def main():
             for word, record in rescued.items():
                 concepts[concepts.index(word)] = record["phrase"]
             print(f"[rescue] SAM3 again with {concepts}")
-            mask_rows, foreground_rows, score_rows, detections, raw = sweep(concepts)
+            mask_rows, foreground_rows, score_rows, detections, raw, instance_rows = sweep(concepts)
 
     # Concepts feeding the --unassigned_to part may legitimately see nothing: that
     # part's job is to absorb whatever no mask claimed, so it needs no detections.
@@ -281,6 +285,7 @@ def main():
         masks=np.stack(mask_rows),
         foreground=np.stack(foreground_rows),
         scores=np.stack(score_rows),
+        instances=np.stack(instance_rows),
         width=np.int32(manifest["resolution"]),
         concepts=np.array(concepts),
         owners=np.array(owners),

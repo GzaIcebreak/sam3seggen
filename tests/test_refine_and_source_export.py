@@ -120,22 +120,20 @@ class RefineEvidenceTest(unittest.TestCase):
         self.assertEqual(drop_thin_evidence(labels, counts, 2).tolist(), [0, -1, 1, -1])
         self.assertEqual(drop_thin_evidence(labels, counts, 1).tolist(), [0, 1, 1, -1])
 
-    def test_refine_reads_only_voted_faces(self):
+    def test_a_grown_patch_without_direct_votes_stays(self):
         import data_toolkit.lift_sam3 as lift_sam3
         import refine_units
 
         mesh = fine_box()
         units = np.zeros(len(mesh.faces), dtype=int)
         labels = np.zeros(len(mesh.faces), dtype=int)           # the vote: all torso
-        seen = {}
 
         def fake_lift(*args, **kwargs):
-            seen.update(kwargs)
-            # a lift that grew `head` over the whole unit but voted it on no face
+            # grown: head over the whole unit; voted: nowhere (the cat's hips)
             grown = np.ones(len(mesh.faces), dtype=int)
             if kwargs.get("keep_unvoted", True) is False:
                 grown[:] = -1
-            return grown, ["torso", "head"], None, {}  # no raster: nothing to veto with
+            return grown, ["torso", "head"], None, {}
 
         saved = lift_sam3.lift
         lift_sam3.lift = fake_lift
@@ -144,10 +142,41 @@ class RefineEvidenceTest(unittest.TestCase):
                 mesh, units, labels, ["torso", "head"], None, None, 0.7, 512)
         finally:
             lift_sam3.lift = saved
-        self.assertIs(seen.get("keep_unvoted"), False)
-        self.assertEqual(seen.get("min_views"), 2)
         self.assertEqual(changes, [])
         self.assertTrue((new == 0).all())
+
+    def test_a_voted_patch_moves_and_takes_its_inner_wall_twin(self):
+        import data_toolkit.lift_sam3 as lift_sam3
+        import refine_units
+
+        outer = fine_box()
+        inner = fine_box()
+        inner.apply_scale(0.96)                                   # the remesh's second wall
+        inner.invert()
+        mesh = trimesh.util.concatenate([outer, inner])
+        n_outer = len(outer.faces)
+        units = np.zeros(len(mesh.faces), dtype=int)              # fused into one unit
+        labels = np.zeros(len(mesh.faces), dtype=int)
+        top = mesh.triangles_center[:, 2] > 0.4                   # the top faces, both walls
+        top_outer = top & (np.arange(len(mesh.faces)) < n_outer)
+
+        def fake_lift(*args, **kwargs):
+            grown = np.where(top, 1, 0)                           # head on the top, both walls
+            if kwargs.get("keep_unvoted", True) is False:
+                grown = np.where(top_outer, 1, -1)                # cameras see the outer wall only
+            return grown, ["torso", "head"], None, {}
+
+        saved = lift_sam3.lift
+        lift_sam3.lift = fake_lift
+        try:
+            new, changes = refine_units.refine_labels_by_masks(
+                mesh, units, labels, ["torso", "head"], None, None, 0.7, 512)
+        finally:
+            lift_sam3.lift = saved
+        self.assertEqual(len(changes), 2)
+        self.assertIn("twin_of", changes[1])
+        self.assertTrue((new[top] == 1).all())
+        self.assertTrue((new[~top] == 0).all())
 
 
 class FlankedTest(unittest.TestCase):
@@ -163,6 +192,16 @@ class FlankedTest(unittest.TestCase):
         cuff = np.zeros((10, 10), dtype=bool)
         cuff[2:6, 1:4] = True                       # the old part on one side only
         self.assertEqual(flanked_share(patch, cuff), 0.0)
+
+    def test_a_bay_touches_the_new_part_little_a_strip_touches_it_much(self):
+        from refine_units import boundary_share
+
+        # faces 0..3 are the patch; 4..9 outside: labels 0 = old, 1 = new
+        labels = np.array([0, 0, 0, 0, 0, 0, 0, 1, 1, 1])
+        bay = np.array([[0, 4], [1, 5], [2, 6], [3, 7], [0, 1], [2, 3]])      # 3 old, 1 new
+        self.assertAlmostEqual(boundary_share([0, 1, 2, 3], labels, bay, 1), 0.25)
+        strip = np.array([[0, 7], [1, 8], [2, 9], [3, 4], [0, 1]])          # 3 new, 1 old
+        self.assertAlmostEqual(boundary_share([0, 1, 2, 3], labels, strip, 1), 0.75)
 
     def test_the_veto_reads_only_views_that_support_the_move(self):
         from types import SimpleNamespace

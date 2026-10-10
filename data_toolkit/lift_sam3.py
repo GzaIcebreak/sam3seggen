@@ -36,6 +36,7 @@ class MaskSet:
     views: list[str]
     part_order: list[str]
     unassigned_to: str | None
+    instances: np.ndarray | None = None   # int [views, concepts]: SAM3's instance count, 0 = unseen
 
 
 def load_masks(path) -> MaskSet:
@@ -51,6 +52,7 @@ def load_masks(path) -> MaskSet:
         views=[str(v) for v in data["views"]],
         part_order=[str(v) for v in data["part_order"]],
         unassigned_to=unassigned or None,
+        instances=data["instances"].astype(np.int32) if "instances" in data.files else None,
     )
 
 

@@ -357,7 +357,8 @@ def segment_prompts(processor, model, image: Image.Image, prompts: list[str], th
         print(f"  [{prompt}] instances={len(masks)} best={best:.3f} pixels={area}")
         if area <= 0:
             continue
-        parts.append({"prompt": prompt, "mask": union.cpu().numpy(), "score": best, "text_vec": text_vec})
+        parts.append({"prompt": prompt, "mask": union.cpu().numpy(), "score": best, "text_vec": text_vec,
+                      "instances": int(len(masks))})
     return parts
 
 

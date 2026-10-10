@@ -21,14 +21,20 @@ from scipy.sparse.csgraph import connected_components
 
 DEFAULT_MIN_SHARE = 0.05
 DEFAULT_MIN_FACES = 50
-# a face's per-face label counts as evidence only if this many views' masks back it: on
-# the puppy one rear view's torso mask covered the back of the head, and refine moved an
-# ear's worth of the head to the torso on that view alone
-DEFAULT_MIN_VIEWS = 2
+# a patch moves only if this share of its area carries the new part's mask directly (in
+# any view): the dog's belly strips are 48-99% voted, the cat's hips called head 0-17%
+MIN_VOTED_SHARE = 0.4
+# a patch under that share still moves as the inner-wall twin of a moving patch: the
+# remesh's second shell, fused into the unit, that no camera sees (within this x diagonal)
+TWIN_REACH = 0.02
 # a move is vetoed when, in the views that support it, at least this share of the
 # patch's pixels has the old part's mask both left and right of it on the image row
 # (the back of a dog's head between its two ears, which the rear views call torso)
 FLANKED_SHARE = 0.5
+# ... and only when the patch is a bay of its old part in 3-D: it touches the new part
+# along at most this share of its boundary (the back of the head: 18%; a belly strip
+# between the legs: 37-58%)
+BAY_NEW_SHARE = 0.25
 SUPPORT_SHARE = 0.3       # a view supports a move if the new part's mask covers this much of the patch
 # seg.glb already carries to_glb's baked axis swap: see data_toolkit/spike_lift.py.
 SEG_GLB_ROTATION = np.diag([1.0, -1.0, -1.0])
@@ -94,6 +100,19 @@ def patch_flanked_by(faces, old_name, new_name, face_ids, mask_set, support=SUPP
     return float(np.mean(shares)) if shares else None
 
 
+def boundary_share(faces, labels, adjacency, label):
+    """Share of the patch's boundary edges (adjacency pairs with one face inside) whose
+    outside face currently carries `label`."""
+    member = np.zeros(len(labels), dtype=bool)
+    member[np.asarray(faces)] = True
+    a, b = adjacency[:, 0], adjacency[:, 1]
+    crossing = member[a] != member[b]
+    if not crossing.any():
+        return 0.0
+    outside = np.where(member[a[crossing]], b[crossing], a[crossing])
+    return float((labels[outside] == label).mean())
+
+
 def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
                     min_faces=DEFAULT_MIN_FACES, veto=None):
     """Give a coherent patch of a unit the label `per_face` says, if it is big enough.
@@ -139,7 +158,7 @@ def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
 def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera_angle_x,
                            resolution, min_share=DEFAULT_MIN_SHARE,
                            min_faces=DEFAULT_MIN_FACES, smoothness=0.4,
-                           min_views=DEFAULT_MIN_VIEWS):
+                           min_voted=MIN_VOTED_SHARE, twin_reach=TWIN_REACH):
     """Lift the masks per face and hand the vote's labels to relabel_patches.
 
     `names` orders the label indices (the vote's part order); the lift's own part order
@@ -147,23 +166,74 @@ def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera
     """
     from data_toolkit.lift_sam3 import lift
 
-    # keep_unvoted=False: a face no mask covered carries a label grown from a neighbour,
-    # which is not evidence -- on the lying cat a head label grown from one view's tail
-    # tip took the hips and hind legs the vote had given to the torso
+    # the grown labels draw the patches (a patch reaches into the faces no camera saw);
+    # the voted labels are the evidence a patch has to show before it may move
     part_labels, part_names, face_ids, _ = lift(
         mesh, SEG_GLB_ROTATION, mask_set, cameras, camera_angle_x, resolution,
-        smoothness=smoothness, keep_unvoted=False, min_views=min_views)
+        smoothness=smoothness)
+    voted_labels, voted_names, _, _ = lift(
+        mesh, SEG_GLB_ROTATION, mask_set, cameras, camera_angle_x, resolution,
+        smoothness=smoothness, keep_unvoted=False)
     to_label = {index: names.index(name) for index, name in enumerate(part_names)
                 if name in names}
     per_face = np.array([to_label.get(int(label), -1) for label in part_labels])
+    to_voted = {index: names.index(name) for index, name in enumerate(voted_names)
+                if name in names}
+    voted = np.array([to_voted.get(int(label), -1) for label in voted_labels])
+    area = np.asarray(mesh.area_faces)
+    adjacency = np.asarray(welded_adjacency(mesh))
+    deferred = []
 
-    def flanked(faces, old, new):
+    def veto(faces, old, new):
+        faces = np.asarray(faces)
+        evidence = float(area[faces][voted[faces] == new].sum() / max(area[faces].sum(), 1e-12))
+        if evidence < min_voted:
+            deferred.append((faces, old, new, evidence))
+            return True
         share = patch_flanked_by(faces, names[old], names[new], face_ids, mask_set)
         if share is not None and share >= FLANKED_SHARE:
-            print(f"  unit {int(units[faces[0]]):>3}: kept {len(faces)} faces with {names[old]} -- "
-                  f"in the views that call them {names[new]}, {names[old]}'s mask flanks them "
-                  f"left and right ({share:.0%})")
-            return True
+            touch = boundary_share(faces, labels, adjacency, new)
+            if touch <= BAY_NEW_SHARE:
+                print(f"  unit {int(units[faces[0]]):>3}: kept {len(faces)} faces with {names[old]} -- "
+                      f"a bay of it: {names[old]}'s mask flanks them left and right ({share:.0%}) "
+                      f"and only {touch:.0%} of their boundary touches {names[new]}")
+                return True
         return False
 
-    return relabel_patches(mesh, units, labels, per_face, min_share, min_faces, veto=flanked)
+    labels, changes = relabel_patches(mesh, units, labels, per_face, min_share, min_faces, veto=veto)
+    return move_twins(mesh, units, labels, changes, deferred, names, twin_reach)
+
+
+def move_twins(mesh, units, labels, changes, deferred, names, reach=TWIN_REACH):
+    """A deferred patch (too little direct evidence) moves after all when it is the
+    inner-wall twin of a patch that moved: same old->new, and lying within `reach` x
+    the mesh diagonal of it. Returns (labels, changes) with the twins appended."""
+    if not deferred:
+        return labels, changes
+    from scipy.spatial import cKDTree
+
+    labels = np.array(labels).copy()
+    changes = list(changes)
+    centres = np.asarray(mesh.triangles_center)
+    diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    area = np.asarray(mesh.area_faces)
+    moved = [(c, np.flatnonzero((labels == c["to"]) & np.isin(units, [c["unit"]])))
+             for c in changes if "twin_of" not in c]
+    for faces, old, new, evidence in deferred:
+        twin = None
+        for change, member in moved:
+            if change["from"] != old or change["to"] != new or not len(member):
+                continue
+            if cKDTree(centres[member]).query(centres[faces], distance_upper_bound=reach * diag)[0].min() <= reach * diag:
+                twin = change
+                break
+        if twin is None:
+            print(f"  unit {int(units[faces[0]]):>3}: kept {len(faces)} faces with {names[old]} -- "
+                  f"only {evidence:.0%} of them carry {names[new]}'s mask")
+            continue
+        labels[faces] = new
+        unit_area = float(area[units == units[faces[0]]].sum())
+        changes.append({"unit": int(units[faces[0]]), "faces": int(len(faces)),
+                        "share_of_unit": float(area[faces].sum() / max(unit_area, 1e-12)),
+                        "from": int(old), "to": int(new), "twin_of": int(twin["unit"])})
+    return labels, changes
