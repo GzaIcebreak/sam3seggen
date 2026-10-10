@@ -75,10 +75,11 @@ def is_weak(stats, n_views):
 
 def weak_concepts(concepts, owners, raw, n_views, unassigned_to=None):
     """Plain prompt words (phrase == part name) SAM3 barely sees. The catch-all part is
-    allowed to be empty and is never rescued."""
+    included: it may stay empty, but when it is a word the person typed its mask being
+    found only helps (`unassigned_to` is kept for the call sites)."""
     weak = []
     for concept, owner in zip(concepts, owners):
-        if concept != owner or owner == unassigned_to:
+        if concept != owner:
             continue
         if is_weak(phrase_stats(raw.get(concept, []), n_views), n_views):
             weak.append(concept)

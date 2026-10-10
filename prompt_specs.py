@@ -57,23 +57,42 @@ def part_names(specs: Sequence[PartSpec]) -> list[str]:
     return [name for name, _ in specs]
 
 
+# Words naming the part that carries everything else; the catch-all when the requested
+# one is not among the prompts. Bases and stands are left out: a statue's plinth is a
+# part of its own, not where a stray leg belongs.
+BODY_WORDS = ("body", "torso", "main body", "trunk", "主体", "身体", "躯干", "机身", "车身", "船身")
+
+
+def body_word(expected_names: Sequence[str]) -> str | None:
+    """The first prompt that names the main body ('torso', 'robot body', '主体'), or None."""
+    for name in expected_names:
+        word = str(name).strip().lower()
+        if word in BODY_WORDS or word.endswith(" body") or word.endswith(" torso"):
+            return name
+    return None
+
+
 def resolve_unassigned_to(target: str | None, expected_names: Sequence[str]) -> str | None:
     """The part that absorbs faces no prompt claimed.
 
     `target` is kept when it names a requested component. A name that is not among the
     prompts -- the default `body` against Chinese prompts, or a typo -- falls back to the
-    first prompt rather than to nothing: on a grey model where SAM3 recognised neither
-    主体 nor 底座, "nothing" meant every face was dropped and the export was empty. An
-    explicit empty string (or a Swagger leftover like `string`) still means "drop them".
+    body word among the prompts (torso, 主体, robot body), else the first prompt, rather
+    than to nothing: on a grey model where SAM3 recognised neither 主体 nor 底座,
+    "nothing" meant every face was dropped and the export was empty. The body comes
+    before the first prompt because with 'head, torso' the first prompt took the puppy's
+    legs and tail. An explicit empty string (or a Swagger leftover like `string`) still
+    means "drop them".
     """
     if not target or target == "string":
         return None
     if target not in expected_names:
         if not expected_names:
             return None
+        fallback = body_word(expected_names) or expected_names[0]
         print(f"[split] unassigned_to={target!r} is not in {list(expected_names)}; "
-              f"using {expected_names[0]!r} for the unclaimed faces")
-        return expected_names[0]
+              f"using {fallback!r} for the unclaimed faces")
+        return fallback
     return target
 
 

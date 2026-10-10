@@ -32,10 +32,13 @@ class WeakTest(unittest.TestCase):
         weak = weak_concepts(["head", "torso", "tail"], ["head", "torso", "tail"], raw, 4)
         self.assertEqual(weak, ["head", "tail"])
 
-    def test_explicit_phrases_and_the_catch_all_are_left_alone(self):
-        raw = {"dog head": [], "body": []}
-        self.assertEqual(weak_concepts(["dog head", "body"], ["head", "body"], raw, 4,
-                                       unassigned_to="body"), [])
+    def test_explicit_phrases_are_left_alone_but_the_catch_all_is_not(self):
+        raw = {"dog head": [], "head": []}
+        self.assertEqual(weak_concepts(["dog head"], ["head"], raw, 4), [])
+        # the puppy run: the catch-all was `head` and SAM3 saw it in 3 of 8 views
+        self.assertEqual(weak_concepts(["head", "torso"], ["head", "torso"],
+                                       {"head": [(0.5, 0.2)] * 3, "torso": [(0.6, 0.3)] * 8}, 8,
+                                       unassigned_to="head"), ["head"])
 
     def test_stats_use_the_median(self):
         stats = phrase_stats([(0.9, 0.1), (0.5, 0.3), (0.7, 0.2)], 4)

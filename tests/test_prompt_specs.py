@@ -75,7 +75,12 @@ class PromptSpecsTest(unittest.TestCase):
         self.assertEqual(resolve_unassigned_to("body", ["head", "body", "leg"]), "body")
         # the default `body` against the default Chinese prompts: unclaimed faces go to 主体
         self.assertEqual(resolve_unassigned_to("body", ["主体", "底座"]), "主体")
-        self.assertEqual(resolve_unassigned_to("torsoo", ["head", "torso"]), "head")
+        # a body word comes before the first prompt: with 'head, torso' the head used to
+        # take the puppy's legs and tail
+        self.assertEqual(resolve_unassigned_to("body", ["head", "torso"]), "torso")
+        self.assertEqual(resolve_unassigned_to("torsoo", ["head", "torso"]), "torso")
+        self.assertEqual(resolve_unassigned_to("body", ["head", "robot body", "leg"]), "robot body")
+        self.assertEqual(resolve_unassigned_to("body", ["head", "tail", "leg"]), "head")
         self.assertIsNone(resolve_unassigned_to("string", ["head", "tail", "legs"]))
         self.assertIsNone(resolve_unassigned_to("", ["head", "body"]))
         self.assertIsNone(resolve_unassigned_to("body", []))
