@@ -376,9 +376,18 @@ def cut_weights(lengths, angles, convex, crease_gain=2.0):
     return weights / mean if mean > 0 else weights
 
 
+def drop_unvoted(labels, votes):
+    """-1 wherever no mask voted: the label there was grown from a neighbour or taken
+    from the nearest face, a guess rather than something a mask said."""
+    labels = np.asarray(labels).copy()
+    labels[np.asarray(votes).sum(axis=1) <= 0] = -1
+    return labels
+
+
 def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
          smooth_iterations=2, supersample=4, min_patch_ratio=0.001, smoothness=0.0,
-         crease_gain=2.0, confidence_path=None, confidence_gain=4.0, confidence_hops=4):
+         crease_gain=2.0, confidence_path=None, confidence_gain=4.0, confidence_hops=4,
+         keep_unvoted=True):
     """Return per-face part labels, the part names and a coverage report.
 
     `supersample` rasterises face ids finer than the SAM3 masks. A remesh's triangles
@@ -389,6 +398,9 @@ def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
     `smoothness` trades semantic fidelity for intact boundaries: at 0 every face keeps
     whichever label the masks voted for, teeth and all; raising it charges for seam
     length until the cut follows the model's own folds.
+
+    `keep_unvoted=False` returns -1 for every face no mask voted on instead of the label
+    grown into it (refine_units reads the result as evidence; a grown label is not).
     """
     from data_toolkit.parts_rebake import smooth_labels
 
@@ -423,6 +435,8 @@ def lift(mesh, rotation, mask_set: MaskSet, cameras, camera_angle_x, resolution,
         adjacency, labels, np.asarray(mesh.area_faces), min_patch_ratio
     )
 
+    if not keep_unvoted:
+        labels = drop_unvoted(labels, votes)
     report = {
         **confidence_report,
         "faces": int(len(faces)),

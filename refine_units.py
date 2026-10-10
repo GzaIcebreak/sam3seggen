@@ -85,9 +85,12 @@ def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera
     """
     from data_toolkit.lift_sam3 import lift
 
+    # keep_unvoted=False: a face no mask covered carries a label grown from a neighbour,
+    # which is not evidence -- on the lying cat a head label grown from one view's tail
+    # tip took the hips and hind legs the vote had given to the torso
     part_labels, part_names, _, _ = lift(
         mesh, SEG_GLB_ROTATION, mask_set, cameras, camera_angle_x, resolution,
-        smoothness=smoothness)
+        smoothness=smoothness, keep_unvoted=False)
     to_label = {index: names.index(name) for index, name in enumerate(part_names)
                 if name in names}
     per_face = np.array([to_label.get(int(label), -1) for label in part_labels])

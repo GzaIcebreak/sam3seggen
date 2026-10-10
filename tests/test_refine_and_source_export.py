@@ -104,5 +104,42 @@ class SourceExportTest(unittest.TestCase):
                                                  os.path.join(out, "names.json"), os.path.join(out, "parts.glb")))
 
 
+class RefineEvidenceTest(unittest.TestCase):
+    def test_unvoted_faces_lose_their_grown_label(self):
+        from data_toolkit.lift_sam3 import drop_unvoted
+
+        labels = np.array([0, 0, 1, 1, 1])
+        votes = np.array([[2, 0], [0, 0], [0, 0], [0, 0], [0, 3]], dtype=float)
+        self.assertEqual(drop_unvoted(labels, votes).tolist(), [0, -1, -1, -1, 1])
+
+    def test_refine_reads_only_voted_faces(self):
+        import data_toolkit.lift_sam3 as lift_sam3
+        import refine_units
+
+        mesh = fine_box()
+        units = np.zeros(len(mesh.faces), dtype=int)
+        labels = np.zeros(len(mesh.faces), dtype=int)           # the vote: all torso
+        seen = {}
+
+        def fake_lift(*args, **kwargs):
+            seen.update(kwargs)
+            # a lift that grew `head` over the whole unit but voted it on no face
+            grown = np.ones(len(mesh.faces), dtype=int)
+            if kwargs.get("keep_unvoted", True) is False:
+                grown[:] = -1
+            return grown, ["torso", "head"], None, {}
+
+        saved = lift_sam3.lift
+        lift_sam3.lift = fake_lift
+        try:
+            new, changes = refine_units.refine_labels_by_masks(
+                mesh, units, labels, ["torso", "head"], None, None, 0.7, 512)
+        finally:
+            lift_sam3.lift = saved
+        self.assertIs(seen.get("keep_unvoted"), False)
+        self.assertEqual(changes, [])
+        self.assertTrue((new == 0).all())
+
+
 if __name__ == "__main__":
     unittest.main()
