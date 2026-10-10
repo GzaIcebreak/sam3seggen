@@ -25,6 +25,11 @@ DEFAULT_MIN_FACES = 50
 # the puppy one rear view's torso mask covered the back of the head, and refine moved an
 # ear's worth of the head to the torso on that view alone
 DEFAULT_MIN_VIEWS = 2
+# a move is vetoed when, in the views that support it, at least this share of the
+# patch's pixels has the old part's mask both left and right of it on the image row
+# (the back of a dog's head between its two ears, which the rear views call torso)
+FLANKED_SHARE = 0.5
+SUPPORT_SHARE = 0.3       # a view supports a move if the new part's mask covers this much of the patch
 # seg.glb already carries to_glb's baked axis swap: see data_toolkit/spike_lift.py.
 SEG_GLB_ROTATION = np.diag([1.0, -1.0, -1.0])
 
@@ -40,13 +45,63 @@ def welded_adjacency(mesh):
     return welded.face_adjacency
 
 
+def flanked_share(patch, old):
+    """Share of the patch's pixels lying on image rows where the old part's mask shows
+    up both left and right of the patch. `patch`, `old`: [H, W] bool."""
+    rows = np.flatnonzero(patch.any(axis=1))
+    total = flanked = 0
+    for row in rows:
+        cols = np.flatnonzero(patch[row])
+        total += len(cols)
+        if old[row, :cols[0]].any() and old[row, cols[-1] + 1:].any():
+            flanked += len(cols)
+    return flanked / total if total else 0.0
+
+
+def patch_flanked_by(faces, old_name, new_name, face_ids, mask_set, support=SUPPORT_SHARE):
+    """Mean flanked_share over the views whose `new_name` mask covers the patch, or None
+    when no view supports the move. `face_ids` is lift's raster (face index + 1, 0 =
+    background), possibly supersampled relative to the masks."""
+    from data_toolkit.lift_sam3 import mask_lookup
+
+    if face_ids is None or mask_set is None:
+        return None
+    resolution = mask_set.masks.shape[-1]
+    lookup = mask_lookup(resolution, face_ids.shape[-1] // resolution)
+    member = np.zeros(int(face_ids.max()) + 1, dtype=bool)
+    member[np.asarray(faces) + 1] = True
+    shares = []
+    for view in range(len(face_ids)):
+        hit = np.flatnonzero(member[face_ids[view].ravel()])
+        if not len(hit):
+            continue
+        patch = np.zeros(resolution * resolution, dtype=bool)
+        patch[hit if lookup is None else lookup[hit]] = True
+        patch = patch.reshape(resolution, resolution)
+        live = mask_set.scores[view] > 0
+        old = np.zeros_like(patch)
+        new = np.zeros_like(patch)
+        for concept, owner in enumerate(mask_set.owners):
+            if not live[concept]:
+                continue
+            if owner == old_name:
+                old |= mask_set.masks[view, concept]
+            elif owner == new_name:
+                new |= mask_set.masks[view, concept]
+        if (new & patch).sum() < support * patch.sum():
+            continue
+        shares.append(flanked_share(patch, old))
+    return float(np.mean(shares)) if shares else None
+
+
 def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
-                    min_faces=DEFAULT_MIN_FACES):
+                    min_faces=DEFAULT_MIN_FACES, veto=None):
     """Give a coherent patch of a unit the label `per_face` says, if it is big enough.
 
     Returns (labels, changes): a copy of `labels` with the patches relabelled, and one
     row per patch that moved. A patch is a connected set of faces of one unit whose
     per-face label agrees with itself and disagrees with the unit's label.
+    `veto(faces, old, new)` may keep a patch where it is by returning True.
     """
     units = np.asarray(units)
     labels = np.array(labels).copy()
@@ -73,6 +128,8 @@ def relabel_patches(mesh, units, labels, per_face, min_share=DEFAULT_MIN_SHARE,
         if len(faces) < min_faces or share < min_share:
             continue
         old, new = int(labels[faces[0]]), int(per_face[faces[0]])
+        if veto is not None and veto(faces, old, new):
+            continue
         labels[faces] = new
         changes.append({"unit": int(units[faces[0]]), "faces": int(len(faces)),
                         "share_of_unit": share, "from": old, "to": new})
@@ -93,10 +150,20 @@ def refine_labels_by_masks(mesh, units, labels, names, mask_set, cameras, camera
     # keep_unvoted=False: a face no mask covered carries a label grown from a neighbour,
     # which is not evidence -- on the lying cat a head label grown from one view's tail
     # tip took the hips and hind legs the vote had given to the torso
-    part_labels, part_names, _, _ = lift(
+    part_labels, part_names, face_ids, _ = lift(
         mesh, SEG_GLB_ROTATION, mask_set, cameras, camera_angle_x, resolution,
         smoothness=smoothness, keep_unvoted=False, min_views=min_views)
     to_label = {index: names.index(name) for index, name in enumerate(part_names)
                 if name in names}
     per_face = np.array([to_label.get(int(label), -1) for label in part_labels])
-    return relabel_patches(mesh, units, labels, per_face, min_share, min_faces)
+
+    def flanked(faces, old, new):
+        share = patch_flanked_by(faces, names[old], names[new], face_ids, mask_set)
+        if share is not None and share >= FLANKED_SHARE:
+            print(f"  unit {int(units[faces[0]]):>3}: kept {len(faces)} faces with {names[old]} -- "
+                  f"in the views that call them {names[new]}, {names[old]}'s mask flanks them "
+                  f"left and right ({share:.0%})")
+            return True
+        return False
+
+    return relabel_patches(mesh, units, labels, per_face, min_share, min_faces, veto=flanked)

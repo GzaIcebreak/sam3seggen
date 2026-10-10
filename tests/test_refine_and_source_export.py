@@ -135,7 +135,7 @@ class RefineEvidenceTest(unittest.TestCase):
             grown = np.ones(len(mesh.faces), dtype=int)
             if kwargs.get("keep_unvoted", True) is False:
                 grown[:] = -1
-            return grown, ["torso", "head"], None, {}
+            return grown, ["torso", "head"], None, {}  # no raster: nothing to veto with
 
         saved = lift_sam3.lift
         lift_sam3.lift = fake_lift
@@ -148,6 +148,41 @@ class RefineEvidenceTest(unittest.TestCase):
         self.assertEqual(seen.get("min_views"), 2)
         self.assertEqual(changes, [])
         self.assertTrue((new == 0).all())
+
+
+class FlankedTest(unittest.TestCase):
+    def test_between_two_ears_is_flanked_a_hand_past_a_cuff_is_not(self):
+        from refine_units import flanked_share
+
+        patch = np.zeros((10, 10), dtype=bool)
+        patch[2:6, 4:6] = True                      # the back of the head
+        ears = np.zeros((10, 10), dtype=bool)
+        ears[1:7, 1:3] = True
+        ears[1:7, 7:9] = True                       # one ear each side
+        self.assertEqual(flanked_share(patch, ears), 1.0)
+        cuff = np.zeros((10, 10), dtype=bool)
+        cuff[2:6, 1:4] = True                       # the old part on one side only
+        self.assertEqual(flanked_share(patch, cuff), 0.0)
+
+    def test_the_veto_reads_only_views_that_support_the_move(self):
+        from types import SimpleNamespace
+
+        from refine_units import patch_flanked_by
+
+        face_ids = np.zeros((2, 10, 10), dtype=np.int32)
+        face_ids[:, 2:6, 4:6] = 1                   # face 0 seen in both views
+        head = np.zeros((2, 10, 10), dtype=bool)
+        head[:, 1:7, 1:3] = True
+        head[:, 1:7, 7:9] = True
+        torso = np.zeros((2, 10, 10), dtype=bool)
+        torso[0, 0:8, 3:7] = True                   # only view 0 calls the patch torso
+        masks = np.stack([head, torso], axis=1)     # [views, concepts, H, W]
+        mask_set = SimpleNamespace(masks=masks, scores=np.ones((2, 2)), owners=["head", "torso"])
+        self.assertEqual(patch_flanked_by([0], "head", "torso", face_ids, mask_set), 1.0)
+        self.assertIsNone(patch_flanked_by([0], "torso", "head", face_ids,
+                                           SimpleNamespace(masks=np.zeros_like(masks),
+                                                           scores=np.ones((2, 2)),
+                                                           owners=["head", "torso"])))
 
 
 if __name__ == "__main__":
