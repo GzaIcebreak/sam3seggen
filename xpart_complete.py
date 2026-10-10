@@ -607,6 +607,9 @@ def main():
     parser.add_argument("--num_chunks", type=int, default=50000,
                         help="Query points per marching-cubes block; X-Part's own 400000 "
                              "needs 3 GiB a block and runs out on a 32 GB card")
+    parser.add_argument("--draws", type=int, default=3,
+                        help="Draw every part this many times (seed and collar varied) and keep the "
+                             "draw hybrid_complete's quality_score likes best")
     parser.add_argument("--redraws", type=int, default=2,
                         help="How many times to draw a part again when its solid comes "
                              "back far bigger than its box; X-Part's part-identity "
@@ -719,14 +722,7 @@ def main():
 
     names = [row["name"] for row in rows]
     solids = generate(pipeline, os.path.abspath(args.glb), boxes, condition, names, args)
-
-    solids = redraw_escapees(pipeline, os.path.abspath(args.glb), boxes, condition, names,
-                             solids, args)
-    centre, norm_scale = xpart_normalization(source.bounds)
-    solids = redraw_hollow(pipeline, os.path.abspath(args.glb), boxes, surfaces, centre,
-                           norm_scale, names, solids, args)
-    solids = redraw_regrown(pipeline, os.path.abspath(args.glb), boxes, surfaces, names, solids, args)
-    solids = redraw_sockets(pipeline, os.path.abspath(args.glb), boxes, surfaces, names, solids, args)
+    solids = best_of_draws(pipeline, os.path.abspath(args.glb), boxes, surfaces, names, solids, args)
 
     instances = trimesh.Scene()
     for index, solid in enumerate(solids):
@@ -948,201 +944,57 @@ def intrusion_share(solid, own, others, diag, tau=INTRUSION_TAU, band=INTRUSION_
     return float(bad.mean())
 
 
-def redraw_regrown(pipeline, glb, boxes, surfaces, names, solids, args):
-    """Draw a part again (another seed) while its solid copies its neighbours -- the dog's
-    body came back with the legs and head on it -- keeping the least intruding draw.
-    Cutting the copies off (hybrid_complete.cull_intrusions) stays as the last resort."""
-    import copy
+def score_draw(index, solid, surfaces, boxes, names, open_surfaces):
+    """hybrid_complete's quality_score of one candidate solid for part `index`."""
+    from hybrid_complete import quality_score, solid_metrics
 
-    if args.redraws <= 0 or not solids:
-        return solids
-    live = [s for s in surfaces if s is not None and len(s.vertices)]
-    if not live:
-        return solids
-    allpts = np.concatenate([np.asarray(s.vertices) for s in live])
-    diag = float(np.linalg.norm(allpts.max(axis=0) - allpts.min(axis=0)))
+    if solid is None or not len(solid.faces):
+        return 0.0, None
+    metrics = solid_metrics(surfaces[index], solid, boxes[index], surfaces=open_surfaces, instance=index)
+    return (quality_score(metrics) if metrics else 0.0), metrics
 
-    def measure(index, solid):
-        others = np.concatenate([np.asarray(s.vertices) for j, s in enumerate(surfaces)
-                                 if j != index and s is not None and len(s.vertices)] or [np.zeros((0, 3))])
-        return intrusion_share(solid, surfaces[index], others, diag)
 
-    intrusion = {i: measure(i, s) for i, s in enumerate(solids) if s is not None}
-    for attempt in range(args.redraws):
-        bad = sorted(i for i, v in intrusion.items() if v > INTRUSION_REDRAW)
-        if not bad:
-            break
-        print(f"{len(bad)} of {len(boxes)} solids regrew their neighbours "
-              f"({', '.join(f'{names[i]} {intrusion[i]:.0%}' for i in bad)}); redrawing them with another "
-              f"seed (attempt {attempt + 1} of {args.redraws}) ...")
+def best_of_draws(pipeline, glb, boxes, surfaces, names, solids, args):
+    """Draw every part --draws times (the first draw is `solids`), varying the seed and
+    the collar, score each draw with hybrid_complete's quality_score and keep the best
+    draw per part. One score for every defect at once, so a redraw cannot trade a socket
+    for a hollow shell."""
+    from hybrid_complete import OpenSurfaces
+
+    draws = max(int(getattr(args, "draws", 1)), 1)
+    open_surfaces = OpenSurfaces({i: (names[i], surfaces[i]) for i in range(len(surfaces))})
+    candidates = [list(solids)]
+    base_collar = args.collar if args.condition == "collar" else DEFAULT_COLLAR
+    for k in range(1, draws):
+        import copy
+
         again = copy.copy(args)
-        again.seed = args.seed + 1000 * (attempt + 1)
-        condition = None
-        if args.condition in ("surface", "collar"):
-            import torch
-
-            centre, scale = xpart_normalization(trimesh.util.concatenate(live).bounds)
-            collar = args.collar if args.condition == "collar" else 0.0
-            condition = torch.from_numpy(part_surface_condition(
-                surfaces, centre, scale, seed=again.seed, collar=collar))[bad]
-        replacements = generate(pipeline, glb, boxes[bad], condition, [names[i] for i in bad], again)
-        for index, replacement in zip(bad, replacements):
-            if replacement is None:
-                continue
-            after = measure(index, replacement)
-            if after >= intrusion[index]:
-                print(f"  {names[index]}: the new draw copies {after:.0%}; keeping the {intrusion[index]:.0%} one")
-                continue
-            print(f"  {names[index]}: {intrusion[index]:.0%} -> {after:.0%} on the neighbours, kept")
-            solids[index] = replacement
-            intrusion[index] = after
-    still = [f"{names[i]} {v:.0%}" for i, v in intrusion.items() if v > INTRUSION_REDRAW]
-    if still:
-        print(f"still regrowing their neighbours after {args.redraws} redraws (the cut will take "
-              f"the copies off): {', '.join(still)}")
-    return solids
-
-
-def redraw_sockets(pipeline, glb, boxes, surfaces, names, solids, args):
-    """Draw a part again (another seed) while its solid sinks below its cuts instead of
-    plugging them; the draw with the highest mean plug height is kept."""
-    import copy
-
-    if args.redraws <= 0 or not solids:
-        return solids
-    allpts = np.concatenate([np.asarray(s.vertices) for s in surfaces if s is not None and len(s.vertices)])
-    diag = float(np.linalg.norm(allpts.max(axis=0) - allpts.min(axis=0)))
-
-    def measure(index, solid):
-        others = np.concatenate([np.asarray(s.vertices) for j, s in enumerate(surfaces)
-                                 if j != index and s is not None and len(s.vertices)] or [np.zeros((0, 3))])
-        m = plug_metrics(surfaces[index], solid, others, diag)
-        return None if m is None else m["plug_mean"]
-
-    plug = {i: measure(i, s) for i, s in enumerate(solids) if s is not None}
-    for attempt in range(args.redraws):
-        bad = sorted(i for i, p in plug.items() if p is not None and p < SOCKET_REDRAW)
-        if not bad:
-            break
-        print(f"{len(bad)} of {len(boxes)} solids sink below their cuts instead of plugging them "
-              f"({', '.join(f'{names[i]} {plug[i]:+.2f}' for i in bad)}); redrawing them with another "
-              f"seed (attempt {attempt + 1} of {args.redraws}) ...")
-        again = copy.copy(args)
-        again.seed = args.seed + 100 * (attempt + 1)
+        again.seed = args.seed + 100 * k
+        collar = base_collar * (2 if k % 2 == 1 else 1)
         condition = None
         if args.condition in ("surface", "collar"):
             import torch
 
             centre, scale = xpart_normalization(trimesh.util.concatenate(
-                [s for s in surfaces if s is not None]).bounds)
-            # a wider collar each time: more of the neighbour says how the surface goes on
-            collar = (args.collar if args.condition == "collar" else DEFAULT_COLLAR) * (2 ** (attempt + 1))
-            print(f"  (collar {collar:.0%} of the diagonal)")
+                [p for p in surfaces if p is not None]).bounds)
             condition = torch.from_numpy(part_surface_condition(
-                surfaces, centre, scale, seed=again.seed, collar=collar))[bad]
-        replacements = generate(pipeline, glb, boxes[bad], condition, [names[i] for i in bad], again)
-        for index, replacement in zip(bad, replacements):
-            if replacement is None:
-                continue
-            after = measure(index, replacement)
-            if after is None or after <= plug[index]:
-                print(f"  {names[index]}: the new draw is {after if after is None else f'{after:+.2f}'}; "
-                      f"keeping the {plug[index]:+.2f} one")
-                continue
-            print(f"  {names[index]}: {plug[index]:+.2f} -> {after:+.2f}, kept")
-            solids[index] = replacement
-            plug[index] = after
-    still = [f"{names[i]} {p:+.2f}" for i, p in plug.items() if p is not None and p < SOCKET_REDRAW]
-    if still:
-        print(f"still sunk below their cuts after {args.redraws} redraws: {', '.join(still)}")
-    return solids
-
-
-def redraw_hollow(pipeline, glb, boxes, surfaces, centre, scale, names, solids, args):
-    """Draw a part again, with a collar (wider each time), when its solid is a thin shell.
-
-    Conditioned on its own open faces alone, X-Part often hands back the surface thickened
-    into a double wall -- a bowl for a head, a tube for a leg -- rather than a filled part.
-    The neighbours' faces along the cut tell it how the surface continues (collar_samples);
-    on the 人物-01 figure that took hollow instances from 5 of 13 to 1 of 13. The part that
-    stays hollow is tried with twice the collar, then four times, up to --redraws times; a
-    redraw is kept only if it is less hollow."""
-    import torch
-
-    if args.redraws <= 0:
-        return solids
-    base = args.collar if args.condition == "collar" else DEFAULT_COLLAR
-    for attempt in range(args.redraws):
-        hollow = {index: hollow_share(solid, boxes[index])
-                  for index, solid in enumerate(solids) if solid is not None}
-        bad = sorted(i for i, share in hollow.items() if share > HOLLOW_REDRAW)
-        if not bad:
-            return solids
-        collar = base * (2 ** (attempt + 1))
-        print(f"{len(bad)} of {len(boxes)} solids are thin shells "
-              f"({', '.join(f'{names[i]} {hollow[i]:.0%}' for i in bad)}); redrawing them with "
-              f"a {collar:.0%}-diagonal collar (attempt {attempt + 1} of {args.redraws}) ...")
-        cond = torch.from_numpy(part_surface_condition(
-            surfaces, centre, scale, seed=args.seed + attempt + 1, collar=collar))[bad]
-        replacements = generate(pipeline, glb, boxes[bad], cond, [names[i] for i in bad], args)
-        for index, replacement in zip(bad, replacements):
-            if replacement is None:
-                continue
-            after = hollow_share(replacement, boxes[index])
-            if after >= hollow[index]:
-                print(f"  {names[index]}: still {after:.0%} hollow; keeping the {hollow[index]:.0%} one")
-                continue
-            print(f"  {names[index]}: {hollow[index]:.0%} -> {after:.0%} hollow, kept")
-            solids[index] = replacement
-    still = [names[i] for i, solid in enumerate(solids)
-             if solid is not None and hollow_share(solid, boxes[i]) > HOLLOW_REDRAW]
-    if still:
-        print(f"still hollow after {args.redraws} redraws (the score will send them to "
-              f"HoloPart or keep the open surface): {', '.join(still)}")
-    return solids
-
-
-def redraw_escapees(pipeline, glb, boxes, condition, names, solids, args):
-    """Draw a part again when the solid it produced is far too big for its box.
-
-    X-Part is not a function of its prompt. `partformer_dit` adds a part-identity embedding
-    picked by `torch.randperm` on every forward pass, so a part's result depends on the
-    draw and on which other parts came with it. The same foot, from the same conditioning,
-    overran its box by 675%, then 174%, then 7% across three runs -- so the occasional
-    part that comes back many times its own size is bad luck, not a bad prompt, and the
-    answer is another draw rather than a weaker prompt.
-
-    The box is what makes this checkable at all: it says how big the part was, and nothing
-    that closes a cut should need half the box again.
-    """
-    for attempt in range(max(args.redraws, 0)):
-        escaped = {index: box_escape(solid.bounds, boxes[index])
-                   for index, solid in enumerate(solids) if solid is not None}
-        runaway = sorted(i for i, over in escaped.items() if over > BOX_ESCAPE_WARNING)
-        if not runaway:
-            return solids
-        print(f"{len(runaway)} of {len(boxes)} parts overran their box "
-              f"({', '.join(f'{names[i]} by {escaped[i]:.0%}' for i in runaway)}); "
-              f"redrawing them (attempt {attempt + 1} of {args.redraws}) ...")
-        replacements = generate(
-            pipeline, glb, boxes[runaway],
-            None if condition is None else condition[runaway],
-            [names[i] for i in runaway], args)
-        for index, replacement in zip(runaway, replacements):
-            if replacement is None:
-                continue
-            after = box_escape(replacement.bounds, boxes[index])
-            if after >= escaped[index]:
-                print(f"  {names[index]}: the new draw overruns by {after:.0%}; keeping "
-                      f"the {escaped[index]:.0%} one")
-                continue
-            print(f"  {names[index]}: {escaped[index]:.0%} -> {after:.0%} overrun, kept")
-            solids[index] = replacement
-    still = [names[i] for i, solid in enumerate(solids)
-             if solid is not None and box_escape(solid.bounds, boxes[i]) > BOX_ESCAPE_WARNING]
-    if still:
-        print(f"still overrunning after {args.redraws} redraws: {', '.join(still)}")
-    return solids
+                surfaces, centre, scale, seed=again.seed, collar=collar))
+        print(f"draw {k + 1} of {draws} (seed {again.seed}, collar {collar:.0%} of the diagonal) ...")
+        candidates.append(generate(pipeline, glb, boxes, condition, names, again))
+    chosen = []
+    for index in range(len(boxes)):
+        scored = []
+        for k, cand in enumerate(candidates):
+            score, metrics = score_draw(index, cand[index], surfaces, boxes, names, open_surfaces)
+            scored.append((score, k, metrics))
+        best = max(scored, key=lambda row: row[0])
+        chosen.append(candidates[best[1]][index])
+        detail = " ".join(f"d{k + 1}={score:.2f}" for score, k, _ in scored)
+        m = best[2] or {}
+        print(f"  {names[index]:24s} keeps draw {best[1] + 1}: {detail}"
+              + (f"  (plug {m.get('plug_mean', float('nan')):+.2f} hollow {m.get('hollow', 0):.0%} "
+                 f"intrusion {m.get('intrusion', 0):.0%} escape {m.get('escape', 0):.0%})" if m else ""))
+    return chosen
 
 
 if __name__ == "__main__":

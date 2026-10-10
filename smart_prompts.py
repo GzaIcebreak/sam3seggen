@@ -91,8 +91,13 @@ def vlm_config():
 
 def provider_params(base_url):
     """Request fields a provider needs beyond the OpenAI shape."""
-    if "dashscope" in base_url and (_env_or_dotenv("SEGVIGEN_VLM_THINKING") or "off").lower() != "on":
-        return {"enable_thinking": False}
+    if "dashscope" in base_url:
+        # temperature 0 + a fixed seed: the same renders give the same word list (a part
+        # appeared in one run of 人物-01 and not in the next)
+        params = {"temperature": 0, "seed": 42}
+        if (_env_or_dotenv("SEGVIGEN_VLM_THINKING") or "off").lower() != "on":
+            params["enable_thinking"] = False
+        return params
     return {}
 
 
