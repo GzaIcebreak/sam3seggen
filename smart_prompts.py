@@ -30,6 +30,7 @@ import io
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 
 from PIL import Image
@@ -47,6 +48,27 @@ _MODEL_CACHE = {}
 MAX_CANDIDATES = 30
 MAX_VIEWS = 8      # the proposal renders 8 azimuths; a 2x4 grid is still cheap
 MAX_SHORTLIST = 6
+
+
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def open_url(request, timeout):
+    """urlopen through the environment's proxy; if the proxy itself cannot be reached
+    (refused, reset, unresolvable -- not an HTTP error from the API), the same request
+    is sent directly. The VLM endpoints in use (DashScope, Moonshot) need no proxy."""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError:
+        raise                       # the API answered; its error is the answer
+    except (urllib.error.URLError, ConnectionError, OSError) as error:
+        print(f"[smart] VLM request failed through the proxy ({type(error).__name__}: "
+              f"{str(error)[:120]}); retrying directly")
+        # a fresh request: the proxy handler rewrote the first one's host to the proxy
+        fresh = urllib.request.Request(request.full_url, data=request.data,
+                                       headers=dict(request.header_items()),
+                                       method=request.get_method())
+        return _DIRECT.open(fresh, timeout=timeout)
 
 
 def vlm_api_key():
@@ -80,7 +102,7 @@ def resolve_model(api_key, base_url, timeout=30):
         return _MODEL_CACHE[base_url]
     request = urllib.request.Request(f"{base_url}/models",
                                      headers={"Authorization": f"Bearer {api_key}"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with open_url(request, timeout) as response:
         rows = json.load(response).get("data", [])
     vision = [row["id"] for row in rows if row.get("supports_image_in")]
     if not vision:
@@ -343,7 +365,7 @@ def ask_vlm(image_paths, question, allowed_words, api_key=None, base_url=None,
             f"{base_url}/chat/completions", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST")
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_url(request, timeout) as response:
             body = json.load(response)
         choice = body["choices"][0]
         message = choice["message"]
