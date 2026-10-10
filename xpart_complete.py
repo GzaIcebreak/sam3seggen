@@ -918,9 +918,10 @@ def plug_metrics(surface, solid, others, diag):
 
 
 
-INTRUSION_REDRAW = 0.10   # share of the solid's surface lying on a neighbour: redraw above this
+INTRUSION_REDRAW = 0.08   # share of the solid's surface lying on a neighbour: redraw above this
 INTRUSION_TAU = 0.02      # "on a neighbour" = within this x model diagonal of it, off its own surface
-INTRUSION_BAND = 0.16     # ... outside this x diagonal of the part's own cut rim (the collar zone)
+INTRUSION_BAND = 0.04     # ... outside this x diagonal of the part's own cut rim: the collar's reach
+                          # (16% covered 99.9% of a dog body with six cuts and hid the regrown legs)
 
 
 def intrusion_share(solid, own, others, diag, tau=INTRUSION_TAU, band=INTRUSION_BAND):
@@ -1034,7 +1035,9 @@ def redraw_sockets(pipeline, glb, boxes, surfaces, names, solids, args):
 
             centre, scale = xpart_normalization(trimesh.util.concatenate(
                 [s for s in surfaces if s is not None]).bounds)
-            collar = args.collar if args.condition == "collar" else 0.0
+            # a wider collar each time: more of the neighbour says how the surface goes on
+            collar = (args.collar if args.condition == "collar" else DEFAULT_COLLAR) * (2 ** (attempt + 1))
+            print(f"  (collar {collar:.0%} of the diagonal)")
             condition = torch.from_numpy(part_surface_condition(
                 surfaces, centre, scale, seed=again.seed, collar=collar))[bad]
         replacements = generate(pipeline, glb, boxes[bad], condition, [names[i] for i in bad], again)

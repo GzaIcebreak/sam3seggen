@@ -46,7 +46,7 @@ class PlugSocketTest(unittest.TestCase):
         a = np.random.RandomState(2).rand(4000) * 2 * np.pi
         column = np.stack([0.5 * np.cos(a), 0.5 * np.sin(a), 1.0 + np.random.RandomState(3).rand(4000)], axis=1)
         others = np.concatenate([neighbour_points(), column])
-        plug = trimesh.creation.cylinder(radius=0.5, height=2.3, sections=48).apply_translation((0, 0, 0.15))
+        plug = trimesh.creation.cylinder(radius=0.5, height=2.2, sections=48).apply_translation((0, 0, 0.1))
         regrown = trimesh.creation.cylinder(radius=0.5, height=3.0, sections=48).apply_translation((0, 0, 0.5))
         self.assertLess(intrusion_share(plug, tube, others, diag=3.0), 0.05)       # a plug stays in the rim band
         self.assertGreater(intrusion_share(regrown, tube, others, diag=3.0), 0.10)  # the column is copied
