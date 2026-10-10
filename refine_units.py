@@ -19,7 +19,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-DEFAULT_MIN_SHARE = 0.05
+DEFAULT_MIN_SHARE = 0.02
 DEFAULT_MIN_FACES = 50
 # a patch moves only if this share of its area carries the new part's mask directly (in
 # any view): the dog's belly strips are 48-99% voted, the cat's hips called head 0-17%

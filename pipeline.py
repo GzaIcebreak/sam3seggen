@@ -75,7 +75,7 @@ DEFAULT_HOLOPART_LARGE = "score"   # escape | always | score; see hybrid_complet
 HOLOPART_LARGE_MODES = ("escape", "always", "score")
 DEFAULT_REFINE = "masks"           # cut a voted unit where its own masks name a patch differently; off keeps one name per unit
 REFINE_MODES = ("masks", "off")
-DEFAULT_REFINE_MIN_SHARE = 0.05
+DEFAULT_REFINE_MIN_SHARE = 0.02
 # where the geometric units come from: P3-SAM (Hunyuan3D-Part) when it really splits
 # the model, else the SegviGen samples (p3sam_units.py)
 UNITS_MODES = ("auto", "p3sam", "segvigen")

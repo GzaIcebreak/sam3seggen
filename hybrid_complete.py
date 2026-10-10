@@ -12,7 +12,8 @@ import numpy as np
 import trimesh
 
 from xpart_complete import (
-    box_escape, group_solids, hollow_share, load_part_nodes, plug_metrics, thin_faces,
+    box_escape, group_solids, hollow_share, intrusion_share, load_part_nodes, plug_metrics,
+    thin_faces,
 )
 
 ESCAPE_LIMIT = 0.5
@@ -476,14 +477,13 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     extra = cKDTree(part_points).query(solid_points)[0] / diag
     intrusion = 0.0
     plug = None
-    if surfaces is not None and instance is not None:
-        bad = surfaces.intruding(instance, solid_points, tau * diag)
-        outside = ~surfaces.near_rim(instance, solid_points, RIM_BAND * diag)
-        intrusion = float(bad[outside].mean()) if outside.any() else 0.0
-        if surfaces.all is not None:
-            others = surfaces.all.data[surfaces.all_labels != instance]
-            model_diag = float(np.linalg.norm(surfaces.all.data.max(axis=0) - surfaces.all.data.min(axis=0)))
-            plug = plug_metrics(surface, solid, others, model_diag)
+    if surfaces is not None and instance is not None and surfaces.all is not None:
+        others = surfaces.all.data[surfaces.all_labels != instance]
+        model_diag = float(np.linalg.norm(surfaces.all.data.max(axis=0) - surfaces.all.data.min(axis=0)))
+        # the share of the solid lying on a neighbour beyond the collar's reach (4% of the
+        # model diagonal); a band of 16% of the box diagonal hid a dog body's regrown legs
+        intrusion = intrusion_share(solid, surface, others, model_diag)
+        plug = plug_metrics(surface, solid, others, model_diag)
     return {
         **(plug or {}),
         "cover": float((fit < tau).mean()),

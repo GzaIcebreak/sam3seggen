@@ -610,6 +610,9 @@ def main():
     parser.add_argument("--draws", type=int, default=3,
                         help="Draw every part this many times (seed and collar varied) and keep the "
                              "draw hybrid_complete's quality_score likes best")
+    parser.add_argument("--extra_draws", type=int, default=2,
+                        help="Up to this many further draws for the parts whose best draw scores "
+                             f"under {EXTRA_DRAW_BELOW:.2f}")
     parser.add_argument("--redraws", type=int, default=2,
                         help="How many times to draw a part again when its solid comes "
                              "back far bigger than its box; X-Part's part-identity "
@@ -869,6 +872,7 @@ def cut_loops(surface, others, diag, min_loop=PLUG_MIN_LOOP, cut_tau=PLUG_CUT_TA
 
 
 PLUG_SAMPLES = 20000      # surface points of the solid the plug height is read from
+EXTRA_DRAW_BELOW = 0.60   # a part whose best draw scores under this gets --extra_draws more
 
 
 def solid_points(solid, samples=PLUG_SAMPLES, seed=0):
@@ -981,14 +985,42 @@ def best_of_draws(pipeline, glb, boxes, surfaces, names, solids, args):
                 surfaces, centre, scale, seed=again.seed, collar=collar))
         print(f"draw {k + 1} of {draws} (seed {again.seed}, collar {collar:.0%} of the diagonal) ...")
         candidates.append(generate(pipeline, glb, boxes, condition, names, again))
+    scores = [[score_draw(index, cand[index], surfaces, boxes, names, open_surfaces)
+               for cand in candidates] for index in range(len(boxes))]
+    # the parts no draw served well get a few more draws of their own
+    extra = max(int(getattr(args, "extra_draws", 0)), 0)
+    for e in range(extra):
+        weak = [i for i in range(len(boxes)) if max(s for s, _ in scores[i]) < EXTRA_DRAW_BELOW]
+        if not weak:
+            break
+        import copy
+
+        again = copy.copy(args)
+        again.seed = args.seed + 100 * (draws + e)
+        collar = base_collar * (2 if e % 2 == 0 else 1)
+        condition = None
+        if args.condition in ("surface", "collar"):
+            import torch
+
+            centre, scale = xpart_normalization(trimesh.util.concatenate(
+                [p for p in surfaces if p is not None]).bounds)
+            condition = torch.from_numpy(part_surface_condition(
+                surfaces, centre, scale, seed=again.seed, collar=collar))[weak]
+        print(f"extra draw {e + 1} of {extra} for {', '.join(names[i] for i in weak)} "
+              f"(best so far under {EXTRA_DRAW_BELOW:.2f}; seed {again.seed}, collar {collar:.0%}) ...")
+        more = generate(pipeline, glb, boxes[weak], condition, [names[i] for i in weak], again)
+        for i, solid in zip(weak, more):
+            for cand in candidates:
+                pass
+            candidates.append(None)        # placeholder so draw numbers stay unique
+            scores[i].append(score_draw(i, solid, surfaces, boxes, names, open_surfaces))
+            candidates[-1] = {i: solid}
     chosen = []
     for index in range(len(boxes)):
-        scored = []
-        for k, cand in enumerate(candidates):
-            score, metrics = score_draw(index, cand[index], surfaces, boxes, names, open_surfaces)
-            scored.append((score, k, metrics))
+        scored = [(score, k, metrics) for k, (score, metrics) in enumerate(scores[index])]
         best = max(scored, key=lambda row: row[0])
-        chosen.append(candidates[best[1]][index])
+        cand = candidates[best[1]]
+        chosen.append(cand[index] if isinstance(cand, (list, tuple)) else cand.get(index))
         detail = " ".join(f"d{k + 1}={score:.2f}" for score, k, _ in scored)
         m = best[2] or {}
         print(f"  {names[index]:24s} keeps draw {best[1] + 1}: {detail}"
