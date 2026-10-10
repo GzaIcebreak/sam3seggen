@@ -725,6 +725,8 @@ def main():
     centre, norm_scale = xpart_normalization(source.bounds)
     solids = redraw_hollow(pipeline, os.path.abspath(args.glb), boxes, surfaces, centre,
                            norm_scale, names, solids, args)
+    solids = redraw_regrown(pipeline, os.path.abspath(args.glb), boxes, surfaces, names, solids, args)
+    solids = redraw_sockets(pipeline, os.path.abspath(args.glb), boxes, surfaces, names, solids, args)
 
     instances = trimesh.Scene()
     for index, solid in enumerate(solids):
@@ -784,6 +786,272 @@ def generate(pipeline, glb, boxes, condition, names, args):
         for offset, geometry in enumerate(geometries[:len(chunk)]):
             solids[start + offset] = geometry
         torch.cuda.empty_cache()
+    return solids
+
+
+
+# --- plug or socket --------------------------------------------------------------------------
+PLUG_MIN_LOOP = 0.08      # a cut loop is at least this x the part's largest extent across
+PLUG_CUT_TAU = 0.02       # ... and lies within this x the model diagonal of another instance
+PLUG_BAND = 1.5           # the solid's surface within this x loop diameter of the loop plane
+SOCKET_REDRAW = 0.10      # mean plug height (loop diameters) below which a part is redrawn
+
+
+def _welded(mesh):
+    out = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.faces), process=False)
+    out.merge_vertices(merge_tex=True, merge_norm=True)
+    return out
+
+
+def _boundary_loops(mesh):
+    """Closed loops of vertex indices along the mesh's open boundary (face winding)."""
+    edges = mesh.edges
+    once = trimesh.grouping.group_rows(mesh.edges_sorted, require_count=1)
+    nxt = {}
+    for a, b in edges[once]:
+        nxt.setdefault(int(a), []).append(int(b))
+    loops, seen = [], set()
+    for a, b in edges[once]:
+        a, b = int(a), int(b)
+        if (a, b) in seen:
+            continue
+        loop, current = [a], a
+        while True:
+            candidates = [c for c in nxt.get(current, []) if (current, c) not in seen]
+            if not candidates:
+                break
+            c = candidates[0]
+            seen.add((current, c))
+            if c == loop[0]:
+                break
+            loop.append(c)
+            current = c
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def cut_loops(surface, others, diag, min_loop=PLUG_MIN_LOOP, cut_tau=PLUG_CUT_TAU):
+    """The open surface's cut loops: plane (centre, u, v, outward n), 2-D hull, diameter.
+    `others` = points of the neighbouring instances (array or cKDTree); a boundary loop
+    that does not lie on a neighbour is a hole of the original mesh and is skipped."""
+    from scipy.spatial import ConvexHull, cKDTree
+
+    surface = _welded(surface)
+    vertices = np.asarray(surface.vertices)
+    if not len(vertices):
+        return []
+    others = others if isinstance(others, cKDTree) else (cKDTree(np.asarray(others)) if len(others) else None)
+    own = cKDTree(vertices)
+    extent = float(np.ptp(vertices, axis=0).max())
+    out = []
+    for loop in _boundary_loops(surface):
+        if len(loop) < 12:
+            continue
+        pts = vertices[np.asarray(loop)]
+        diameter = float(np.ptp(pts, axis=0).max())
+        if diameter < min_loop * extent:
+            continue
+        if others is not None and np.median(others.query(pts)[0]) > cut_tau * diag:
+            continue
+        centre = pts.mean(axis=0)
+        _, _, axes = np.linalg.svd(pts - centre, full_matrices=False)
+        normal = axes[2]
+        # outward = away from the part's own surface next to the loop (the neighbour's rim
+        # coincides with the loop and gives no direction)
+        near = vertices[own.query_ball_point(centre, PLUG_BAND * diameter)]
+        if len(near) and np.dot(near.mean(axis=0) - centre, normal) > 0:
+            normal = -normal
+        uv = np.stack([(pts - centre) @ axes[0], (pts - centre) @ axes[1]], axis=1)
+        try:
+            hull = ConvexHull(uv)
+        except Exception:
+            continue
+        out.append({"centre": centre, "u": axes[0], "v": axes[1], "n": normal, "hull": hull,
+                    "diameter": diameter})
+    return out
+
+
+PLUG_SAMPLES = 20000      # surface points of the solid the plug height is read from
+
+
+def solid_points(solid, samples=PLUG_SAMPLES, seed=0):
+    """Points on the solid's surface (plug_height reads these, not the vertices: a coarse
+    mesh has vertices only along its rims)."""
+    if solid is None or not len(solid.faces):
+        return np.zeros((0, 3))
+    return trimesh.sample.sample_surface(solid, samples, seed=seed)[0]
+
+
+def plug_height(points, loop, band=PLUG_BAND):
+    """p90 height of the solid's surface (`points`, see solid_points; a mesh is sampled)
+    inside the loop's footprint, in loop diameters: positive = a plug sticking out past
+    the cut, negative = a socket sunk below it. None when nothing lies in the footprint."""
+    if isinstance(points, trimesh.Trimesh):
+        points = solid_points(points)
+    local = np.asarray(points) - loop["centre"]
+    uv = np.stack([local @ loop["u"], local @ loop["v"]], axis=1)
+    eq = loop["hull"].equations
+    inside = np.all(uv @ eq[:, :2].T + eq[:, 2] <= -0.05 * loop["diameter"], axis=1)
+    if inside.sum() < 10:
+        return None
+    h = local[inside] @ loop["n"]
+    h = h[np.abs(h) <= band * loop["diameter"]]
+    if len(h) < 10:
+        return None
+    return float(np.percentile(h, 90) / loop["diameter"])
+
+
+def plug_metrics(surface, solid, others, diag):
+    """{plug_mean, plug_min, sockets, loops} over the surface's cut loops, or None when
+    the surface has no cut loop the solid reaches."""
+    heights = []
+    points = solid_points(solid)
+    for loop in cut_loops(surface, others, diag):
+        h = plug_height(points, loop)
+        if h is not None:
+            heights.append(h)
+    if not heights:
+        return None
+    return {"plug_mean": float(np.mean(heights)), "plug_min": float(min(heights)),
+            "sockets": int(sum(h < -0.1 for h in heights)), "loops": len(heights)}
+
+
+
+INTRUSION_REDRAW = 0.10   # share of the solid's surface lying on a neighbour: redraw above this
+INTRUSION_TAU = 0.02      # "on a neighbour" = within this x model diagonal of it, off its own surface
+INTRUSION_BAND = 0.16     # ... outside this x diagonal of the part's own cut rim (the collar zone)
+
+
+def intrusion_share(solid, own, others, diag, tau=INTRUSION_TAU, band=INTRUSION_BAND):
+    """Share of the solid's surface that copies a neighbour: farther than tau from the
+    part's own open surface, within tau of another instance, and outside the band along
+    the part's own cut rim where the collar conditioning legitimately puts some."""
+    from scipy.spatial import cKDTree
+
+    points = solid_points(solid)
+    if not len(points) or own is None or not len(own.vertices):
+        return 0.0
+    others = others if isinstance(others, cKDTree) else (cKDTree(np.asarray(others)) if len(others) else None)
+    if others is None:
+        return 0.0
+    welded = _welded(own)
+    d_own = cKDTree(solid_points(welded, seed=1)).query(points)[0]
+    d_other = others.query(points, distance_upper_bound=tau * diag)[0]
+    bad = (d_own > tau * diag) & (d_other < tau * diag)
+    edges = welded.edges
+    once = trimesh.grouping.group_rows(welded.edges_sorted, require_count=1)
+    if len(once):
+        rim = cKDTree(np.asarray(welded.vertices)[np.unique(edges[once])])
+        bad &= ~(rim.query(points, distance_upper_bound=band * diag)[0] < band * diag)
+    return float(bad.mean())
+
+
+def redraw_regrown(pipeline, glb, boxes, surfaces, names, solids, args):
+    """Draw a part again (another seed) while its solid copies its neighbours -- the dog's
+    body came back with the legs and head on it -- keeping the least intruding draw.
+    Cutting the copies off (hybrid_complete.cull_intrusions) stays as the last resort."""
+    import copy
+
+    if args.redraws <= 0 or not solids:
+        return solids
+    live = [s for s in surfaces if s is not None and len(s.vertices)]
+    if not live:
+        return solids
+    allpts = np.concatenate([np.asarray(s.vertices) for s in live])
+    diag = float(np.linalg.norm(allpts.max(axis=0) - allpts.min(axis=0)))
+
+    def measure(index, solid):
+        others = np.concatenate([np.asarray(s.vertices) for j, s in enumerate(surfaces)
+                                 if j != index and s is not None and len(s.vertices)] or [np.zeros((0, 3))])
+        return intrusion_share(solid, surfaces[index], others, diag)
+
+    intrusion = {i: measure(i, s) for i, s in enumerate(solids) if s is not None}
+    for attempt in range(args.redraws):
+        bad = sorted(i for i, v in intrusion.items() if v > INTRUSION_REDRAW)
+        if not bad:
+            break
+        print(f"{len(bad)} of {len(boxes)} solids regrew their neighbours "
+              f"({', '.join(f'{names[i]} {intrusion[i]:.0%}' for i in bad)}); redrawing them with another "
+              f"seed (attempt {attempt + 1} of {args.redraws}) ...")
+        again = copy.copy(args)
+        again.seed = args.seed + 1000 * (attempt + 1)
+        condition = None
+        if args.condition in ("surface", "collar"):
+            import torch
+
+            centre, scale = xpart_normalization(trimesh.util.concatenate(live).bounds)
+            collar = args.collar if args.condition == "collar" else 0.0
+            condition = torch.from_numpy(part_surface_condition(
+                surfaces, centre, scale, seed=again.seed, collar=collar))[bad]
+        replacements = generate(pipeline, glb, boxes[bad], condition, [names[i] for i in bad], again)
+        for index, replacement in zip(bad, replacements):
+            if replacement is None:
+                continue
+            after = measure(index, replacement)
+            if after >= intrusion[index]:
+                print(f"  {names[index]}: the new draw copies {after:.0%}; keeping the {intrusion[index]:.0%} one")
+                continue
+            print(f"  {names[index]}: {intrusion[index]:.0%} -> {after:.0%} on the neighbours, kept")
+            solids[index] = replacement
+            intrusion[index] = after
+    still = [f"{names[i]} {v:.0%}" for i, v in intrusion.items() if v > INTRUSION_REDRAW]
+    if still:
+        print(f"still regrowing their neighbours after {args.redraws} redraws (the cut will take "
+              f"the copies off): {', '.join(still)}")
+    return solids
+
+
+def redraw_sockets(pipeline, glb, boxes, surfaces, names, solids, args):
+    """Draw a part again (another seed) while its solid sinks below its cuts instead of
+    plugging them; the draw with the highest mean plug height is kept."""
+    import copy
+
+    if args.redraws <= 0 or not solids:
+        return solids
+    allpts = np.concatenate([np.asarray(s.vertices) for s in surfaces if s is not None and len(s.vertices)])
+    diag = float(np.linalg.norm(allpts.max(axis=0) - allpts.min(axis=0)))
+
+    def measure(index, solid):
+        others = np.concatenate([np.asarray(s.vertices) for j, s in enumerate(surfaces)
+                                 if j != index and s is not None and len(s.vertices)] or [np.zeros((0, 3))])
+        m = plug_metrics(surfaces[index], solid, others, diag)
+        return None if m is None else m["plug_mean"]
+
+    plug = {i: measure(i, s) for i, s in enumerate(solids) if s is not None}
+    for attempt in range(args.redraws):
+        bad = sorted(i for i, p in plug.items() if p is not None and p < SOCKET_REDRAW)
+        if not bad:
+            break
+        print(f"{len(bad)} of {len(boxes)} solids sink below their cuts instead of plugging them "
+              f"({', '.join(f'{names[i]} {plug[i]:+.2f}' for i in bad)}); redrawing them with another "
+              f"seed (attempt {attempt + 1} of {args.redraws}) ...")
+        again = copy.copy(args)
+        again.seed = args.seed + 100 * (attempt + 1)
+        condition = None
+        if args.condition in ("surface", "collar"):
+            import torch
+
+            centre, scale = xpart_normalization(trimesh.util.concatenate(
+                [s for s in surfaces if s is not None]).bounds)
+            collar = args.collar if args.condition == "collar" else 0.0
+            condition = torch.from_numpy(part_surface_condition(
+                surfaces, centre, scale, seed=again.seed, collar=collar))[bad]
+        replacements = generate(pipeline, glb, boxes[bad], condition, [names[i] for i in bad], again)
+        for index, replacement in zip(bad, replacements):
+            if replacement is None:
+                continue
+            after = measure(index, replacement)
+            if after is None or after <= plug[index]:
+                print(f"  {names[index]}: the new draw is {after if after is None else f'{after:+.2f}'}; "
+                      f"keeping the {plug[index]:+.2f} one")
+                continue
+            print(f"  {names[index]}: {plug[index]:+.2f} -> {after:+.2f}, kept")
+            solids[index] = replacement
+            plug[index] = after
+    still = [f"{names[i]} {p:+.2f}" for i, p in plug.items() if p is not None and p < SOCKET_REDRAW]
+    if still:
+        print(f"still sunk below their cuts after {args.redraws} redraws: {', '.join(still)}")
     return solids
 
 

@@ -74,8 +74,10 @@ def patch_flanked_by(faces, old_name, new_name, face_ids, mask_set, support=SUPP
         return None
     resolution = mask_set.masks.shape[-1]
     lookup = mask_lookup(resolution, face_ids.shape[-1] // resolution)
-    member = np.zeros(int(face_ids.max()) + 1, dtype=bool)
-    member[np.asarray(faces) + 1] = True
+    faces = np.asarray(faces)
+    # sized by the patch too: a face no camera saw has an id past the raster's largest
+    member = np.zeros(max(int(face_ids.max()), int(faces.max()) + 1) + 1, dtype=bool)
+    member[faces + 1] = True
     shares = []
     for view in range(len(face_ids)):
         hit = np.flatnonzero(member[face_ids[view].ravel()])

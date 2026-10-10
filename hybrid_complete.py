@@ -11,7 +11,9 @@ import os
 import numpy as np
 import trimesh
 
-from xpart_complete import box_escape, group_solids, hollow_share, load_part_nodes, thin_faces
+from xpart_complete import (
+    box_escape, group_solids, hollow_share, load_part_nodes, plug_metrics, thin_faces,
+)
 
 ESCAPE_LIMIT = 0.5
 AREA_LARGE = 0.08
@@ -192,6 +194,8 @@ SCORE_EXTRA_SCALE = 0.35  # invented geometry this far out (p90) zeroes the scor
 ESCAPE_FREE = 0.2         # a solid may reach this far past its box before it counts (the plug)
 RIM_BAND = 0.16           # within this x diagonal of the part's own cut rim: the collar zone
 HOLOPART_MARGIN = 0.2     # HoloPart replaces an X-Part solid only when ahead by this much ...
+SOCKET_FREE = 0.10        # mean plug height (loop diameters) a solid may fall short of unpenalised
+SOCKET_SCALE = 0.40       # ... and the shortfall at which the socket penalty reaches 1
 HOLOPART_ONLY_BELOW = 0.35  # ... and only when the X-Part solid is this bad (its cuts are cleaner)
 REGROWN_SHARE = 0.2       # an intruding region this big (x own open area) is a regrown neighbour, not a plug
 NEIGHBOUR_COVER = 0.35    # ... or one that lies on this share of a single neighbour's open surface
@@ -471,11 +475,17 @@ def solid_metrics(surface, solid, box, samples=SCORE_SAMPLES, tau=SCORE_TAU, see
     fit = cKDTree(dense).query(part_points)[0] / diag
     extra = cKDTree(part_points).query(solid_points)[0] / diag
     intrusion = 0.0
+    plug = None
     if surfaces is not None and instance is not None:
         bad = surfaces.intruding(instance, solid_points, tau * diag)
         outside = ~surfaces.near_rim(instance, solid_points, RIM_BAND * diag)
         intrusion = float(bad[outside].mean()) if outside.any() else 0.0
+        if surfaces.all is not None:
+            others = surfaces.all.data[surfaces.all_labels != instance]
+            model_diag = float(np.linalg.norm(surfaces.all.data.max(axis=0) - surfaces.all.data.min(axis=0)))
+            plug = plug_metrics(surface, solid, others, model_diag)
     return {
+        **(plug or {}),
         "cover": float((fit < tau).mean()),
         "fit_p90": float(np.percentile(fit, 90)),
         "extra_p90": float(np.percentile(extra, 90)),
@@ -517,8 +527,12 @@ def quality_score(metrics, extra_scale=SCORE_EXTRA_SCALE, intrusion_scale=INTRUS
     intrusion = min(1.0, metrics.get("intrusion", 0.0) / intrusion_scale)
     hollow = min(1.0, max(0.0, metrics.get("hollow", 0.0)
                           - max(hollow_free, metrics.get("hollow_ref", 0.0))) / hollow_scale)
+    # a socket where a plug should be: a watertight dish sunk below the cut scores well on
+    # every distance metric and looks like a hole in the part
+    plug = metrics.get("plug_mean")
+    socket = 0.0 if plug is None else min(1.0, max(0.0, SOCKET_FREE - plug) / SOCKET_SCALE)
     return float(metrics["cover"] * (1.0 - extra) * (1.0 - escape) * whole
-                 * (1.0 - intrusion) * (1.0 - hollow))
+                 * (1.0 - intrusion) * (1.0 - hollow) * (1.0 - socket))
 
 
 def _score_inputs(out_dir):

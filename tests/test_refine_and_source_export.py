@@ -203,6 +203,18 @@ class FlankedTest(unittest.TestCase):
         strip = np.array([[0, 7], [1, 8], [2, 9], [3, 4], [0, 1]])          # 3 new, 1 old
         self.assertAlmostEqual(boundary_share([0, 1, 2, 3], labels, strip, 1), 0.75)
 
+    def test_a_patch_face_no_camera_saw_does_not_crash_the_veto(self):
+        from types import SimpleNamespace
+
+        from refine_units import patch_flanked_by
+
+        face_ids = np.zeros((1, 10, 10), dtype=np.int32)
+        face_ids[0, 2:6, 4:6] = 1                   # only face 0 was ever rasterised
+        masks = np.zeros((1, 2, 10, 10), dtype=bool)
+        mask_set = SimpleNamespace(masks=masks, scores=np.ones((1, 2)), owners=["head", "torso"])
+        # face 7 is in the patch but no camera saw it: no error, and no view supports a move
+        self.assertIsNone(patch_flanked_by([0, 7], "head", "torso", face_ids, mask_set))
+
     def test_the_veto_reads_only_views_that_support_the_move(self):
         from types import SimpleNamespace
 
