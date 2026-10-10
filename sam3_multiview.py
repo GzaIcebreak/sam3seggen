@@ -21,6 +21,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+from phrase_rescue import (
+    choose_phrase, phrase_stats, rescue_enabled, rescue_phrases, weak_concepts,
+)
 from prompt_specs import normalize_part_specs, part_names, validate_target_name
 from sam3_to_2dmap import (
     DEFAULT_SAM3, attach_decoder_lora, auto_parts, foreground_mask, load_concept_bank,
@@ -69,6 +72,43 @@ def overlay_v3(masks, foreground):
     return painted
 
 
+def rescue_weak_words(concepts, owners, raw, manifest, views_dir, unassigned_to,
+                      processor, model, threshold, device, bank):
+    """{word: record} for the plain words SAM3 barely saw that another phrasing finds
+    clearly better (phrase_rescue.py). One extra SAM3 pass over the views, only for the
+    candidate phrases, and only when some word is weak."""
+    n_views = len(manifest["views"])
+    weak = weak_concepts(concepts, owners, raw, n_views, unassigned_to)
+    if not weak:
+        return {}
+    trials = {word: rescue_phrases(word, taken=concepts) for word in weak}
+    phrases = list(dict.fromkeys(p for options in trials.values() for p, _ in options))
+    print(f"[rescue] SAM3 barely sees {weak}; measuring {phrases}")
+    measured = {phrase: [] for phrase in phrases}
+    for view in manifest["views"]:
+        image = Image.open(os.path.join(views_dir, view["image"]))
+        foreground = foreground_mask(image)
+        silhouette = max(int(foreground.sum()), 1)
+        for part in segment_prompts(processor, model, image, phrases, threshold, device, bank=bank):
+            if part["prompt"] in measured:
+                measured[part["prompt"]].append(
+                    (float(part["score"]), int((part["mask"].astype(bool) & foreground).sum()) / silhouette))
+    rescued = {}
+    for word, options in trials.items():
+        own = phrase_stats(raw.get(word, []), n_views)
+        candidates = [dict(phrase_stats(measured[p], n_views), phrase=p, tier=t) for p, t in options]
+        pick = choose_phrase(own, candidates, n_views)
+        tried = ", ".join(f"{c['phrase']} {c['seen']}/{n_views} {c['score']:.2f}" for c in candidates)
+        if pick is None:
+            print(f"[rescue] {word}: {own['seen']}/{n_views} {own['score']:.2f}; nothing better ({tried})")
+            continue
+        print(f"[rescue] {word}: {own['seen']}/{n_views} {own['score']:.2f} -> '{pick['phrase']}' "
+              f"{pick['seen']}/{n_views} {pick['score']:.2f} (tried {tried})")
+        rescued[word] = {"phrase": pick["phrase"], "seen": pick["seen"], "score": pick["score"],
+                         "own_seen": own["seen"], "own_score": own["score"], "views": n_views}
+    return rescued
+
+
 def main():
     parser = argparse.ArgumentParser(description="SAM3 over a view grid -> raw per-concept masks")
     parser.add_argument("--views_dir", required=True, help="Directory holding cameras.json and renders")
@@ -92,6 +132,9 @@ def main():
                         help="A second render of the same cameras (the unpainted grey views when "
                              "--views_dir is flat-painted). Each prompt keeps, per view, whichever of "
                              "the two images gave it the higher score. --assign paint only.")
+    parser.add_argument("--no_rescue", action="store_true",
+                        help="Keep a plain prompt word SAM3 barely sees as it is instead of trying "
+                             "other phrasings ('animal head' for 'head'); see phrase_rescue.py")
     parser.add_argument("--require_masks", action="store_true",
                         help="Exit if a prompt (other than --unassigned_to) is unseen in every view")
     parser.add_argument("--assign", choices=["paint", "rank", "auto"],
@@ -143,11 +186,20 @@ def main():
     if bank is not None:
         attach_decoder_lora(model, bank, bank_path, None, device)
 
-    mask_rows, foreground_rows, score_rows = [], [], []
-    detections = {concept: 0 for concept in concepts}
-    for view in manifest["views"]:
-        image = Image.open(os.path.join(views_dir, view["image"]))
-        print(f"[{view['name']}]")
+    def sweep(concepts):
+        """SAM3 over every view: the packed rows to save, the per-concept detection
+        counts after the overlay, and the raw hits [(score, silhouette share)] before it."""
+        mask_rows, foreground_rows, score_rows = [], [], []
+        detections = {concept: 0 for concept in concepts}
+        raw = {concept: [] for concept in concepts}
+        for view in manifest["views"]:
+            image = Image.open(os.path.join(views_dir, view["image"]))
+            print(f"[{view['name']}]")
+            sweep_view(view, image, concepts, mask_rows, foreground_rows, score_rows,
+                       detections, raw)
+        return mask_rows, foreground_rows, score_rows, detections, raw
+
+    def sweep_view(view, image, concepts, mask_rows, foreground_rows, score_rows, detections, raw):
         if assign == "paint":
             parts = segment_prompts(processor, model, image, concepts, threshold, device, bank=bank)
             if extra_dir:
@@ -176,6 +228,12 @@ def main():
             del fields
         found = {part["prompt"]: part for part in parts}
         foreground = foreground_mask(image)
+        silhouette = max(int(foreground.sum()), 1)
+        for concept in concepts:
+            hit = found.get(concept)
+            if hit is not None:
+                raw[concept].append((float(hit["score"]),
+                                     int((hit["mask"].astype(bool) & foreground).sum()) / silhouette))
         masks = np.zeros((len(concepts), *foreground.shape), dtype=bool)
         scores = np.zeros(len(concepts), dtype=np.float32)
         for index, concept in enumerate(concepts):
@@ -196,6 +254,17 @@ def main():
         mask_rows.append(np.packbits(masks, axis=-1))
         foreground_rows.append(np.packbits(foreground, axis=-1))
         score_rows.append(scores)
+
+    mask_rows, foreground_rows, score_rows, detections, raw = sweep(concepts)
+    rescued = {}
+    if rescue_enabled(args.no_rescue):
+        rescued = rescue_weak_words(concepts, owners, raw, manifest, views_dir, args.unassigned_to,
+                                    processor, model, threshold, device, bank)
+        if rescued:
+            for word, record in rescued.items():
+                concepts[concepts.index(word)] = record["phrase"]
+            print(f"[rescue] SAM3 again with {concepts}")
+            mask_rows, foreground_rows, score_rows, detections, raw = sweep(concepts)
 
     # Concepts feeding the --unassigned_to part may legitimately see nothing: that
     # part's job is to absorb whatever no mask claimed, so it needs no detections.
@@ -219,6 +288,7 @@ def main():
         part_order=np.array(part_names(specs)),
         unassigned_to=np.array(args.unassigned_to or ""),
         assign=np.array(assign),
+        rescued=np.array(json.dumps(rescued)),
     )
     print(f"saved {out}")
     for concept, count in detections.items():

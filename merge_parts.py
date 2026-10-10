@@ -182,6 +182,10 @@ def sam3_masks(views_dir, prompts, out_npz, unassigned_to=None, py_sam3=None,
         command.append("--raw")
     if require_masks:
         command.append("--require_masks")
+    from phrase_rescue import rescue_enabled
+
+    if not rescue_enabled():
+        command.append("--no_rescue")
     if unassigned_to:
         command += ["--unassigned_to", unassigned_to]
     # --prompts is nargs="+" and would otherwise swallow the flags after it.
@@ -249,6 +253,11 @@ def guidance(glb, work_dir, seg_glb, prompts, unassigned_to=None,
     dual = painted and assign == "paint"
     if dual:
         overlay += "+grey"
+    from phrase_rescue import rescue_enabled
+
+    if rescue_enabled():
+        # masks made without the phrase rescue must not stand in for a rescued run
+        overlay += "+rescue"
     masks_npz = sam3_masks(
         prompt_dir, prompts,
         os.path.join(work_dir, masks_name(
