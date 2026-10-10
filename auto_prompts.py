@@ -46,6 +46,36 @@ DEFAULT_SHORTLIST_INSIDE = 0.8       # a word this far inside another kept word'
 DEFAULT_SHORTLIST_MIN_PARTS = 2      # fewer found parts than this: the full sweep gives a second opinion
 VARIANT_MAX_GROWTH = 2.0             # a variant may cover at most this x the own word's area
 MAX_VARIANT_PHRASES = 48             # SAM3 phrases measured for one shortlist (parts x variants)
+VLM_ATTEMPTS = 3                     # tries per VLM call before 智能分割模式 gives up
+VLM_RETRY_WAIT = 10.0                # seconds before the 2nd try; x2 before the 3rd
+
+
+class VlmUnavailable(RuntimeError):
+    """智能分割模式 got no usable answer from the VLM. The job fails rather than falling
+    back to the rule-based pick: when the proxy tunnel dropped, 28 of 36 smart-mode jobs
+    quietly did that and named a grenade `lock` + `machine body`."""
+
+
+def ask_vlm_or_fail(call, what, attempts=VLM_ATTEMPTS, wait=VLM_RETRY_WAIT):
+    """call() until it answers, up to `attempts` times; then raise VlmUnavailable."""
+    import time
+
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as error:
+            last = error
+            print(f"[smart] VLM {what}: attempt {attempt}/{attempts} failed "
+                  f"({type(error).__name__}: {str(error)[:160]})")
+            if attempt < attempts and wait > 0:
+                time.sleep(wait * attempt)
+    raise VlmUnavailable(
+        f"智能分割模式：大模型调用失败（{what}，已重试 {attempts} 次），任务中止，没有退回规则挑词。"
+        f"请检查 SEGVIGEN_VLM_BASE_URL / 网络后重试。最后的错误：{type(last).__name__}: {str(last)[:300]}"
+    ) from last
+
+
 IRREGULAR_SINGULAR = {"feet": "foot", "teeth": "tooth", "antennae": "antenna", "geese": "goose",
                       "men": "man", "women": "woman", "children": "child", "knives": "knife",
                       "leaves": "leaf", "shelves": "shelf", "halves": "half", "wolves": "wolf",
@@ -467,54 +497,49 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
         print(f"[smart] asking the VLM to name the object and its parts "
               f"(vocabulary of {len(concepts)} bank words"
               + (", following the guide image" if guide_image else "") + ") ...")
-        try:
-            chosen = kimi_shortlist(images, concepts, guide_image=guide_image)
-        except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
-            print(f"[smart] VLM failed ({type(error).__name__}: {str(error)[:160]}); "
-                  "falling back to the full bank sweep")
-            shortlist_error = f"{type(error).__name__}: {error}"
-        else:
-            shortlist_error = None
-            print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
-                  f"main={chosen['main']!r} parts={chosen['parts']}"
-                  + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
-            words = list(dict.fromkeys(
-                phrase for phrases in variant_phrases(chosen).values() for phrase in phrases))
-            if words:
-                import hashlib
+        chosen = ask_vlm_or_fail(lambda: kimi_shortlist(images, concepts, guide_image=guide_image),
+                                 "naming the parts")
+        shortlist_error = None
+        print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
+              f"main={chosen['main']!r} parts={chosen['parts']}"
+              + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
+        words = list(dict.fromkeys(
+            phrase for phrases in variant_phrases(chosen).values() for phrase in phrases))
+        if words:
+            import hashlib
 
-                digest = hashlib.sha1("|".join(words).encode("utf-8")).hexdigest()[:10]
-                short_npz = os.path.join(work_dir, f"auto_shortlist_{digest}{suffix}.npz")
-                if not (reuse and os.path.isfile(short_npz)):
-                    print(f"[smart] asking SAM3 for the {len(words)} shortlisted words and "
-                          f"variants over {len(azimuths.split(','))} views ...")
-                    sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir,
-                               painted, short_npz, words)
-                short = load_masks(short_npz)
-                rows = word_stats(short.masks, short.foreground, short.scores, short.concepts,
-                                  min_views=DEFAULT_SHORTLIST_MIN_VIEWS)
-                proposal, reason = accept_shortlist(
-                    chosen, rows, max_parts=max_parts, masks=short.masks,
-                    foreground=short.foreground, concepts=short.concepts)
-                if proposal is None:
-                    print(f"[smart] shortlist unusable ({reason}); falling back to the full bank sweep")
-                else:
-                    proposal["covered"] = covered_share(
-                        short.masks, short.foreground, short.concepts,
-                        [proposal["phrases"][p] for p in proposal["part_names"]])
-                    kimi = proposal["kimi"]
-                    if kimi.get("variants_used"):
-                        print(f"[smart] SAM3 knows these better: "
-                              + ", ".join(f"{k} -> {v}" for k, v in kimi["variants_used"].items()))
-                    if kimi.get("not_found") or kimi.get("dropped_whole") or kimi.get("dropped_overlap"):
-                        print(f"[smart] not found by SAM3: {kimi.get('not_found') or []}; "
-                              f"whole-object words dropped: {kimi.get('dropped_whole') or []}; "
-                              f"same thing as another word: {kimi.get('dropped_overlap') or {}}")
-                    if len(proposal["part_names"]) < DEFAULT_SHORTLIST_MIN_PARTS:
-                        print(f"[smart] only {len(proposal['part_names'])} part found "
-                              f"({proposal['covered']:.0%} of the silhouette); asking the full "
-                              "bank sweep for a second opinion")
-                        shortlist_proposal, proposal = proposal, None
+            digest = hashlib.sha1("|".join(words).encode("utf-8")).hexdigest()[:10]
+            short_npz = os.path.join(work_dir, f"auto_shortlist_{digest}{suffix}.npz")
+            if not (reuse and os.path.isfile(short_npz)):
+                print(f"[smart] asking SAM3 for the {len(words)} shortlisted words and "
+                      f"variants over {len(azimuths.split(','))} views ...")
+                sam3_sweep(py_sam3, sam3_model, concept_bank, prompt_dir, views_dir,
+                           painted, short_npz, words)
+            short = load_masks(short_npz)
+            rows = word_stats(short.masks, short.foreground, short.scores, short.concepts,
+                              min_views=DEFAULT_SHORTLIST_MIN_VIEWS)
+            proposal, reason = accept_shortlist(
+                chosen, rows, max_parts=max_parts, masks=short.masks,
+                foreground=short.foreground, concepts=short.concepts)
+            if proposal is None:
+                print(f"[smart] shortlist unusable ({reason}); falling back to the full bank sweep")
+            else:
+                proposal["covered"] = covered_share(
+                    short.masks, short.foreground, short.concepts,
+                    [proposal["phrases"][p] for p in proposal["part_names"]])
+                kimi = proposal["kimi"]
+                if kimi.get("variants_used"):
+                    print(f"[smart] SAM3 knows these better: "
+                          + ", ".join(f"{k} -> {v}" for k, v in kimi["variants_used"].items()))
+                if kimi.get("not_found") or kimi.get("dropped_whole") or kimi.get("dropped_overlap"):
+                    print(f"[smart] not found by SAM3: {kimi.get('not_found') or []}; "
+                          f"whole-object words dropped: {kimi.get('dropped_whole') or []}; "
+                          f"same thing as another word: {kimi.get('dropped_overlap') or {}}")
+                if len(proposal["part_names"]) < DEFAULT_SHORTLIST_MIN_PARTS:
+                    print(f"[smart] only {len(proposal['part_names'])} part found "
+                          f"({proposal['covered']:.0%} of the silhouette); asking the full "
+                          "bank sweep for a second opinion")
+                    shortlist_proposal, proposal = proposal, None
 
     if proposal is None:
         masks_npz = os.path.join(work_dir, f"auto_concepts{suffix}.npz")
@@ -534,28 +559,24 @@ def propose_prompts(glb, work_dir, seg_glb, py_sam3, sam3_model, concept_bank,
                 proposal["shortlist_error"] = shortlist_error
             print(f"[smart] asking the VLM to review {len(proposal['candidates'])} candidate words ...")
             proposal["heuristic"] = {"main": proposal["main"], "parts": proposal["parts"]}
-            try:
-                chosen = kimi_select(images, proposal["candidates"], concepts)
-            except Exception as error:  # a VLM hiccup must not sink a twenty-minute job
-                proposal["kimi_error"] = f"{type(error).__name__}: {error}"
-                print(f"[smart] VLM failed ({proposal['kimi_error'][:160]}); keeping the rule-based pick")
+            chosen = ask_vlm_or_fail(lambda: kimi_select(images, proposal["candidates"], concepts),
+                                     "reviewing the candidate words")
+            proposal["kimi"] = chosen
+            print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
+                  f"main={chosen['main']!r} parts={chosen['parts']}"
+                  + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
+            chosen["parts"], whole_words = drop_whole_words(chosen["parts"], proposal["candidates"])
+            if whole_words:
+                chosen["dropped_whole"] = whole_words
+                print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
+                      f"or more, so it names the object rather than a part")
+            # main + one part is a split (pineapple: fruit + leaves); only no part at all,
+            # or parts with nothing to name the remainder, falls back to the rules
+            if len(chosen["parts"]) >= 2 or (chosen["parts"] and chosen["main"]):
+                proposal["parts"] = chosen["parts"][:max_parts]
+                proposal["main"] = chosen["main"] or proposal["main"]
             else:
-                proposal["kimi"] = chosen
-                print(f"[smart] {chosen.get('model', 'VLM')}: object={chosen['object']!r} "
-                      f"main={chosen['main']!r} parts={chosen['parts']}"
-                      + (f" (dropped, not in bank: {chosen['dropped']})" if chosen["dropped"] else ""))
-                chosen["parts"], whole_words = drop_whole_words(chosen["parts"], proposal["candidates"])
-                if whole_words:
-                    chosen["dropped_whole"] = whole_words
-                    print(f"[smart] dropped {whole_words}: each mask covers half the silhouette "
-                          f"or more, so it names the object rather than a part")
-                # main + one part is a split (pineapple: fruit + leaves); only no part at all,
-                # or parts with nothing to name the remainder, falls back to the rules
-                if len(chosen["parts"]) >= 2 or (chosen["parts"] and chosen["main"]):
-                    proposal["parts"] = chosen["parts"][:max_parts]
-                    proposal["main"] = chosen["main"] or proposal["main"]
-                else:
-                    print("[smart] VLM returned no usable part; keeping the rule-based pick")
+                print("[smart] VLM returned no usable part; keeping the rule-based pick")
     if shortlist_proposal is not None:
         # the sweep's review is the second opinion: it wins when it names more parts
         # and covers more (a one-word shortlist is what sent us here)
